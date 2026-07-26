@@ -44,24 +44,28 @@ HTML + CSS in, pixels in a window out. No JavaScript.
 - [x] Layout: the box tree with anonymous boxes, block formatting (widths,
       auto margins, heights, sibling margin collapsing) and inline formatting
       (line boxes, white-space collapsing, line breaking, text-align)
-- [ ] Real font metrics — `engine/src/layout/metrics.mx` currently estimates
-      advances from a width table, so text is proportional but not accurate
+- [x] Real text: TrueType parsing (`cmap`, `hmtx`, `glyf` including composite
+      glyphs), an anti-aliased scanline rasterizer using the nonzero winding
+      rule, and font selection across three generic families in regular, bold
+      and italic
 - [ ] Floats, static positioning beyond normal flow, parent/child margin
       collapsing, inline borders and padding
 - [x] Paint: software rasterizer with alpha blending, backgrounds, borders,
-      bitmap-font text, and a BMP writer
+      outline text, and a BMP writer
 - [x] Window: Win32 via `extern fn` FFI, with scrolling
 
 **Milestone 1 is complete: HTML + CSS render to pixels in a window.**
 
 ## Milestone 2 — a usable document viewer
 
-- [ ] **Real text.** The single biggest quality gap: glyphs come from an 8x8
-      ASCII bitmap font and advances are estimated from a width table, so text
-      is legible but neither accurate nor able to render non-ASCII, bold or
-      italic. Needs TrueType parsing, real metrics, and shaping for Latin
-      scripts. `engine/src/layout/metrics.mx` and `engine/src/paint/font.mx`
-      are the only two files this touches.
+- [ ] **Text shaping.** Glyphs are placed at their nominal advances, so there
+      is no kerning (`kern`/`GPOS`), no ligatures, and no support for scripts
+      needing reordering or contextual forms. This is the largest remaining
+      typography gap now that outlines are real.
+- [ ] A glyph cache: every glyph is re-rasterized on every paint, which is the
+      obvious performance win and the reason a long page is slow to render
+- [ ] CFF/Type-2 outlines, so OpenType fonts without a `glyf` table render
+      rather than falling back
 - [ ] Re-layout on window resize (the viewer keeps its initial width)
 - [ ] Charset sniffing + non-UTF-8 decoding (§13.2.3)
 - [ ] Line breaking per a UAX #14 subset (currently breaks at spaces only)

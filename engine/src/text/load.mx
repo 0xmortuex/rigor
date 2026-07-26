@@ -1,0 +1,96 @@
+// Reading font files from disk, and the default Windows font mapping.
+//
+// This is font *policy*, deliberately separate from the parsing in
+// engine.text.sfnt: which files exist and what a generic family should resolve
+// to is a property of the system, not of the format. A MortOS build would keep
+// sfnt.mx untouched and replace this module.
+module engine.text.load;
+
+import std.vec;
+import std.fs;
+import sfnt;
+import fonts;
+
+// Read a whole file into a buffer. Returns an empty buffer when the file
+// cannot be opened, which loads as a face whose is_ok() is false.
+pub fn read_file(path: *u8) -> Vec<u8> {
+    let contents: Vec<u8> = vec.new<u8>();
+    let handle: File = fs.open(path, "rb");
+    if !fs.is_open(&handle) {
+        return move contents;
+    }
+    let chunk: [u8; 65536] = [0; 65536];
+    loop {
+        let read: u64 = fs.read(&handle, slice(&chunk[0], 65536));
+        if read == 0 {
+            break;
+        }
+        for index: u64 in 0..read {
+            vec.push(&contents, chunk[index]);
+        }
+    }
+    fs.close(&handle);
+    return move contents;
+}
+
+fn install_path(
+    set: *TextFontSet,
+    family: u8,
+    bold: bool,
+    italic: bool,
+    path: *u8
+) -> bool {
+    let data: Vec<u8> = read_file(path);
+    if data.length == 0 {
+        vec.destroy(&data);
+        return false;
+    }
+    let face: TextFace = sfnt.load(move data);
+    if !sfnt.is_ok(&face) {
+        sfnt.destroy(&face);
+        return false;
+    }
+    fonts.install(set, family, bold, italic, move face);
+    return true;
+}
+
+// Load the standard Windows core fonts into `set`. Missing files are skipped,
+// and font selection falls back accordingly, so a system without one of these
+// still renders. Returns true when at least one face loaded.
+pub fn load_windows_defaults(set: *TextFontSet) -> bool {
+    let sans: u8 = fonts.family_sans();
+    let serif: u8 = fonts.family_serif();
+    let mono: u8 = fonts.family_mono();
+
+    // Segoe UI is the Windows UI face and is what a browser picks for
+    // sans-serif here; Arial is the fallback if it is absent.
+    if !install_path(set, sans, false, false, "C:\\Windows\\Fonts\\segoeui.ttf") {
+        install_path(set, sans, false, false, "C:\\Windows\\Fonts\\arial.ttf");
+    }
+    if !install_path(set, sans, true, false, "C:\\Windows\\Fonts\\segoeuib.ttf") {
+        install_path(set, sans, true, false, "C:\\Windows\\Fonts\\arialbd.ttf");
+    }
+    if !install_path(set, sans, false, true, "C:\\Windows\\Fonts\\segoeuii.ttf") {
+        install_path(set, sans, false, true, "C:\\Windows\\Fonts\\ariali.ttf");
+    }
+    if !install_path(set, sans, true, true, "C:\\Windows\\Fonts\\segoeuiz.ttf") {
+        install_path(set, sans, true, true, "C:\\Windows\\Fonts\\arialbi.ttf");
+    }
+
+    install_path(set, serif, false, false, "C:\\Windows\\Fonts\\times.ttf");
+    install_path(set, serif, true, false, "C:\\Windows\\Fonts\\timesbd.ttf");
+    install_path(set, serif, false, true, "C:\\Windows\\Fonts\\timesi.ttf");
+    install_path(set, serif, true, true, "C:\\Windows\\Fonts\\timesbi.ttf");
+
+    if !install_path(set, mono, false, false, "C:\\Windows\\Fonts\\consola.ttf") {
+        install_path(set, mono, false, false, "C:\\Windows\\Fonts\\cour.ttf");
+    }
+    if !install_path(set, mono, true, false, "C:\\Windows\\Fonts\\consolab.ttf") {
+        install_path(set, mono, true, false, "C:\\Windows\\Fonts\\courbd.ttf");
+    }
+    if !install_path(set, mono, false, true, "C:\\Windows\\Fonts\\consolai.ttf") {
+        install_path(set, mono, false, true, "C:\\Windows\\Fonts\\couri.ttf");
+    }
+
+    return fonts.has_any(set);
+}

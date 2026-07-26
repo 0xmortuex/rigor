@@ -1,0 +1,49 @@
+// UTF-8 decoding for text measurement and rendering.
+//
+// The parsing stages work on bytes because everything they dispatch on is
+// ASCII, but text layout and glyph lookup need whole code points, so this is
+// where bytes become characters. Malformed sequences decode as U+FFFD and
+// advance one byte, which keeps a decoder loop making progress on bad input
+// rather than stalling or running off the end.
+module engine.text.utf8;
+
+struct TextChar {
+    codepoint: u32,
+    // Bytes consumed; always at least 1.
+    size: u64,
+}
+
+pub fn decode(view: []const u8, index: u64) -> TextChar {
+    if index >= len(view) {
+        return TextChar { codepoint: 0 as u32, size: 1 };
+    }
+    let lead: u8 = view[index];
+    if lead < 0x80 as u8 {
+        return TextChar { codepoint: lead as u32, size: 1 };
+    }
+    let extra: u64 = 0;
+    let value: u32 = 0 as u32;
+    if lead >= 0xF0 as u8 && lead <= 0xF4 as u8 {
+        extra = 3;
+        value = (lead & (0x07 as u8)) as u32;
+    } else if lead >= 0xE0 as u8 && lead <= 0xEF as u8 {
+        extra = 2;
+        value = (lead & (0x0F as u8)) as u32;
+    } else if lead >= 0xC2 as u8 && lead <= 0xDF as u8 {
+        extra = 1;
+        value = (lead & (0x1F as u8)) as u32;
+    } else {
+        return TextChar { codepoint: 0xFFFD as u32, size: 1 };
+    }
+    if index + extra >= len(view) {
+        return TextChar { codepoint: 0xFFFD as u32, size: 1 };
+    }
+    for step: u64 in 1..(extra + 1) {
+        let continuation: u8 = view[index + step];
+        if (continuation & (0xC0 as u8)) != 0x80 as u8 {
+            return TextChar { codepoint: 0xFFFD as u32, size: 1 };
+        }
+        value = (value << 6) | ((continuation & (0x3F as u8)) as u32);
+    }
+    return TextChar { codepoint: value, size: 1 + extra };
+}

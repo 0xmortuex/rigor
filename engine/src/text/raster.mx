@@ -1,0 +1,272 @@
+// Glyph rasterization: a flattened outline to an 8-bit coverage bitmap.
+//
+// Scanline fill with the nonzero winding rule, anti-aliased by sampling
+// several sub-scanlines per pixel row and computing exact fractional coverage
+// horizontally. Vertical quality comes from the sample count; horizontal
+// quality is exact, because a span's endpoints are real numbers and the
+// partial pixels at each end are weighted by how much of them the span covers.
+//
+// That asymmetry is deliberate: horizontal exactness is cheap (two divisions
+// per span) and is what makes stem edges look clean, while vertical sampling
+// costs a full edge walk per sub-scanline. Four sub-scanlines is the usual
+// quality/cost knee and is what most software rasterizers settle on.
+module engine.text.raster;
+
+import std.vec;
+import outline;
+
+// A rendered glyph: coverage from 0 to 255, plus where it sits relative to the
+// pen position and the baseline.
+resource struct TextGlyphBitmap {
+    coverage: Vec<u8>,
+    width: u64,
+    height: u64,
+    // Offset of the bitmap's top-left from the pen on the baseline. `left` is
+    // positive to the right, `top` is positive downward.
+    left: f64,
+    top: f64,
+}
+
+pub fn new_bitmap() -> TextGlyphBitmap {
+    return TextGlyphBitmap {
+        coverage: vec.new<u8>(),
+        width: 0, height: 0, left: 0.0, top: 0.0,
+    };
+}
+
+pub fn destroy(bitmap: *TextGlyphBitmap) -> void {
+    vec.destroy(&(*bitmap).coverage);
+    (*bitmap).width = 0;
+    (*bitmap).height = 0;
+}
+
+pub fn coverage_at(bitmap: *TextGlyphBitmap, x: u64, y: u64) -> u8 {
+    if x >= (*bitmap).width || y >= (*bitmap).height {
+        return 0 as u8;
+    }
+    return (*bitmap).coverage.data[y * (*bitmap).width + x];
+}
+
+// Sub-scanlines sampled per pixel row.
+fn samples() -> u64 { return 4; }
+
+// One edge of the outline in device space, always stored top-to-bottom with
+// the original direction kept as the winding contribution.
+struct TextEdge {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    winding: i64,
+}
+
+fn floor_f64(value: f64) -> f64 {
+    let truncated: f64 = (value as i64) as f64;
+    if value < 0.0 && truncated != value {
+        return truncated - 1.0;
+    }
+    return truncated;
+}
+
+// Rasterize `shape` at `scale` (device pixels per font unit). The outline's y
+// axis points up; the bitmap's points down, so y is negated here.
+pub fn render(shape: *TextOutline, scale: f64) -> TextGlyphBitmap {
+    let bitmap: TextGlyphBitmap = new_bitmap();
+    let total_points: u64 = outline.point_count(shape);
+    if total_points == 0 || outline.contour_count(shape) == 0 {
+        return move bitmap;
+    }
+
+    // Device-space bounds.
+    let min_x: f64 = outline.point_x(shape, 0) * scale;
+    let max_x: f64 = min_x;
+    let min_y: f64 = 0.0 - outline.point_y(shape, 0) * scale;
+    let max_y: f64 = min_y;
+    for index: u64 in 0..total_points {
+        let x: f64 = outline.point_x(shape, index) * scale;
+        let y: f64 = 0.0 - outline.point_y(shape, index) * scale;
+        if x < min_x { min_x = x; }
+        if x > max_x { max_x = x; }
+        if y < min_y { min_y = y; }
+        if y > max_y { max_y = y; }
+    }
+
+    // One pixel of slack on each side so partially covered edge pixels fit.
+    let origin_x: f64 = floor_f64(min_x) - 1.0;
+    let origin_y: f64 = floor_f64(min_y) - 1.0;
+    let width: u64 = ((max_x - origin_x) + 2.0) as u64;
+    let height: u64 = ((max_y - origin_y) + 2.0) as u64;
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        return move bitmap;
+    }
+
+    // Collect edges, skipping horizontal ones (they never cross a scanline).
+    let edges: Vec<TextEdge> = vec.new<TextEdge>();
+    let first: u64 = 0;
+    for contour: u64 in 0..outline.contour_count(shape) {
+        let limit: u64 = outline.contour_end(shape, contour);
+        if limit <= first + 1 {
+            first = limit;
+            continue;
+        }
+        for index: u64 in first..limit {
+            let next: u64 = index + 1;
+            if next >= limit {
+                next = first;
+            }
+            let ax: f64 = outline.point_x(shape, index) * scale - origin_x;
+            let ay: f64 = 0.0 - outline.point_y(shape, index) * scale - origin_y;
+            let bx: f64 = outline.point_x(shape, next) * scale - origin_x;
+            let by: f64 = 0.0 - outline.point_y(shape, next) * scale - origin_y;
+            if ay == by {
+                continue;
+            }
+            if ay < by {
+                vec.push(&edges, TextEdge {
+                    x0: ax, y0: ay, x1: bx, y1: by, winding: 1,
+                });
+            } else {
+                vec.push(&edges, TextEdge {
+                    x0: bx, y0: by, x1: ax, y1: ay, winding: 0 - 1,
+                });
+            }
+        }
+        first = limit;
+    }
+    if edges.length == 0 {
+        vec.destroy(&edges);
+        return move bitmap;
+    }
+
+    // Coverage accumulator, one f64 per pixel, filled sub-scanline by
+    // sub-scanline and normalized at the end.
+    let accumulator: Vec<f64> = vec.with_capacity<f64>(width * height + 1);
+    for index: u64 in 0..(width * height) {
+        vec.push(&accumulator, 0.0);
+    }
+
+    let crossing_x: Vec<f64> = vec.new<f64>();
+    let crossing_w: Vec<i64> = vec.new<i64>();
+    let sample_count: u64 = samples();
+    let sample_weight: f64 = 1.0 / (sample_count as f64);
+
+    for row: u64 in 0..height {
+        for sample: u64 in 0..sample_count {
+            let y: f64 = (row as f64)
+                + ((sample as f64) + 0.5) * sample_weight;
+            vec.clear(&crossing_x);
+            vec.clear(&crossing_w);
+            for index: u64 in 0..edges.length {
+                let edge: TextEdge = edges.data[index];
+                // Half-open in y so a vertex shared by two edges is counted
+                // exactly once.
+                if y < edge.y0 || y >= edge.y1 {
+                    continue;
+                }
+                let t: f64 = (y - edge.y0) / (edge.y1 - edge.y0);
+                vec.push(&crossing_x, edge.x0 + t * (edge.x1 - edge.x0));
+                vec.push(&crossing_w, edge.winding);
+            }
+            if crossing_x.length < 2 {
+                continue;
+            }
+            sort_crossings(&crossing_x, &crossing_w);
+
+            // Nonzero winding: a span is inside wherever the running winding
+            // number is not zero.
+            let winding: i64 = 0;
+            for index: u64 in 0..(crossing_x.length - 1) {
+                winding = winding + crossing_w.data[index];
+                if winding == 0 {
+                    continue;
+                }
+                add_span(&accumulator, width, row,
+                    crossing_x.data[index], crossing_x.data[index + 1],
+                    sample_weight);
+            }
+        }
+    }
+
+    for index: u64 in 0..(width * height) {
+        let value: f64 = accumulator.data[index];
+        if value <= 0.0 {
+            vec.push(&(*(&bitmap)).coverage, 0 as u8);
+        } else if value >= 1.0 {
+            vec.push(&bitmap.coverage, 255 as u8);
+        } else {
+            vec.push(&bitmap.coverage, (value * 255.0 + 0.5) as u8);
+        }
+    }
+    bitmap.width = width;
+    bitmap.height = height;
+    bitmap.left = origin_x;
+    bitmap.top = origin_y;
+
+    vec.destroy(&crossing_x);
+    vec.destroy(&crossing_w);
+    vec.destroy(&accumulator);
+    vec.destroy(&edges);
+    return move bitmap;
+}
+
+// Insertion sort: a scanline crosses few edges, and the arrays are nearly
+// sorted from one sub-scanline to the next.
+fn sort_crossings(xs: *Vec<f64>, windings: *Vec<i64>) -> void {
+    for index: u64 in 1..(*xs).length {
+        let x: f64 = (*xs).data[index];
+        let winding: i64 = (*windings).data[index];
+        let position: u64 = index;
+        while position > 0 && (*xs).data[position - 1] > x {
+            (*xs).data[position] = (*xs).data[position - 1];
+            (*windings).data[position] = (*windings).data[position - 1];
+            position = position - 1;
+        }
+        (*xs).data[position] = x;
+        (*windings).data[position] = winding;
+    }
+}
+
+// Add a horizontal span's coverage to one row, weighting the partially
+// covered pixels at each end by the fraction actually inside the span.
+fn add_span(
+    accumulator: *Vec<f64>,
+    width: u64,
+    row: u64,
+    from: f64,
+    to: f64,
+    weight: f64
+) -> void {
+    let left: f64 = from;
+    let right: f64 = to;
+    if left < 0.0 {
+        left = 0.0;
+    }
+    if right > (width as f64) {
+        right = width as f64;
+    }
+    if right <= left {
+        return;
+    }
+    let first: u64 = left as u64;
+    let last: u64 = right as u64;
+    if last >= width {
+        last = width - 1;
+    }
+    let base: u64 = row * width;
+    if first == last {
+        (*accumulator).data[base + first] =
+            (*accumulator).data[base + first] + (right - left) * weight;
+        return;
+    }
+    // Leading partial pixel.
+    (*accumulator).data[base + first] = (*accumulator).data[base + first]
+        + (((first + 1) as f64) - left) * weight;
+    // Whole pixels between.
+    for column: u64 in (first + 1)..last {
+        (*accumulator).data[base + column] =
+            (*accumulator).data[base + column] + weight;
+    }
+    // Trailing partial pixel.
+    (*accumulator).data[base + last] = (*accumulator).data[base + last]
+        + (right - (last as f64)) * weight;
+}

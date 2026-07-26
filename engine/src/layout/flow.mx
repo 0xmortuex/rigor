@@ -22,6 +22,8 @@ import box;
 import metrics;
 import engine.dom.node;
 import engine.style.computed;
+import engine.text.fonts;
+import engine.text.utf8;
 
 // --- Box tree construction ---------------------------------------------------
 
@@ -197,6 +199,7 @@ fn layout_block(
     doc: *DomDocument,
     tree: *LayoutTree,
     styles: *StyleTree,
+    set: *TextFontSet,
     box_index: u64,
     x: f64,
     y: f64,
@@ -270,10 +273,10 @@ fn layout_block(
     let content_height: f64 = 0.0;
     if first_child_is_inline(tree, box_index) {
         content_height = layout_inline_content(
-            doc, tree, styles, box_index, content_x, content_y, width);
+            doc, tree, styles, set, box_index, content_x, content_y, width);
     } else {
         content_height = layout_block_children(
-            doc, tree, styles, box_index, content_x, content_y, width);
+            doc, tree, styles, set, box_index, content_x, content_y, width);
     }
 
     current = box.get(tree, box_index);
@@ -315,6 +318,7 @@ fn layout_block_children(
     doc: *DomDocument,
     tree: *LayoutTree,
     styles: *StyleTree,
+    set: *TextFontSet,
     parent: u64,
     content_x: f64,
     content_y: f64,
@@ -334,7 +338,7 @@ fn layout_block_children(
             gap = larger(previous_bottom, top_margin);
         }
         let child_y: f64 = cursor + gap;
-        layout_block(doc, tree, styles, child, content_x, child_y, content_width);
+        layout_block(doc, tree, styles, set, child, content_x, child_y, content_width);
         let placed: LayoutBox = box.get(tree, child);
         cursor = placed.y + box.border_box_height(placed);
         previous_bottom = placed.margin_bottom;
@@ -370,6 +374,7 @@ fn layout_inline_content(
     doc: *DomDocument,
     tree: *LayoutTree,
     styles: *StyleTree,
+    set: *TextFontSet,
     container: u64,
     content_x: f64,
     content_y: f64,
@@ -386,9 +391,9 @@ fn layout_inline_content(
         available: content_width,
         last_fragment: box.none(),
     };
-    layout_inline_children(doc, tree, styles, container, &state);
+    layout_inline_children(doc, tree, styles, set, container, &state);
     if !state.line_empty {
-        align_line(tree, styles, &state);
+        align_line(tree, styles, set, &state);
         return state.line_top + state.line_height - content_y;
     }
     return state.line_top - content_y;
@@ -398,6 +403,7 @@ fn layout_inline_children(
     doc: *DomDocument,
     tree: *LayoutTree,
     styles: *StyleTree,
+    set: *TextFontSet,
     parent: u64,
     state: *InlineState
 ) -> void {
@@ -406,14 +412,14 @@ fn layout_inline_children(
         let child_box: LayoutBox = box.get(tree, child);
         let next: u64 = child_box.next_sibling;
         if child_box.kind == box.box_text() {
-            place_text(doc, tree, styles, child, state);
+            place_text(doc, tree, styles, set, child, state);
         } else if child_box.kind == box.box_inline() {
             // An inline box's geometry is the extent of its fragments. Inline
             // borders and padding are not implemented; recording the extent is
             // enough for paint to draw a background behind it.
             let start_x: f64 = (*state).x;
             let start_y: f64 = (*state).line_top;
-            layout_inline_children(doc, tree, styles, child, state);
+            layout_inline_children(doc, tree, styles, set, child, state);
             let updated: LayoutBox = box.get(tree, child);
             updated.x = start_x;
             updated.y = start_y;
@@ -435,6 +441,7 @@ fn place_text(
     doc: *DomDocument,
     tree: *LayoutTree,
     styles: *StyleTree,
+    set: *TextFontSet,
     text_box: u64,
     state: *InlineState
 ) -> void {
@@ -458,21 +465,29 @@ fn place_text(
 
         if preserve {
             if c == 10 as u8 {
-                first_fragment = flush_fragment(tree, styles, text_box, state,
+                first_fragment = flush_fragment(tree, styles, set, text_box, state,
                     fragment_start, fragment_width, first_fragment);
-                break_line(tree, styles, state);
+                break_line(tree, styles, set, state);
                 fragment_start = box.text_length(tree);
                 fragment_width = 0.0;
                 index = index + 1;
                 continue;
             }
-            box.push_byte(tree, c);
-            let advance: f64 = metrics.char_width(c, font_size);
+            // Preserved text still has to advance a whole character at a time,
+            // so a multi-byte sequence is measured once rather than per byte.
+            let source_view: []const u8 =
+                node.bytes(doc, source_off + index, source_len - index);
+            let decoded: TextChar = utf8.decode(source_view, 0);
+            for step: u64 in 0..decoded.size {
+                box.push_byte(tree, dom_byte(doc, source_off, index + step));
+            }
+            let advance: f64 =
+                metrics.codepoint_width(set, style, decoded.codepoint);
             fragment_width = fragment_width + advance;
             (*state).x = (*state).x + advance;
             (*state).line_empty = false;
             grow_line(state, style.line_height);
-            index = index + 1;
+            index = index + decoded.size;
             continue;
         }
 
@@ -497,19 +512,19 @@ fn place_text(
         let word_len: u64 = index - word_start;
         let word: []const u8 =
             node.bytes(doc, source_off + word_start, word_len);
-        let word_width: f64 = metrics.text_width(word, font_size);
+        let word_width: f64 = metrics.text_width(set, style, word);
         let space_width: f64 = 0.0;
         if (*state).pending_space {
-            space_width = metrics.char_width(' ', font_size);
+            space_width = metrics.codepoint_width(set, style, ' ' as u32);
         }
 
         let overflows: bool = !nowrap && !(*state).line_empty
             && (*state).x + space_width + word_width
                 > (*state).origin_x + (*state).available;
         if overflows {
-            first_fragment = flush_fragment(tree, styles, text_box, state,
+            first_fragment = flush_fragment(tree, styles, set, text_box, state,
                 fragment_start, fragment_width, first_fragment);
-            break_line(tree, styles, state);
+            break_line(tree, styles, set, state);
             fragment_start = box.text_length(tree);
             fragment_width = 0.0;
             (*state).pending_space = false;
@@ -542,7 +557,7 @@ fn place_text(
         (*state).line_empty = false;
         grow_line(state, style.line_height);
     }
-    flush_fragment(tree, styles, text_box, state, fragment_start,
+    flush_fragment(tree, styles, set, text_box, state, fragment_start,
         fragment_width, first_fragment);
 }
 
@@ -563,6 +578,7 @@ fn grow_line(state: *InlineState, line_height: f64) -> void {
 fn flush_fragment(
     tree: *LayoutTree,
     styles: *StyleTree,
+    set: *TextFontSet,
     text_box: u64,
     state: *InlineState,
     fragment_start: u64,
@@ -588,15 +604,20 @@ fn flush_fragment(
     fragment.y = (*state).line_top;
     fragment.width = fragment_width;
     fragment.height = style.line_height;
-    fragment.baseline = metrics.ascent(style.font_size);
+    fragment.baseline = metrics.ascent(set, style);
     box.set(tree, target, fragment);
     grow_line(state, style.line_height);
     (*state).last_fragment = target;
     return false;
 }
 
-fn break_line(tree: *LayoutTree, styles: *StyleTree, state: *InlineState) -> void {
-    align_line(tree, styles, state);
+fn break_line(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    set: *TextFontSet,
+    state: *InlineState
+) -> void {
+    align_line(tree, styles, set, state);
     (*state).line_top = (*state).line_top + (*state).line_height;
     (*state).x = (*state).origin_x;
     (*state).line_height = 0.0;
@@ -606,7 +627,12 @@ fn break_line(tree: *LayoutTree, styles: *StyleTree, state: *InlineState) -> voi
 }
 
 // Apply text-align to the fragments sitting on the current line.
-fn align_line(tree: *LayoutTree, styles: *StyleTree, state: *InlineState) -> void {
+fn align_line(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    set: *TextFontSet,
+    state: *InlineState
+) -> void {
     let style: ComputedStyle =
         style_of(styles, box.get(tree, (*state).container).style_node);
     if style.text_align == computed.text_align_left()
@@ -645,13 +671,14 @@ pub fn layout(
     doc: *DomDocument,
     styles: *StyleTree,
     tree: *LayoutTree,
+    set: *TextFontSet,
     viewport_width: f64
 ) -> void {
     build(doc, styles, tree);
     if (*tree).root == box.none() {
         return;
     }
-    layout_block(doc, tree, styles, (*tree).root, 0.0, 0.0, viewport_width);
+    layout_block(doc, tree, styles, set, (*tree).root, 0.0, 0.0, viewport_width);
 }
 
 // The total height the document occupies, for sizing a canvas.

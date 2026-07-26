@@ -426,6 +426,56 @@ pub fn parse_white_space(s: *CssTokenSink, index: u64) -> StyleKeywordResult {
     return StyleKeywordResult { ok: false, value: 0 as u8 };
 }
 
+// font-family: walk the comma-separated list and take the generic family of
+// the first entry recognised. Specific face names are mapped by the table
+// below rather than looked up in a font database, so an unlisted name falls
+// through to the next entry exactly as it would if the font were missing.
+pub fn parse_font_family(
+    s: *CssTokenSink,
+    first: u64,
+    limit: u64
+) -> StyleKeywordResult {
+    let cursor: u64 = first;
+    while cursor < limit {
+        let token: CssToken = css_tokens.get_token(s, cursor);
+        if token.kind == css_tokens.kind_ident()
+            || token.kind == css_tokens.kind_string() {
+            let name: []const u8 = css_tokens.token_value(s, token);
+            if equals_ci(name, "serif") || equals_ci(name, "times")
+                || equals_ci(name, "georgia") || equals_ci(name, "garamond")
+                || equals_ci(name, "cambria") || equals_ci(name, "palatino")
+                || equals_ci(name, "baskerville") || equals_ci(name, "constantia") {
+                return StyleKeywordResult {
+                    ok: true, value: computed.font_family_serif(),
+                };
+            }
+            if equals_ci(name, "monospace") || equals_ci(name, "courier")
+                || equals_ci(name, "consolas") || equals_ci(name, "menlo")
+                || equals_ci(name, "monaco") || equals_ci(name, "ui-monospace")
+                || equals_ci(name, "conso") {
+                return StyleKeywordResult {
+                    ok: true, value: computed.font_family_mono(),
+                };
+            }
+            if equals_ci(name, "sans-serif") || equals_ci(name, "arial")
+                || equals_ci(name, "helvetica") || equals_ci(name, "verdana")
+                || equals_ci(name, "tahoma") || equals_ci(name, "calibri")
+                || equals_ci(name, "segoe") || equals_ci(name, "roboto")
+                || equals_ci(name, "inter") || equals_ci(name, "system-ui")
+                || equals_ci(name, "ui-sans-serif") {
+                return StyleKeywordResult {
+                    ok: true, value: computed.font_family_sans(),
+                };
+            }
+            // A multi-word name such as "Times New Roman" arrives as several
+            // ident tokens; only the first word is tested, which is enough to
+            // classify every common family.
+        }
+        cursor = cursor + 1;
+    }
+    return StyleKeywordResult { ok: false, value: 0 as u8 };
+}
+
 pub fn parse_font_style(s: *CssTokenSink, index: u64) -> StyleKeywordResult {
     let token: CssToken = css_tokens.get_token(s, index);
     if token.kind != css_tokens.kind_ident() {

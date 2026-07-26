@@ -62,9 +62,11 @@
   </div>
 
   <div class="note">
-    <p>Text is drawn with a bitmap font and measured with estimated advances,
-    so it is legible but not metrically accurate. Real font parsing is the
-    next milestone.</p>
+    <p>The type you are reading is real: glyph outlines come from the system
+    font's own <code>glyf</code> table, advances from its <code>hmtx</code>
+    table, and each glyph is filled by an anti-aliasing scanline rasterizer.
+    What is still missing is shaping &mdash; kerning, ligatures and any script
+    that needs reordering.</p>
   </div>
 
   <h2>Things that work</h2>

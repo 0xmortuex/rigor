@@ -32,6 +32,8 @@ import engine.layout.serialize as layout_serialize;
 import engine.paint.canvas;
 import engine.paint.paint;
 import engine.paint.bmp;
+import engine.text.fonts;
+import engine.text.load;
 import std.fs;
 
 extern fn getchar() -> c_int;
@@ -369,8 +371,10 @@ fn main() -> int {
     dump_styles(&out, &doc, &tree_styles, 0, 0);
 
     // Lay the document out at a conventional 800px viewport.
+    let font_set: TextFontSet = fonts.new_set();
+    load.load_windows_defaults(&font_set);
     let boxes: LayoutTree = box.new_tree();
-    flow.layout(&doc, &tree_styles, &boxes, 800.0);
+    flow.layout(&doc, &tree_styles, &boxes, &font_set, 800.0);
     out_str(&out, "-- layout --");
     out_line(&out);
     let layout_text: Vec<u8> = layout_serialize.tree_text(&boxes, &doc);
@@ -388,7 +392,7 @@ fn main() -> int {
         page_height = 1;
     }
     let target: Canvas = canvas.new_canvas(800, page_height);
-    paint.paint(&target, &boxes, &tree_styles);
+    paint.paint(&target, &boxes, &tree_styles, &font_set);
     let image: Vec<u8> = bmp.encode(&target);
     let output: File = fs.open("rigor.bmp", "wb");
     if fs.is_open(&output) {
@@ -406,6 +410,7 @@ fn main() -> int {
     vec.destroy(&image);
     canvas.destroy(&target);
     box.destroy(&boxes);
+    fonts.destroy(&font_set);
 
     computed.destroy(&tree_styles);
     stylesheet.destroy(&ua_sheet);

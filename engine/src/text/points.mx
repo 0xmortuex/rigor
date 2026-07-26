@@ -1,0 +1,80 @@
+// Scratch storage for one glyph's raw outline points.
+//
+// This lives in its own module because Mort requires a resource struct's
+// destructor to be the module's single `destroy`, and engine.text.outline
+// already owns that name for TextOutline.
+module engine.text.points;
+
+import std.vec;
+
+// Points as read from the glyph, before curve flattening: coordinates in font
+// units plus the on-curve flag, and the index one past each contour's last
+// point.
+resource struct TextGlyphPoints {
+    xs: Vec<f64>,
+    ys: Vec<f64>,
+    on_curve: Vec<bool>,
+    ends: Vec<u64>,
+}
+
+pub fn new_points() -> TextGlyphPoints {
+    return TextGlyphPoints {
+        xs: vec.new<f64>(),
+        ys: vec.new<f64>(),
+        on_curve: vec.new<bool>(),
+        ends: vec.new<u64>(),
+    };
+}
+
+pub fn destroy(points: *TextGlyphPoints) -> void {
+    vec.destroy(&(*points).xs);
+    vec.destroy(&(*points).ys);
+    vec.destroy(&(*points).on_curve);
+    vec.destroy(&(*points).ends);
+}
+
+pub fn count(points: *TextGlyphPoints) -> u64 {
+    return (*points).xs.length;
+}
+
+pub fn contour_count(points: *TextGlyphPoints) -> u64 {
+    return (*points).ends.length;
+}
+
+pub fn push(points: *TextGlyphPoints, x: f64, y: f64, on_curve: bool) -> void {
+    vec.push(&(*points).xs, x);
+    vec.push(&(*points).ys, y);
+    vec.push(&(*points).on_curve, on_curve);
+}
+
+pub fn push_end(points: *TextGlyphPoints, end: u64) -> void {
+    vec.push(&(*points).ends, end);
+}
+
+pub fn x_at(points: *TextGlyphPoints, index: u64) -> f64 {
+    match vec.get(&(*points).xs, index) {
+        Option<f64>.Some(value) => { return value; },
+        Option<f64>.None => { return 0.0; },
+    }
+}
+
+pub fn y_at(points: *TextGlyphPoints, index: u64) -> f64 {
+    match vec.get(&(*points).ys, index) {
+        Option<f64>.Some(value) => { return value; },
+        Option<f64>.None => { return 0.0; },
+    }
+}
+
+pub fn on_curve_at(points: *TextGlyphPoints, index: u64) -> bool {
+    match vec.get(&(*points).on_curve, index) {
+        Option<bool>.Some(value) => { return value; },
+        Option<bool>.None => { return false; },
+    }
+}
+
+pub fn end_at(points: *TextGlyphPoints, index: u64) -> u64 {
+    match vec.get(&(*points).ends, index) {
+        Option<u64>.Some(value) => { return value; },
+        Option<u64>.None => { return 0; },
+    }
+}

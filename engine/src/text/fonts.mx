@@ -1,0 +1,139 @@
+// The set of faces available for rendering, and how a style picks one.
+//
+// The engine never looks for a font on disk: an embedder loads the bytes it
+// wants and installs them here. That keeps font *policy* — which files exist,
+// what a family name should resolve to on this system — outside the engine,
+// while font *parsing* stays in it. It is the same split as the platform
+// boundary in the viewer, and it is what lets a MortOS build supply its own
+// faces without touching engine code.
+//
+// The slots are the three CSS generic families crossed with bold and italic.
+// A style naming a specific family is mapped to a generic by the cascade, so
+// nothing here needs a font-name database.
+module engine.text.fonts;
+
+import std.vec;
+import sfnt;
+
+// Generic families, matching computed.font_family_*.
+pub fn family_sans() -> u8 { return 0 as u8; }
+pub fn family_serif() -> u8 { return 1 as u8; }
+pub fn family_mono() -> u8 { return 2 as u8; }
+
+// Twelve named slots rather than an array, because Mort's ownership rules make
+// a Vec of resources awkward to destroy element by element, and the set is
+// fixed anyway.
+resource struct TextFontSet {
+    sans: TextFace,
+    sans_bold: TextFace,
+    sans_italic: TextFace,
+    sans_bold_italic: TextFace,
+    serif: TextFace,
+    serif_bold: TextFace,
+    serif_italic: TextFace,
+    serif_bold_italic: TextFace,
+    mono: TextFace,
+    mono_bold: TextFace,
+    mono_italic: TextFace,
+    mono_bold_italic: TextFace,
+}
+
+fn empty_face() -> TextFace {
+    return sfnt.load(vec.new<u8>());
+}
+
+pub fn new_set() -> TextFontSet {
+    return TextFontSet {
+        sans: empty_face(),
+        sans_bold: empty_face(),
+        sans_italic: empty_face(),
+        sans_bold_italic: empty_face(),
+        serif: empty_face(),
+        serif_bold: empty_face(),
+        serif_italic: empty_face(),
+        serif_bold_italic: empty_face(),
+        mono: empty_face(),
+        mono_bold: empty_face(),
+        mono_italic: empty_face(),
+        mono_bold_italic: empty_face(),
+    };
+}
+
+pub fn destroy(set: *TextFontSet) -> void {
+    sfnt.destroy(&(*set).sans);
+    sfnt.destroy(&(*set).sans_bold);
+    sfnt.destroy(&(*set).sans_italic);
+    sfnt.destroy(&(*set).sans_bold_italic);
+    sfnt.destroy(&(*set).serif);
+    sfnt.destroy(&(*set).serif_bold);
+    sfnt.destroy(&(*set).serif_italic);
+    sfnt.destroy(&(*set).serif_bold_italic);
+    sfnt.destroy(&(*set).mono);
+    sfnt.destroy(&(*set).mono_bold);
+    sfnt.destroy(&(*set).mono_italic);
+    sfnt.destroy(&(*set).mono_bold_italic);
+}
+
+// Install a face. Takes ownership of `face`; any face already in the slot is
+// replaced and destroyed.
+pub fn install(
+    set: *TextFontSet,
+    family: u8,
+    bold: bool,
+    italic: bool,
+    face: TextFace
+) -> void {
+    let slot: *TextFace = slot_of(set, family, bold, italic);
+    sfnt.destroy(slot);
+    (*slot) = move face;
+}
+
+fn slot_of(
+    set: *TextFontSet,
+    family: u8,
+    bold: bool,
+    italic: bool
+) -> *TextFace {
+    if family == family_serif() {
+        if bold && italic { return &(*set).serif_bold_italic; }
+        if bold { return &(*set).serif_bold; }
+        if italic { return &(*set).serif_italic; }
+        return &(*set).serif;
+    }
+    if family == family_mono() {
+        if bold && italic { return &(*set).mono_bold_italic; }
+        if bold { return &(*set).mono_bold; }
+        if italic { return &(*set).mono_italic; }
+        return &(*set).mono;
+    }
+    if bold && italic { return &(*set).sans_bold_italic; }
+    if bold { return &(*set).sans_bold; }
+    if italic { return &(*set).sans_italic; }
+    return &(*set).sans;
+}
+
+// The face a style should use, falling back along the path a browser does:
+// the exact style, then the family's regular face, then sans regular. Returns
+// a face whose is_ok() is false when nothing at all is installed, which
+// callers treat as "no text".
+pub fn select(
+    set: *TextFontSet,
+    family: u8,
+    bold: bool,
+    italic: bool
+) -> *TextFace {
+    let exact: *TextFace = slot_of(set, family, bold, italic);
+    if sfnt.is_ok(exact) {
+        return exact;
+    }
+    let regular: *TextFace = slot_of(set, family, false, false);
+    if sfnt.is_ok(regular) {
+        return regular;
+    }
+    return &(*set).sans;
+}
+
+pub fn has_any(set: *TextFontSet) -> bool {
+    return sfnt.is_ok(&(*set).sans) || sfnt.is_ok(&(*set).serif)
+        || sfnt.is_ok(&(*set).mono);
+}

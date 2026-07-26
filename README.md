@@ -118,6 +118,11 @@ by the tree builder). The harness prints the skip count on every run.
   block width constraint including `auto` margins centring a box, auto and
   fixed heights, adjacent-sibling margin collapsing, and inline formatting
   with line boxes, white-space collapsing, line breaking and `text-align`.
+- **Real text**: TrueType parsing — `cmap` for character-to-glyph mapping,
+  `hmtx` for advances, `glyf` for outlines including composite glyphs — with
+  an anti-aliased scanline rasterizer using the nonzero winding rule. Bold,
+  italic and monospace resolve to the system's actual faces, and non-ASCII
+  renders.
 - **Paint**: a software rasterizer with source-over alpha blending, drawing
   backgrounds, borders and text into a BGRA canvas, plus a BMP writer so a
   render can be diffed without a window.
@@ -214,7 +219,8 @@ engine/            the engine library (Mort package `engine`) — embeddable
   src/css/         preprocessing, tokenizer, parser, selectors, matching
   src/style/       the cascade, computed values, the UA stylesheet
   src/layout/      the box tree, normal flow, font metrics
-  src/paint/       the canvas, the rasterizer, the bitmap font, a BMP writer
+  src/text/        TrueType parsing, outlines, the glyph rasterizer
+  src/paint/       the canvas, box painting, a BMP writer, a fallback font
 src/main.mx        the rigor developer CLI
 viewer/            the windowed viewer; viewer/src/win32.mx is all the
                    platform-specific code in the project

@@ -6,11 +6,12 @@
 // rigor lays out today; z-index and stacking contexts arrive with positioned
 // elements and will reorder this walk rather than replace it.
 //
-// Text is drawn with the bitmap font in engine.paint.font. That font is
-// monospaced 8x8 while layout measures proportional advances, so glyphs are
-// placed at the positions layout computed rather than stepped by a fixed
-// pitch: the two agree on where a run starts and ends even though the shapes
-// are not the ones measured.
+// Text is drawn from the font's real outlines: each glyph is looked up through
+// the font's cmap, its contours are flattened, and it is rasterized with
+// anti-aliasing and composited in the text colour. Advances come from the same
+// metrics layout measured with, so painted text lands exactly where layout put
+// it. When no font is installed, the built-in 8x8 bitmap font is used instead,
+// so the engine still draws something without a font file present.
 module engine.paint.paint;
 
 import canvas;
@@ -18,6 +19,11 @@ import font;
 import engine.layout.box;
 import engine.layout.metrics;
 import engine.style.computed;
+import engine.text.sfnt;
+import engine.text.fonts;
+import engine.text.outline;
+import engine.text.raster;
+import engine.text.utf8;
 
 fn paint_background(
     target: *Canvas,
@@ -98,32 +104,90 @@ fn paint_glyph(
     }
 }
 
+// Composite a rasterized glyph onto the canvas at the given origin, scaling
+// its coverage into the text colour's alpha.
+fn blit_glyph(
+    target: *Canvas,
+    bitmap: *TextGlyphBitmap,
+    pen_x: f64,
+    baseline_y: f64,
+    color: StyleColor
+) -> void {
+    let origin_x: f64 = pen_x + (*bitmap).left;
+    let origin_y: f64 = baseline_y + (*bitmap).top;
+    for row: u64 in 0..(*bitmap).height {
+        for column: u64 in 0..(*bitmap).width {
+            let coverage: u8 = raster.coverage_at(bitmap, column, row);
+            if coverage == 0 as u8 {
+                continue;
+            }
+            let alpha: u64 = (coverage as u64) * (color.a as u64) / 255;
+            canvas.blend_pixel(target,
+                (origin_x + (column as f64)) as u64,
+                (origin_y + (row as f64)) as u64,
+                computed.rgba(color.r, color.g, color.b, alpha as u8));
+        }
+    }
+}
+
 fn paint_text(
     target: *Canvas,
     tree: *LayoutTree,
+    set: *TextFontSet,
     current: LayoutBox,
     style: ComputedStyle
 ) -> void {
     if current.text_len == 0 {
         return;
     }
-    // In font8x8 the baseline sits at the bottom of row 6, so seven eighths of
-    // the cell is above it. Anchoring on the baseline layout computed keeps
-    // text of different sizes on one line aligned.
-    let cell_height: f64 = style.font_size;
-    let top: f64 = current.y + current.baseline - cell_height * 0.875;
-
     let text: []const u8 = box.text_bytes(tree, current.text_off, current.text_len);
+    let face: *TextFace = metrics.face_for(set, style);
+    let baseline: f64 = current.y + current.baseline;
+
+    if !sfnt.is_ok(face) {
+        paint_text_bitmap(target, text, current.x, baseline, style);
+        return;
+    }
+
+    let scale: f64 = metrics.scale_for(face, style.font_size);
     let pen: f64 = current.x;
+    let index: u64 = 0;
+    while index < len(text) {
+        let decoded: TextChar = utf8.decode(text, index);
+        let glyph: u64 = sfnt.glyph_for(face, decoded.codepoint as u64);
+        // Glyph 0 is .notdef; drawing it would litter the page with boxes for
+        // every unmapped character, so it is skipped and only the advance
+        // applies.
+        if glyph != 0 {
+            let shape: TextOutline = outline.build(face, glyph);
+            let bitmap: TextGlyphBitmap = raster.render(&shape, scale);
+            blit_glyph(target, &bitmap, pen, baseline, style.color);
+            raster.destroy(&bitmap);
+            outline.destroy(&shape);
+        }
+        pen = pen + sfnt.advance_for_glyph(face, glyph) * scale;
+        index = index + decoded.size;
+    }
+}
+
+// The no-font fallback: the built-in 8x8 bitmap, stretched into each measured
+// advance so it still lines up with the geometry layout produced.
+fn paint_text_bitmap(
+    target: *Canvas,
+    text: []const u8,
+    start_x: f64,
+    baseline: f64,
+    style: ComputedStyle
+) -> void {
+    let cell_height: f64 = style.font_size;
+    let top: f64 = baseline - cell_height * 0.875;
+    let pen: f64 = start_x;
     for index: u64 in 0..len(text) {
         let c: u8 = text[index];
-        // Multi-byte sequences have no glyph in this font; skipping the
-        // continuation bytes stops the pen advancing once per byte instead of
-        // once per character.
         if (c & (0xC0 as u8)) == 0x80 as u8 {
             continue;
         }
-        let advance: f64 = metrics.char_width(c, style.font_size);
+        let advance: f64 = estimate_advance(c, style.font_size);
         if c > 32 as u8 && c < 127 as u8 {
             paint_glyph(target, c as u32, pen, top, advance, cell_height,
                 style.color);
@@ -132,17 +196,37 @@ fn paint_text(
     }
 }
 
+// Mirrors the estimate table in engine.layout.metrics, so the fallback path
+// paints at the same advances it measured.
+fn estimate_advance(c: u8, font_size: f64) -> f64 {
+    if c == ' ' { return 0.26 * font_size; }
+    if c == 'i' || c == 'l' || c == 'j' || c == '.' || c == ',' || c == ':'
+        || c == ';' || c == 39 as u8 || c == '|' || c == '!' {
+        return 0.24 * font_size;
+    }
+    if c == 'f' || c == 't' || c == 'r' || c == 'I' || c == '(' || c == ')'
+        || c == '[' || c == ']' || c == '-' || c == '"' {
+        return 0.33 * font_size;
+    }
+    if c == 'm' || c == 'w' || c == 'M' || c == 'W' { return 0.83 * font_size; }
+    if c >= 'A' && c <= 'Z' { return 0.62 * font_size; }
+    if c >= '0' && c <= '9' { return 0.56 * font_size; }
+    if c >= 'a' && c <= 'z' { return 0.53 * font_size; }
+    return 0.55 * font_size;
+}
+
 fn paint_box(
     target: *Canvas,
     tree: *LayoutTree,
     styles: *StyleTree,
+    set: *TextFontSet,
     index: u64
 ) -> void {
     let current: LayoutBox = box.get(tree, index);
     let style: ComputedStyle = computed.get(styles, current.style_node);
 
     if current.kind == box.box_text() {
-        paint_text(target, tree, current, style);
+        paint_text(target, tree, set, current, style);
     } else if current.kind != box.box_anonymous() {
         // Anonymous boxes have no style of their own to paint; their content
         // is painted by their children.
@@ -152,7 +236,7 @@ fn paint_box(
 
     let child: u64 = current.first_child;
     while child != box.none() {
-        paint_box(target, tree, styles, child);
+        paint_box(target, tree, styles, set, child);
         child = box.get(tree, child).next_sibling;
     }
 }
@@ -163,12 +247,13 @@ fn paint_box(
 pub fn paint(
     target: *Canvas,
     tree: *LayoutTree,
-    styles: *StyleTree
+    styles: *StyleTree,
+    set: *TextFontSet
 ) -> void {
     canvas.fill_all(target,
         computed.rgba(255 as u8, 255 as u8, 255 as u8, 255 as u8));
     if (*tree).root == box.none() {
         return;
     }
-    paint_box(target, tree, styles, (*tree).root);
+    paint_box(target, tree, styles, set, (*tree).root);
 }

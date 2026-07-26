@@ -20,6 +20,7 @@ import engine.style.ua;
 import engine.layout.box;
 import engine.layout.flow;
 import engine.layout.serialize as layout_serialize;
+import engine.text.fonts;
 
 resource struct Laid {
     html_normalized: Vec<u8>,
@@ -32,6 +33,7 @@ resource struct Laid {
     css_sink: CssTokenSink,
     sheet: CssStylesheet,
     styles: StyleTree,
+    font_set: TextFontSet,
     boxes: LayoutTree,
 }
 
@@ -64,8 +66,11 @@ fn build(html: *u8, css: *u8, viewport: f64) -> Laid {
     let styles: StyleTree = computed.new_tree(node.node_count(&doc));
     cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &styles);
 
+    // No faces are installed, so metrics use the estimate table. That keeps
+    // these expectations independent of which fonts the machine has.
+    let font_set: TextFontSet = fonts.new_set();
     let boxes: LayoutTree = box.new_tree();
-    flow.layout(&doc, &styles, &boxes, viewport);
+    flow.layout(&doc, &styles, &boxes, &font_set, viewport);
 
     return Laid {
         html_normalized: move html_normalized,
@@ -78,12 +83,14 @@ fn build(html: *u8, css: *u8, viewport: f64) -> Laid {
         css_sink: move css_sink,
         sheet: move sheet,
         styles: move styles,
+        font_set: move font_set,
         boxes: move boxes,
     };
 }
 
 fn destroy(l: *Laid) -> void {
     box.destroy(&(*l).boxes);
+    fonts.destroy(&(*l).font_set);
     computed.destroy(&(*l).styles);
     stylesheet.destroy(&(*l).sheet);
     css_tokens.destroy(&(*l).css_sink);

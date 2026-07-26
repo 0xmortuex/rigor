@@ -1,18 +1,23 @@
 // Font metrics.
 //
-// PLACEHOLDER. Real metrics come from parsing an actual font file, which is a
-// milestone-2 item; until then advances are estimated from a small width table
-// so that line breaking and box sizing behave proportionally rather than
-// monospaced. Text will not be pixel-accurate against a browser, and it is not
-// meant to be — but every consumer of metrics goes through this module, so
-// swapping in real ones is a change to this file alone.
+// Advances come from the font's own `hmtx` table, scaled from font units to
+// pixels by the em size — so a run measured here is exactly as wide as the
+// glyphs painted for it, and line breaking lands where a browser would put it.
 //
-// Widths are expressed as a fraction of the font size, which is roughly how
-// they scale in a real proportional face.
+// When no font is installed the estimate table below is used instead. That
+// path exists so the engine still lays out (and tests still run) without a
+// font file present; it is not meant to be accurate, and any real rendering
+// path should install a face.
 module engine.layout.metrics;
 
-// Advance width of one ASCII byte, as a fraction of the font size.
-fn advance_ratio(c: u8) -> f64 {
+import engine.text.sfnt;
+import engine.text.fonts;
+import engine.text.utf8;
+import engine.style.computed;
+
+// --- Fallback estimates -------------------------------------------------------
+
+fn estimate_ratio(c: u8) -> f64 {
     if c == ' ' { return 0.26; }
     if c == 'i' || c == 'l' || c == 'j' || c == '.' || c == ',' || c == ':'
         || c == ';' || c == 39 as u8 || c == '|' || c == '!' {
@@ -22,45 +27,107 @@ fn advance_ratio(c: u8) -> f64 {
         || c == '[' || c == ']' || c == '-' || c == '"' {
         return 0.33;
     }
-    if c == 'm' || c == 'w' || c == 'M' || c == 'W' {
-        return 0.83;
-    }
-    if c >= 'A' && c <= 'Z' {
-        return 0.62;
-    }
-    if c >= '0' && c <= '9' {
-        return 0.56;
-    }
-    if c >= 'a' && c <= 'z' {
-        return 0.53;
-    }
-    // Everything else, including the lead byte of a multi-byte sequence.
+    if c == 'm' || c == 'w' || c == 'M' || c == 'W' { return 0.83; }
+    if c >= 'A' && c <= 'Z' { return 0.62; }
+    if c >= '0' && c <= '9' { return 0.56; }
+    if c >= 'a' && c <= 'z' { return 0.53; }
     return 0.55;
 }
 
-// Width of a byte run at `font_size`. Continuation bytes of a UTF-8 sequence
-// contribute nothing, so one multi-byte character is measured once.
-pub fn text_width(view: []const u8, font_size: f64) -> f64 {
-    let total: f64 = 0.0;
-    for index: u64 in 0..len(view) {
-        let c: u8 = view[index];
-        if (c & (0xC0 as u8)) != 0x80 as u8 {
-            total = total + advance_ratio(c) * font_size;
+// --- Face selection -----------------------------------------------------------
+
+// The face a computed style resolves to. Weights of 600 and above are bold,
+// which is where browsers put the threshold for a two-weight family.
+pub fn face_for(set: *TextFontSet, style: ComputedStyle) -> *TextFace {
+    return fonts.select(set, style.font_family,
+        style.font_weight >= 600 as u32,
+        style.font_style == computed.font_style_italic());
+}
+
+// Pixels per font unit at this size.
+pub fn scale_for(face: *TextFace, font_size: f64) -> f64 {
+    return font_size / sfnt.units_per_em(face);
+}
+
+// --- Measurement --------------------------------------------------------------
+
+// The advance of one code point, in pixels.
+pub fn codepoint_width(
+    set: *TextFontSet,
+    style: ComputedStyle,
+    codepoint: u32
+) -> f64 {
+    let face: *TextFace = face_for(set, style);
+    if !sfnt.is_ok(face) {
+        if codepoint < 128 as u32 {
+            return estimate_ratio(codepoint as u8) * style.font_size;
         }
+        return 0.55 * style.font_size;
+    }
+    let glyph: u64 = sfnt.glyph_for(face, codepoint as u64);
+    return sfnt.advance_for_glyph(face, glyph) * scale_for(face, style.font_size);
+}
+
+// The advance of a UTF-8 byte run, in pixels.
+pub fn text_width(
+    set: *TextFontSet,
+    style: ComputedStyle,
+    view: []const u8
+) -> f64 {
+    let face: *TextFace = face_for(set, style);
+    let total: f64 = 0.0;
+    let index: u64 = 0;
+    if !sfnt.is_ok(face) {
+        while index < len(view) {
+            let decoded: TextChar = utf8.decode(view, index);
+            if decoded.codepoint < 128 as u32 {
+                total = total + estimate_ratio(decoded.codepoint as u8)
+                    * style.font_size;
+            } else {
+                total = total + 0.55 * style.font_size;
+            }
+            index = index + decoded.size;
+        }
+        return total;
+    }
+    let scale: f64 = scale_for(face, style.font_size);
+    while index < len(view) {
+        let decoded: TextChar = utf8.decode(view, index);
+        let glyph: u64 = sfnt.glyph_for(face, decoded.codepoint as u64);
+        total = total + sfnt.advance_for_glyph(face, glyph) * scale;
+        index = index + decoded.size;
     }
     return total;
 }
 
-pub fn char_width(c: u8, font_size: f64) -> f64 {
-    return advance_ratio(c) * font_size;
+// --- Line metrics -------------------------------------------------------------
+
+// Distance from the top of a line box to the baseline. Taken from the font's
+// own ascent where possible, so text of mixed families sits on one line
+// correctly.
+pub fn ascent(set: *TextFontSet, style: ComputedStyle) -> f64 {
+    let face: *TextFace = face_for(set, style);
+    if !sfnt.is_ok(face) {
+        return style.font_size * 0.8;
+    }
+    let scale: f64 = scale_for(face, style.font_size);
+    let font_ascent: f64 = sfnt.ascent(face) * scale;
+    let font_descent: f64 = sfnt.descent(face) * scale;
+    let content_height: f64 = font_ascent + font_descent;
+    if content_height <= 0.0 {
+        return style.font_size * 0.8;
+    }
+    // The line box may be taller or shorter than the font's own content box;
+    // CSS centres the difference above and below (the "half-leading" of
+    // CSS 2.1 §10.8.1).
+    let half_leading: f64 = (style.line_height - content_height) / 2.0;
+    return half_leading + font_ascent;
 }
 
-// Distance from the top of a line box to the text baseline. The 0.8 split
-// matches the usual ascent/descent ratio closely enough for layout.
-pub fn ascent(font_size: f64) -> f64 {
-    return font_size * 0.8;
-}
-
-pub fn descent(font_size: f64) -> f64 {
-    return font_size * 0.2;
+pub fn descent(set: *TextFontSet, style: ComputedStyle) -> f64 {
+    let face: *TextFace = face_for(set, style);
+    if !sfnt.is_ok(face) {
+        return style.font_size * 0.2;
+    }
+    return sfnt.descent(face) * scale_for(face, style.font_size);
 }

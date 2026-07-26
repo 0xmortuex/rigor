@@ -201,6 +201,12 @@ fn apply_declaration(
         if result.ok { (*style).font_style = result.value; }
         return;
     }
+    if name_is(sheet, declaration, "font-family") {
+        let result: StyleKeywordResult =
+            values.parse_font_family(s, first, limit);
+        if result.ok { (*style).font_family = result.value; }
+        return;
+    }
     if name_is(sheet, declaration, "line-height") {
         let result: StyleNumberResult =
             values.parse_line_height(s, first, font_size, root_font_size);
@@ -376,6 +382,58 @@ fn apply_box_edges(
     return false;
 }
 
+// The three components of a border shorthand, in whatever order they appeared.
+// Omitted components take their initial values, except the colour, which
+// defaults to `currentColor` — the element's own `color`.
+struct BorderShorthand {
+    width: f64,
+    line_style: u8,
+    color: StyleColor,
+}
+
+fn read_border_shorthand(
+    source: StyleSource,
+    first: u64,
+    limit: u64,
+    style: *ComputedStyle,
+    font_size: f64,
+    root_font_size: f64
+) -> BorderShorthand {
+    let s: *CssTokenSink = source.sink;
+    let width: f64 = 3.0;
+    let line_style: u8 = computed.border_none();
+    let color: StyleColor = (*style).color;
+    let cursor: u64 = first;
+    while cursor < limit {
+        cursor = values.skip_ws(s, cursor, limit);
+        if cursor >= limit {
+            break;
+        }
+        // Each component is identified by what it parses as, since the
+        // shorthand allows them in any order.
+        let as_style: StyleKeywordResult = values.parse_border_style(s, cursor);
+        if as_style.ok {
+            line_style = as_style.value;
+        } else {
+            let as_width: StyleNumberResult =
+                values.parse_border_width(s, cursor, font_size, root_font_size);
+            if as_width.ok {
+                width = as_width.value;
+            } else {
+                let as_color: StyleColorResult =
+                    values.parse_color(s, cursor, limit);
+                if as_color.ok {
+                    color = as_color.color;
+                }
+            }
+        }
+        cursor = cursor + 1;
+    }
+    return BorderShorthand {
+        width: width, line_style: line_style, color: color,
+    };
+}
+
 fn apply_border(
     source: StyleSource,
     declaration: CssDeclaration,
@@ -388,47 +446,53 @@ fn apply_border(
     let first: u64 = declaration.value_first;
     let limit: u64 = declaration.value_first + declaration.value_count;
 
-    // The `border` shorthand in any order: width, style and colour.
-    if name_is(sheet, declaration, "border") {
-        let width: f64 = 3.0;
-        let border_style: u8 = computed.border_none();
-        let color: StyleColor = (*style).color;
-        let cursor: u64 = first;
-        while cursor < limit {
-            cursor = values.skip_ws(s, cursor, limit);
-            if cursor >= limit {
-                break;
-            }
-            let as_style: StyleKeywordResult = values.parse_border_style(s, cursor);
-            if as_style.ok {
-                border_style = as_style.value;
-            } else {
-                let as_width: StyleNumberResult =
-                    values.parse_border_width(s, cursor, font_size, root_font_size);
-                if as_width.ok {
-                    width = as_width.value;
-                } else {
-                    let as_color: StyleColorResult =
-                        values.parse_color(s, cursor, limit);
-                    if as_color.ok {
-                        color = as_color.color;
-                    }
-                }
-            }
-            cursor = cursor + 1;
+    // The per-side shorthands, e.g. `border-left: 6px solid gold`. Same
+    // grammar as `border`, applied to one edge.
+    let side: i64 = 0 - 1;
+    if name_is(sheet, declaration, "border-top") { side = 0; }
+    else if name_is(sheet, declaration, "border-right") { side = 1; }
+    else if name_is(sheet, declaration, "border-bottom") { side = 2; }
+    else if name_is(sheet, declaration, "border-left") { side = 3; }
+    if side >= 0 {
+        let parsed: BorderShorthand =
+            read_border_shorthand(source, first, limit, style, font_size,
+                root_font_size);
+        if side == 0 {
+            (*style).border_top_width = parsed.width;
+            (*style).border_top_style = parsed.line_style;
+            (*style).border_top_color = parsed.color;
+        } else if side == 1 {
+            (*style).border_right_width = parsed.width;
+            (*style).border_right_style = parsed.line_style;
+            (*style).border_right_color = parsed.color;
+        } else if side == 2 {
+            (*style).border_bottom_width = parsed.width;
+            (*style).border_bottom_style = parsed.line_style;
+            (*style).border_bottom_color = parsed.color;
+        } else {
+            (*style).border_left_width = parsed.width;
+            (*style).border_left_style = parsed.line_style;
+            (*style).border_left_color = parsed.color;
         }
-        (*style).border_top_width = width;
-        (*style).border_right_width = width;
-        (*style).border_bottom_width = width;
-        (*style).border_left_width = width;
-        (*style).border_top_style = border_style;
-        (*style).border_right_style = border_style;
-        (*style).border_bottom_style = border_style;
-        (*style).border_left_style = border_style;
-        (*style).border_top_color = color;
-        (*style).border_right_color = color;
-        (*style).border_bottom_color = color;
-        (*style).border_left_color = color;
+        return;
+    }
+
+    if name_is(sheet, declaration, "border") {
+        let parsed: BorderShorthand =
+            read_border_shorthand(source, first, limit, style, font_size,
+                root_font_size);
+        (*style).border_top_width = parsed.width;
+        (*style).border_right_width = parsed.width;
+        (*style).border_bottom_width = parsed.width;
+        (*style).border_left_width = parsed.width;
+        (*style).border_top_style = parsed.line_style;
+        (*style).border_right_style = parsed.line_style;
+        (*style).border_bottom_style = parsed.line_style;
+        (*style).border_left_style = parsed.line_style;
+        (*style).border_top_color = parsed.color;
+        (*style).border_right_color = parsed.color;
+        (*style).border_bottom_color = parsed.color;
+        (*style).border_left_color = parsed.color;
         return;
     }
 

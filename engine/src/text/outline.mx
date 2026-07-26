@@ -1,0 +1,408 @@
+// Glyph outlines from the `glyf` table.
+//
+// A TrueType outline is a set of closed contours of quadratic B-spline points.
+// Each point is flagged on-curve or off-curve; an off-curve point is a control
+// point, and two consecutive off-curve points imply an on-curve point midway
+// between them. This module extracts the raw points and then flattens the
+// curves into line segments, which is all the rasterizer needs.
+//
+// Composite glyphs — an 'é' assembled from 'e' and an acute accent — are
+// expanded by recursively appending their components with the recorded offset
+// applied. Component scaling is read but two-by-two transforms are applied
+// only in their simple scale form; skewed components are rare and would need
+// the full matrix.
+module engine.text.outline;
+
+import std.vec;
+import sfnt;
+import points;
+
+// A flattened outline: closed contours of straight segments, in font units
+// with y pointing up (the font's own coordinate system).
+resource struct TextOutline {
+    xs: Vec<f64>,
+    ys: Vec<f64>,
+    // Index one past the last point of each contour.
+    contour_ends: Vec<u64>,
+}
+
+pub fn new_outline() -> TextOutline {
+    return TextOutline {
+        xs: vec.new<f64>(),
+        ys: vec.new<f64>(),
+        contour_ends: vec.new<u64>(),
+    };
+}
+
+pub fn destroy(outline: *TextOutline) -> void {
+    vec.destroy(&(*outline).xs);
+    vec.destroy(&(*outline).ys);
+    vec.destroy(&(*outline).contour_ends);
+}
+
+pub fn point_count(outline: *TextOutline) -> u64 {
+    return (*outline).xs.length;
+}
+
+pub fn contour_count(outline: *TextOutline) -> u64 {
+    return (*outline).contour_ends.length;
+}
+
+pub fn contour_end(outline: *TextOutline, index: u64) -> u64 {
+    match vec.get(&(*outline).contour_ends, index) {
+        Option<u64>.Some(value) => { return value; },
+        Option<u64>.None => { return 0; },
+    }
+}
+
+pub fn point_x(outline: *TextOutline, index: u64) -> f64 {
+    match vec.get(&(*outline).xs, index) {
+        Option<f64>.Some(value) => { return value; },
+        Option<f64>.None => { return 0.0; },
+    }
+}
+
+pub fn point_y(outline: *TextOutline, index: u64) -> f64 {
+    match vec.get(&(*outline).ys, index) {
+        Option<f64>.Some(value) => { return value; },
+        Option<f64>.None => { return 0.0; },
+    }
+}
+
+fn push_point(outline: *TextOutline, x: f64, y: f64) -> void {
+    vec.push(&(*outline).xs, x);
+    vec.push(&(*outline).ys, y);
+}
+
+// Number of line segments to split a quadratic into. Curves in a glyph are
+// short, so a fixed subdivision is both cheap and visually sufficient at text
+// sizes; an adaptive flattener would matter at display sizes.
+fn curve_steps() -> u64 { return 8; }
+
+fn value_at(values: *Vec<f64>, index: u64) -> f64 {
+    match vec.get(values, index) {
+        Option<f64>.Some(value) => { return value; },
+        Option<f64>.None => { return 0.0; },
+    }
+}
+
+fn flag_at(values: *Vec<u64>, index: u64) -> u64 {
+    match vec.get(values, index) {
+        Option<u64>.Some(value) => { return value; },
+        Option<u64>.None => { return 0; },
+    }
+}
+
+fn emit_quadratic(
+    outline: *TextOutline,
+    x0: f64, y0: f64,
+    cx: f64, cy: f64,
+    x1: f64, y1: f64
+) -> void {
+    let steps: u64 = curve_steps();
+    for step: u64 in 1..(steps + 1) {
+        let t: f64 = (step as f64) / (steps as f64);
+        let inverse: f64 = 1.0 - t;
+        // The quadratic Bezier basis.
+        let x: f64 = inverse * inverse * x0 + 2.0 * inverse * t * cx + t * t * x1;
+        let y: f64 = inverse * inverse * y0 + 2.0 * inverse * t * cy + t * t * y1;
+        push_point(outline, x, y);
+    }
+}
+
+// --- Simple glyph parsing -----------------------------------------------------
+
+// Flags in the glyph point stream.
+fn flag_on_curve() -> u64 { return 1; }
+fn flag_x_short() -> u64 { return 2; }
+fn flag_y_short() -> u64 { return 4; }
+fn flag_repeat() -> u64 { return 8; }
+fn flag_x_same_or_positive() -> u64 { return 16; }
+fn flag_y_same_or_positive() -> u64 { return 32; }
+
+// Read a simple glyph's points into `points`, offset by (dx, dy) and scaled.
+fn read_simple(
+    face: *TextFace,
+    start: u64,
+    contours: u64,
+    out_points: *TextGlyphPoints,
+    dx: f64,
+    dy: f64,
+    scale_x: f64,
+    scale_y: f64
+) -> void {
+    let base: u64 = points.count(out_points);
+    let ends_at: u64 = start + 10;
+    let total: u64 = sfnt.u16_at(face, ends_at + (contours - 1) * 2) + 1;
+    // A malformed glyph can claim an absurd point count; cap it rather than
+    // allocate on a hostile number.
+    if total > 10000 {
+        return;
+    }
+    for index: u64 in 0..contours {
+        points.push_end(out_points,
+            base + sfnt.u16_at(face, ends_at + index * 2) + 1);
+    }
+
+    let instruction_length: u64 = sfnt.u16_at(face, ends_at + contours * 2);
+    let cursor: u64 = ends_at + contours * 2 + 2 + instruction_length;
+
+    // Flags, run-length encoded via the repeat bit.
+    let flags: Vec<u64> = vec.with_capacity<u64>(total + 1);
+    let read: u64 = 0;
+    while read < total {
+        let flag: u64 = sfnt.byte_at(face, cursor);
+        cursor = cursor + 1;
+        vec.push(&flags, flag);
+        read = read + 1;
+        if (flag & flag_repeat()) != 0 {
+            let repeats: u64 = sfnt.byte_at(face, cursor);
+            cursor = cursor + 1;
+            for step: u64 in 0..repeats {
+                if read < total {
+                    vec.push(&flags, flag);
+                    read = read + 1;
+                }
+            }
+        }
+    }
+
+    // X coordinates, stored as deltas.
+    let x: f64 = 0.0;
+    let x_values: Vec<f64> = vec.with_capacity<f64>(total + 1);
+    for index: u64 in 0..total {
+        let flag: u64 = flag_at(&flags, index);
+        if (flag & flag_x_short()) != 0 {
+            let delta: f64 = sfnt.byte_at(face, cursor) as f64;
+            cursor = cursor + 1;
+            if (flag & flag_x_same_or_positive()) != 0 {
+                x = x + delta;
+            } else {
+                x = x - delta;
+            }
+        } else if (flag & flag_x_same_or_positive()) == 0 {
+            x = x + (sfnt.i16_at(face, cursor) as f64);
+            cursor = cursor + 2;
+        }
+        vec.push(&x_values, x);
+    }
+
+    // Y coordinates, likewise.
+    let y: f64 = 0.0;
+    for index: u64 in 0..total {
+        let flag: u64 = flag_at(&flags, index);
+        if (flag & flag_y_short()) != 0 {
+            let delta: f64 = sfnt.byte_at(face, cursor) as f64;
+            cursor = cursor + 1;
+            if (flag & flag_y_same_or_positive()) != 0 {
+                y = y + delta;
+            } else {
+                y = y - delta;
+            }
+        } else if (flag & flag_y_same_or_positive()) == 0 {
+            y = y + (sfnt.i16_at(face, cursor) as f64);
+            cursor = cursor + 2;
+        }
+        points.push(out_points,
+            value_at(&x_values, index) * scale_x + dx,
+            y * scale_y + dy,
+            (flag_at(&flags, index) & flag_on_curve()) != 0);
+    }
+    vec.destroy(&x_values);
+    vec.destroy(&flags);
+}
+
+// Append a glyph's points, following composite references up to a depth limit
+// (a font can, accidentally or deliberately, describe a cycle).
+fn append_glyph(
+    face: *TextFace,
+    glyph: u64,
+    out_points: *TextGlyphPoints,
+    dx: f64,
+    dy: f64,
+    scale_x: f64,
+    scale_y: f64,
+    depth: u64
+) -> void {
+    if depth > 5 {
+        return;
+    }
+    let start: u64 = sfnt.glyph_range_start(face, glyph);
+    let end: u64 = sfnt.glyph_range_end(face, glyph);
+    if end <= start {
+        // No outline: a space, or an empty glyph.
+        return;
+    }
+    let contours: i64 = sfnt.i16_at(face, start);
+    if contours > 0 {
+        read_simple(face, start, contours as u64, out_points, dx, dy, scale_x, scale_y);
+        return;
+    }
+    if contours == 0 {
+        return;
+    }
+
+    // Composite glyph: a sequence of component records.
+    let cursor: u64 = start + 10;
+    let more: bool = true;
+    while more {
+        let flags: u64 = sfnt.u16_at(face, cursor);
+        let component: u64 = sfnt.u16_at(face, cursor + 2);
+        cursor = cursor + 4;
+        let arg1: i64 = 0;
+        let arg2: i64 = 0;
+        if (flags & (1 as u64)) != 0 {
+            // ARG_1_AND_2_ARE_WORDS
+            arg1 = sfnt.i16_at(face, cursor);
+            arg2 = sfnt.i16_at(face, cursor + 2);
+            cursor = cursor + 4;
+        } else {
+            arg1 = sfnt.byte_at(face, cursor) as i64;
+            arg2 = sfnt.byte_at(face, cursor + 1) as i64;
+            if arg1 >= 128 { arg1 = arg1 - 256; }
+            if arg2 >= 128 { arg2 = arg2 - 256; }
+            cursor = cursor + 2;
+        }
+        let component_scale_x: f64 = 1.0;
+        let component_scale_y: f64 = 1.0;
+        if (flags & (8 as u64)) != 0 {
+            // WE_HAVE_A_SCALE: one F2Dot14 applied to both axes.
+            component_scale_x = f2dot14(face, cursor);
+            component_scale_y = component_scale_x;
+            cursor = cursor + 2;
+        } else if (flags & (64 as u64)) != 0 {
+            // WE_HAVE_AN_X_AND_Y_SCALE
+            component_scale_x = f2dot14(face, cursor);
+            component_scale_y = f2dot14(face, cursor + 2);
+            cursor = cursor + 4;
+        } else if (flags & (128 as u64)) != 0 {
+            // WE_HAVE_A_TWO_BY_TWO: only the diagonal is applied, so a skewed
+            // or rotated component renders upright rather than not at all.
+            component_scale_x = f2dot14(face, cursor);
+            component_scale_y = f2dot14(face, cursor + 6);
+            cursor = cursor + 8;
+        }
+
+        // ARGS_ARE_XY_VALUES; point-matching placement is not supported and
+        // would need the parent's points, which are not tracked here.
+        let offset_x: f64 = 0.0;
+        let offset_y: f64 = 0.0;
+        if (flags & (2 as u64)) != 0 {
+            offset_x = (arg1 as f64) * scale_x;
+            offset_y = (arg2 as f64) * scale_y;
+        }
+        append_glyph(face, component, out_points,
+            dx + offset_x, dy + offset_y,
+            scale_x * component_scale_x, scale_y * component_scale_y,
+            depth + 1);
+
+        more = (flags & (32 as u64)) != 0;  // MORE_COMPONENTS
+    }
+}
+
+// F2Dot14: a signed fixed-point value with two integer bits.
+fn f2dot14(face: *TextFace, offset: u64) -> f64 {
+    return (sfnt.i16_at(face, offset) as f64) / 16384.0;
+}
+
+// --- Flattening ---------------------------------------------------------------
+
+// Convert one contour's on/off-curve points into line segments.
+fn flatten_contour(
+    out_points: *TextGlyphPoints,
+    first: u64,
+    limit: u64,
+    outline: *TextOutline
+) -> void {
+    let count: u64 = limit - first;
+    if count < 2 {
+        return;
+    }
+
+    // The contour may start on an off-curve point, in which case the start is
+    // either the last point (if on-curve) or the midpoint between them.
+    let start_x: f64 = 0.0;
+    let start_y: f64 = 0.0;
+    let begin: u64 = first;
+    if points.on_curve_at(out_points, first) {
+        start_x = points.x_at(out_points, first);
+        start_y = points.y_at(out_points, first);
+        begin = first + 1;
+    } else if points.on_curve_at(out_points, limit - 1) {
+        start_x = points.x_at(out_points, limit - 1);
+        start_y = points.y_at(out_points, limit - 1);
+    } else {
+        start_x = (points.x_at(out_points, first)
+            + points.x_at(out_points, limit - 1)) / 2.0;
+        start_y = (points.y_at(out_points, first)
+            + points.y_at(out_points, limit - 1)) / 2.0;
+    }
+
+    push_point(outline, start_x, start_y);
+    let current_x: f64 = start_x;
+    let current_y: f64 = start_y;
+    let have_control: bool = false;
+    let control_x: f64 = 0.0;
+    let control_y: f64 = 0.0;
+
+    for step: u64 in 0..count {
+        let index: u64 = begin + step;
+        // Wrap around the contour.
+        while index >= limit {
+            index = index - count;
+        }
+        let px: f64 = points.x_at(out_points, index);
+        let py: f64 = points.y_at(out_points, index);
+        if points.on_curve_at(out_points, index) {
+            if have_control {
+                emit_quadratic(outline, current_x, current_y,
+                    control_x, control_y, px, py);
+                have_control = false;
+            } else {
+                push_point(outline, px, py);
+            }
+            current_x = px;
+            current_y = py;
+        } else {
+            if have_control {
+                // Two controls in a row imply an on-curve point between them.
+                let mid_x: f64 = (control_x + px) / 2.0;
+                let mid_y: f64 = (control_y + py) / 2.0;
+                emit_quadratic(outline, current_x, current_y,
+                    control_x, control_y, mid_x, mid_y);
+                current_x = mid_x;
+                current_y = mid_y;
+            }
+            control_x = px;
+            control_y = py;
+            have_control = true;
+        }
+    }
+    // Close the contour back to its start.
+    if have_control {
+        emit_quadratic(outline, current_x, current_y,
+            control_x, control_y, start_x, start_y);
+    } else {
+        push_point(outline, start_x, start_y);
+    }
+    vec.push(&(*outline).contour_ends, (*outline).xs.length);
+}
+
+// Build the flattened outline of `glyph`, in font units. The caller owns the
+// result and must destroy it.
+pub fn build(face: *TextFace, glyph: u64) -> TextOutline {
+    let outline: TextOutline = new_outline();
+    let scratch: TextGlyphPoints = points.new_points();
+    append_glyph(face, glyph, &scratch, 0.0, 0.0, 1.0, 1.0, 0);
+
+    let first: u64 = 0;
+    for index: u64 in 0..points.contour_count(&scratch) {
+        let limit: u64 = points.end_at(&scratch, index);
+        if limit > first && limit <= points.count(&scratch) {
+            flatten_contour(&scratch, first, limit, &outline);
+        }
+        first = limit;
+    }
+    points.destroy(&scratch);
+    return move outline;
+}

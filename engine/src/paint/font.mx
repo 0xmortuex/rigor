@@ -7,12 +7,12 @@
 // 8x8 monochrome font (based on work by Marcel Sondaar). Vendored so builds
 // are offline and reproducible.
 //
-// This is a stand-in until real font parsing lands: glyphs are monospaced and
-// only cover ASCII, so text rendered through it is legible but neither shaped
-// nor metrically matched to the advances engine.layout.metrics reports. Paint
-// scales each glyph to the nearest whole multiple of 8 pixels and positions it
-// using the layout advance, so the two stay in step even though the shapes are
-// not proportional.
+// This is the fallback used only when no real face is installed — see
+// engine.text.sfnt for the TrueType path that normally renders text. Glyphs
+// here are monospaced and cover ASCII only, so paint stretches each one into
+// the advance layout measured; the result is legible but not typography.
+// Keeping it means the engine still draws something on a system with no usable
+// font file, and that tests can run without depending on the host's fonts.
 //
 // Each glyph is eight bytes, one per row, with bit 0 the leftmost pixel.
 module engine.paint.font;

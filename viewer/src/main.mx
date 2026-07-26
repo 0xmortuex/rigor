@@ -28,6 +28,8 @@ import engine.layout.box;
 import engine.layout.flow;
 import engine.paint.canvas;
 import engine.paint.paint;
+import engine.text.fonts;
+import engine.text.load;
 
 extern fn getchar() -> c_int;
 
@@ -244,15 +246,17 @@ fn main() -> int {
     if viewport < 1.0 {
         viewport = 800.0;
     }
+    let font_set: TextFontSet = fonts.new_set();
+    load.load_windows_defaults(&font_set);
     let boxes: LayoutTree = box.new_tree();
-    flow.layout(&doc, &styles, &boxes, viewport);
+    flow.layout(&doc, &styles, &boxes, &font_set, viewport);
 
     let page_height: u64 = (flow.document_height(&boxes) + 0.5) as u64;
     if page_height < 1 {
         page_height = 1;
     }
     let target: Canvas = canvas.new_canvas(viewport as u64, page_height);
-    paint.paint(&target, &boxes, &styles);
+    paint.paint(&target, &boxes, &styles, &font_set);
 
     PAGE_PIXELS = canvas.pixels(&target);
     PAGE_WIDTH = viewport as i32;
@@ -270,6 +274,7 @@ fn main() -> int {
 
     canvas.destroy(&target);
     box.destroy(&boxes);
+    fonts.destroy(&font_set);
     computed.destroy(&styles);
     stylesheet.destroy(&ua_sheet);
     css_tokens.destroy(&ua_sink);

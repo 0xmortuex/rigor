@@ -16,6 +16,24 @@ Rigor is the classic engine pipeline, each stage an independent module of the
 Every stage above exists today. See ROADMAP.md for what each one does not yet
 cover.
 
+## Font parsing is in the engine; font policy is not
+
+`engine/src/text/` parses TrueType: the table directory, `cmap` for
+character-to-glyph mapping, `hmtx` for advances, `glyf` for outlines, and a
+scanline rasterizer that fills them with the nonzero winding rule. None of it
+touches the filesystem.
+
+Which files exist on a machine, and what `sans-serif` should resolve to there,
+is a property of the system rather than of the format — so an embedder loads
+the bytes it wants and installs them into a `TextFontSet`. `engine/src/text/
+load.mx` holds the Windows mapping and is the one piece of that layer that
+would change on another platform.
+
+The rasterizer samples four sub-scanlines per pixel row but computes horizontal
+coverage exactly. That asymmetry is deliberate: horizontal exactness costs two
+divisions per span and is what makes stem edges look clean, while each extra
+vertical sample costs a full edge walk.
+
 ## The platform boundary is one file
 
 The engine renders into a BGRA byte buffer and knows nothing about any

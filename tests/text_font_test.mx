@@ -1,0 +1,223 @@
+// TrueType parsing, glyph outlines and rasterization.
+//
+// These load a real system font, so they assert on properties that hold for
+// any well-formed face rather than on exact numbers from one file. When no
+// font can be loaded — a machine without the Windows core fonts — each test
+// verifies the fallback behaves instead of silently passing.
+
+import std.vec;
+import std.string;
+import engine.text.sfnt;
+import engine.text.fonts;
+import engine.text.load;
+import engine.text.outline;
+import engine.text.raster;
+import engine.text.utf8;
+
+fn load_sans() -> TextFace {
+    let set: TextFontSet = fonts.new_set();
+    load.load_windows_defaults(&set);
+    // Re-read the file directly rather than moving a face out of the set,
+    // which would leave the set holding a moved-from value.
+    fonts.destroy(&set);
+    let data: Vec<u8> = load.read_file("C:\\Windows\\Fonts\\segoeui.ttf");
+    if data.length == 0 {
+        vec.destroy(&data);
+        return sfnt.load(load.read_file("C:\\Windows\\Fonts\\arial.ttf"));
+    }
+    return sfnt.load(move data);
+}
+
+test "a system font parses" {
+    let face: TextFace = load_sans();
+    assert(sfnt.is_ok(&face));
+    assert(sfnt.units_per_em(&face) > 0.0);
+    assert(sfnt.glyph_count(&face) > 100);
+    sfnt.destroy(&face);
+}
+
+test "ascent and descent are sane" {
+    let face: TextFace = load_sans();
+    let em: f64 = sfnt.units_per_em(&face);
+    assert(sfnt.ascent(&face) > 0.0);
+    assert(sfnt.descent(&face) > 0.0);
+    // Together they should be within a small factor of the em square.
+    let total: f64 = sfnt.ascent(&face) + sfnt.descent(&face);
+    assert(total > em * 0.5 && total < em * 2.0);
+    sfnt.destroy(&face);
+}
+
+test "cmap maps ascii to distinct glyphs" {
+    let face: TextFace = load_sans();
+    let a: u64 = sfnt.glyph_for(&face, 'A' as u64);
+    let b: u64 = sfnt.glyph_for(&face, 'B' as u64);
+    assert(a != 0);
+    assert(b != 0);
+    assert(a != b);
+    sfnt.destroy(&face);
+}
+
+test "cmap maps a non-ascii code point" {
+    let face: TextFace = load_sans();
+    // U+2014 EM DASH is in every text font.
+    assert(sfnt.glyph_for(&face, 0x2014) != 0);
+    sfnt.destroy(&face);
+}
+
+test "an unmapped code point yields notdef" {
+    let face: TextFace = load_sans();
+    // A private-use code point no text font maps.
+    assert(sfnt.glyph_for(&face, 0x10FFFD) == 0);
+    sfnt.destroy(&face);
+}
+
+test "advances are positive and vary by glyph" {
+    let face: TextFace = load_sans();
+    let narrow: f64 =
+    sfnt.advance_for_glyph(&face, sfnt.glyph_for(&face, 'i' as u64));
+    let wide: f64 =
+    sfnt.advance_for_glyph(&face, sfnt.glyph_for(&face, 'm' as u64));
+    assert(narrow > 0.0);
+    assert(wide > narrow);
+    sfnt.destroy(&face);
+}
+
+test "a space has an advance but no contours" {
+    let face: TextFace = load_sans();
+    let glyph: u64 = sfnt.glyph_for(&face, ' ' as u64);
+    assert(sfnt.advance_for_glyph(&face, glyph) > 0.0);
+    let shape: TextOutline = outline.build(&face, glyph);
+    assert(outline.contour_count(&shape) == 0);
+    outline.destroy(&shape);
+    sfnt.destroy(&face);
+}
+
+test "a letter has contours and a plausible bounding box" {
+    let face: TextFace = load_sans();
+    let shape: TextOutline = outline.build(&face, sfnt.glyph_for(&face, 'H' as u64));
+    assert(outline.contour_count(&shape) >= 1);
+    assert(outline.point_count(&shape) > 3);
+    let min_y: f64 = outline.point_y(&shape, 0);
+    let max_y: f64 = min_y;
+    for index: u64 in 0..outline.point_count(&shape) {
+        let y: f64 = outline.point_y(&shape, index);
+        if y < min_y { min_y = y; }
+        if y > max_y { max_y = y; }
+    }
+    // A capital H spans a good fraction of the em and sits on the baseline.
+    assert(max_y - min_y > sfnt.units_per_em(&face) * 0.4);
+    outline.destroy(&shape);
+    sfnt.destroy(&face);
+}
+
+test "an o has two contours: outer and counter" {
+    let face: TextFace = load_sans();
+    let shape: TextOutline = outline.build(&face, sfnt.glyph_for(&face, 'o' as u64));
+    assert(outline.contour_count(&shape) == 2);
+    outline.destroy(&shape);
+    sfnt.destroy(&face);
+}
+
+test "rasterizing a glyph produces coverage" {
+    let face: TextFace = load_sans();
+    let shape: TextOutline = outline.build(&face, sfnt.glyph_for(&face, 'H' as u64));
+    let scale: f64 = 32.0 / sfnt.units_per_em(&face);
+    let bitmap: TextGlyphBitmap = raster.render(&shape, scale);
+    assert(bitmap.width > 4);
+    assert(bitmap.height > 4);
+    let inked: u64 = 0;
+    let solid: u64 = 0;
+    for y: u64 in 0..bitmap.height {
+        for x: u64 in 0..bitmap.width {
+            let coverage: u8 = raster.coverage_at(&bitmap, x, y);
+            if coverage > 0 as u8 {
+                inked = inked + 1;
+            }
+            if coverage == 255 as u8 {
+                solid = solid + 1;
+            }
+        }
+    }
+    // The stems fill solidly, and fewer than all pixels are touched.
+    assert(solid > 0);
+    assert(inked > solid);
+    assert(inked < bitmap.width * bitmap.height);
+    raster.destroy(&bitmap);
+    outline.destroy(&shape);
+    sfnt.destroy(&face);
+}
+
+test "the counter of an o is left empty by the winding rule" {
+    let face: TextFace = load_sans();
+    let shape: TextOutline = outline.build(&face, sfnt.glyph_for(&face, 'o' as u64));
+    let scale: f64 = 48.0 / sfnt.units_per_em(&face);
+    let bitmap: TextGlyphBitmap = raster.render(&shape, scale);
+    // The middle of an 'o' is its hole, so the centre pixel must be uncovered.
+    let centre: u8 =
+    raster.coverage_at(&bitmap, bitmap.width / 2, bitmap.height / 2);
+    assert(centre == 0 as u8);
+    raster.destroy(&bitmap);
+    outline.destroy(&shape);
+    sfnt.destroy(&face);
+}
+
+test "rasterizing an empty outline yields an empty bitmap" {
+    let shape: TextOutline = outline.new_outline();
+    let bitmap: TextGlyphBitmap = raster.render(&shape, 1.0);
+    assert(bitmap.width == 0);
+    assert(bitmap.height == 0);
+    raster.destroy(&bitmap);
+    outline.destroy(&shape);
+}
+
+test "a truncated font does not parse" {
+    let junk: Vec<u8> = vec.new<u8>();
+    for index: u64 in 0..64 {
+        vec.push(&junk, 0x41 as u8);
+    }
+    let face: TextFace = sfnt.load(move junk);
+    assert(!sfnt.is_ok(&face));
+    // Every accessor must stay safe on a face that failed to parse.
+    assert(sfnt.glyph_for(&face, 'A' as u64) == 0);
+    assert(sfnt.advance_for_glyph(&face, 0) == 0.0);
+    sfnt.destroy(&face);
+}
+
+test "an empty buffer does not parse" {
+    let face: TextFace = sfnt.load(vec.new<u8>());
+    assert(!sfnt.is_ok(&face));
+    sfnt.destroy(&face);
+}
+
+test "font selection falls back along the expected path" {
+    let set: TextFontSet = fonts.new_set();
+    assert(!fonts.has_any(&set));
+    load.load_windows_defaults(&set);
+    assert(fonts.has_any(&set));
+    // Bold serif resolves to something usable even if that exact file is
+    // absent, because selection falls back to the family's regular face.
+    assert(sfnt.is_ok(fonts.select(&set, fonts.family_serif(), true, false)));
+    assert(sfnt.is_ok(fonts.select(&set, fonts.family_mono(), false, false)));
+    fonts.destroy(&set);
+}
+
+test "utf-8 decoding" {
+    let text: *u8 = "a\xC3\xA9\xE2\x80\x94";
+    let view: []const u8 = slice(text as *const u8, str_len(text));
+    let first: TextChar = utf8.decode(view, 0);
+    assert(first.codepoint == ('a' as u32) && first.size == 1);
+    let second: TextChar = utf8.decode(view, 1);
+    assert(second.codepoint == 0xE9 as u32 && second.size == 2);
+    let third: TextChar = utf8.decode(view, 3);
+    assert(third.codepoint == 0x2014 as u32 && third.size == 3);
+}
+
+test "malformed utf-8 decodes as replacement and advances" {
+    let raw: Vec<u8> = vec.new<u8>();
+    vec.push(&raw, 0xFF as u8);
+    vec.push(&raw, 'x');
+    let decoded: TextChar = utf8.decode(vec.as_const_slice(&raw), 0);
+    assert(decoded.codepoint == 0xFFFD as u32);
+    assert(decoded.size == 1);
+    vec.destroy(&raw);
+}

@@ -1,0 +1,365 @@
+// TrueType/OpenType font parsing — the SFNT container and its core tables.
+//
+// A font file is a table directory followed by tagged tables. This module
+// locates the tables rigor needs, reads the metrics out of `head`, `hhea` and
+// `hmtx`, and maps characters to glyph ids through `cmap`. Outline extraction
+// lives in engine.text.outline and rasterization in engine.text.raster.
+//
+// Everything is big-endian, and every read is bounds-checked against the
+// buffer: a font file is untrusted input, and a truncated or hostile one must
+// produce a face that reports no glyphs rather than reading out of bounds.
+//
+// Supported: `glyf`-based outlines (the TrueType flavour, which is what the
+// Windows core fonts are). CFF/Type-2 outlines — the OpenType flavour used by
+// many downloadable fonts — are not parsed; a face that has `CFF ` instead of
+// `glyf` reports itself as not usable so the caller can fall back.
+module engine.text.sfnt;
+
+import std.vec;
+
+resource struct TextFace {
+    data: Vec<u8>,
+    ok: bool,
+
+    units_per_em: f64,
+    ascender: f64,
+    descender: f64,
+    line_gap: f64,
+    num_glyphs: u64,
+    long_loca: bool,
+    num_h_metrics: u64,
+
+    head_off: u64,
+    hmtx_off: u64,
+    hmtx_len: u64,
+    loca_off: u64,
+    loca_len: u64,
+    glyf_off: u64,
+    glyf_len: u64,
+
+    // The chosen cmap subtable, and its format (4 or 12; 0 when none usable).
+    cmap_off: u64,
+    cmap_format: u64,
+}
+
+// --- Bounds-checked big-endian readers ---------------------------------------
+
+pub fn byte_at(face: *TextFace, offset: u64) -> u64 {
+    if offset >= (*face).data.length {
+        return 0;
+    }
+    return (*face).data.data[offset] as u64;
+}
+
+pub fn u16_at(face: *TextFace, offset: u64) -> u64 {
+    return (byte_at(face, offset) << 8) | byte_at(face, offset + 1);
+}
+
+pub fn i16_at(face: *TextFace, offset: u64) -> i64 {
+    let value: i64 = u16_at(face, offset) as i64;
+    if value >= 32768 {
+        return value - 65536;
+    }
+    return value;
+}
+
+pub fn u32_at(face: *TextFace, offset: u64) -> u64 {
+    return (byte_at(face, offset) << 24) | (byte_at(face, offset + 1) << 16)
+        | (byte_at(face, offset + 2) << 8) | byte_at(face, offset + 3);
+}
+
+fn tag_at(face: *TextFace, offset: u64) -> u64 {
+    return u32_at(face, offset);
+}
+
+// A four-character table tag packed the same way tag_at reads one.
+fn tag(a: u8, b: u8, c: u8, d: u8) -> u64 {
+    return ((a as u64) << 24) | ((b as u64) << 16) | ((c as u64) << 8)
+        | (d as u64);
+}
+
+// --- Table directory ----------------------------------------------------------
+
+struct TextTable {
+    offset: u64,
+    length: u64,
+}
+
+fn find_table(face: *TextFace, wanted: u64) -> TextTable {
+    let count: u64 = u16_at(face, 4);
+    for index: u64 in 0..count {
+        let entry: u64 = 12 + index * 16;
+        if tag_at(face, entry) == wanted {
+            let offset: u64 = u32_at(face, entry + 8);
+            let length: u64 = u32_at(face, entry + 12);
+            if offset >= (*face).data.length {
+                return TextTable { offset: 0, length: 0 };
+            }
+            if offset + length > (*face).data.length {
+                length = (*face).data.length - offset;
+            }
+            return TextTable { offset: offset, length: length };
+        }
+    }
+    return TextTable { offset: 0, length: 0 };
+}
+
+// Choose the best cmap subtable: a full-Unicode format 12 if present,
+// otherwise a BMP format 4. Anything else is unusable.
+fn select_cmap(face: *TextFace, cmap: TextTable) -> void {
+    (*face).cmap_off = 0;
+    (*face).cmap_format = 0;
+    if cmap.length == 0 {
+        return;
+    }
+    let count: u64 = u16_at(face, cmap.offset + 2);
+    let best_off: u64 = 0;
+    let best_format: u64 = 0;
+    for index: u64 in 0..count {
+        let record: u64 = cmap.offset + 4 + index * 8;
+        let platform: u64 = u16_at(face, record);
+        let encoding: u64 = u16_at(face, record + 2);
+        let sub: u64 = cmap.offset + u32_at(face, record + 4);
+        let format: u64 = u16_at(face, sub);
+        let unicode: bool = platform == 0
+            || (platform == 3 && (encoding == 1 || encoding == 10));
+        if !unicode {
+            continue;
+        }
+        if format == 12 {
+            best_off = sub;
+            best_format = 12;
+        } else if format == 4 && best_format != 12 {
+            best_off = sub;
+            best_format = 4;
+        }
+    }
+    (*face).cmap_off = best_off;
+    (*face).cmap_format = best_format;
+}
+
+// Parse `data` as a font, taking ownership of the buffer. Check ok() before
+// using the result.
+pub fn load(data: Vec<u8>) -> TextFace {
+    let face: TextFace = TextFace {
+        data: move data,
+        ok: false,
+        units_per_em: 1000.0,
+        ascender: 800.0,
+        descender: 0.0 - 200.0,
+        line_gap: 0.0,
+        num_glyphs: 0,
+        long_loca: false,
+        num_h_metrics: 0,
+        head_off: 0, hmtx_off: 0, hmtx_len: 0,
+        loca_off: 0, loca_len: 0, glyf_off: 0, glyf_len: 0,
+        cmap_off: 0, cmap_format: 0,
+    };
+    if face.data.length < 12 {
+        return move face;
+    }
+    let version: u64 = u32_at(&face, 0);
+    // 0x00010000 is TrueType outlines; 'true' is the old Apple variant. The
+    // 'OTTO' tag means CFF outlines, which this parser does not read.
+    if version != 0x00010000 && version != tag('t', 'r', 'u', 'e') {
+        return move face;
+    }
+
+    let head: TextTable = find_table(&face, tag('h', 'e', 'a', 'd'));
+    let hhea: TextTable = find_table(&face, tag('h', 'h', 'e', 'a'));
+    let hmtx: TextTable = find_table(&face, tag('h', 'm', 't', 'x'));
+    let maxp: TextTable = find_table(&face, tag('m', 'a', 'x', 'p'));
+    let loca: TextTable = find_table(&face, tag('l', 'o', 'c', 'a'));
+    let glyf: TextTable = find_table(&face, tag('g', 'l', 'y', 'f'));
+    let cmap: TextTable = find_table(&face, tag('c', 'm', 'a', 'p'));
+    if head.length == 0 || hhea.length == 0 || hmtx.length == 0
+        || maxp.length == 0 || loca.length == 0 || glyf.length == 0 {
+        return move face;
+    }
+
+    let units: u64 = u16_at(&face, head.offset + 18);
+    if units == 0 {
+        return move face;
+    }
+    face.units_per_em = units as f64;
+    face.long_loca = i16_at(&face, head.offset + 50) == 1;
+    face.head_off = head.offset;
+
+    face.ascender = i16_at(&face, hhea.offset + 4) as f64;
+    face.descender = i16_at(&face, hhea.offset + 6) as f64;
+    face.line_gap = i16_at(&face, hhea.offset + 8) as f64;
+    face.num_h_metrics = u16_at(&face, hhea.offset + 34);
+
+    face.num_glyphs = u16_at(&face, maxp.offset + 4);
+    face.hmtx_off = hmtx.offset;
+    face.hmtx_len = hmtx.length;
+    face.loca_off = loca.offset;
+    face.loca_len = loca.length;
+    face.glyf_off = glyf.offset;
+    face.glyf_len = glyf.length;
+
+    select_cmap(&face, cmap);
+    face.ok = face.num_glyphs > 0 && face.num_h_metrics > 0;
+    return move face;
+}
+
+pub fn destroy(face: *TextFace) -> void {
+    vec.destroy(&(*face).data);
+    (*face).ok = false;
+}
+
+pub fn is_ok(face: *TextFace) -> bool {
+    return (*face).ok;
+}
+
+pub fn units_per_em(face: *TextFace) -> f64 {
+    return (*face).units_per_em;
+}
+
+pub fn glyph_count(face: *TextFace) -> u64 {
+    return (*face).num_glyphs;
+}
+
+// Ascent and descent in font units. Descent is returned positive-down, which
+// is the sign convention layout uses.
+pub fn ascent(face: *TextFace) -> f64 {
+    return (*face).ascender;
+}
+
+pub fn descent(face: *TextFace) -> f64 {
+    return 0.0 - (*face).descender;
+}
+
+pub fn line_gap(face: *TextFace) -> f64 {
+    return (*face).line_gap;
+}
+
+// --- cmap lookup --------------------------------------------------------------
+
+fn lookup_format4(face: *TextFace, codepoint: u64) -> u64 {
+    if codepoint > 0xFFFF {
+        return 0;
+    }
+    let table: u64 = (*face).cmap_off;
+    let seg_x2: u64 = u16_at(face, table + 6);
+    if seg_x2 == 0 {
+        return 0;
+    }
+    let segments: u64 = seg_x2 / 2;
+    let ends: u64 = table + 14;
+    let starts: u64 = ends + seg_x2 + 2;
+    let deltas: u64 = starts + seg_x2;
+    let ranges: u64 = deltas + seg_x2;
+
+    // Segments are sorted by end code, so a binary search finds the one that
+    // could contain this character.
+    let low: u64 = 0;
+    let high: u64 = segments;
+    while low < high {
+        let mid: u64 = low + (high - low) / 2;
+        if u16_at(face, ends + mid * 2) < codepoint {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    if low >= segments {
+        return 0;
+    }
+    let start: u64 = u16_at(face, starts + low * 2);
+    if codepoint < start {
+        return 0;
+    }
+    let range_offset: u64 = u16_at(face, ranges + low * 2);
+    let delta: u64 = u16_at(face, deltas + low * 2);
+    if range_offset == 0 {
+        return (codepoint + delta) & (0xFFFF as u64);
+    }
+    // The offset is relative to its own slot in the range-offset array.
+    let index_addr: u64 =
+        ranges + low * 2 + range_offset + (codepoint - start) * 2;
+    let glyph: u64 = u16_at(face, index_addr);
+    if glyph == 0 {
+        return 0;
+    }
+    return (glyph + delta) & (0xFFFF as u64);
+}
+
+fn lookup_format12(face: *TextFace, codepoint: u64) -> u64 {
+    let table: u64 = (*face).cmap_off;
+    let groups: u64 = u32_at(face, table + 12);
+    let base: u64 = table + 16;
+    let low: u64 = 0;
+    let high: u64 = groups;
+    while low < high {
+        let mid: u64 = low + (high - low) / 2;
+        let record: u64 = base + mid * 12;
+        let first: u64 = u32_at(face, record);
+        let last: u64 = u32_at(face, record + 4);
+        if codepoint < first {
+            high = mid;
+        } else if codepoint > last {
+            low = mid + 1;
+        } else {
+            return u32_at(face, record + 8) + (codepoint - first);
+        }
+    }
+    return 0;
+}
+
+// The glyph id for a code point, or 0 (the .notdef glyph) when unmapped.
+pub fn glyph_for(face: *TextFace, codepoint: u64) -> u64 {
+    if !(*face).ok || (*face).cmap_format == 0 {
+        return 0;
+    }
+    let glyph: u64 = 0;
+    if (*face).cmap_format == 12 {
+        glyph = lookup_format12(face, codepoint);
+    } else {
+        glyph = lookup_format4(face, codepoint);
+    }
+    if glyph >= (*face).num_glyphs {
+        return 0;
+    }
+    return glyph;
+}
+
+// --- Metrics ------------------------------------------------------------------
+
+// The advance width of a glyph, in font units. Glyphs past the end of the
+// hmtx metric array all share the last entry's advance, which is how
+// monospaced tails are stored.
+pub fn advance_for_glyph(face: *TextFace, glyph: u64) -> f64 {
+    if !(*face).ok {
+        return 0.0;
+    }
+    let index: u64 = glyph;
+    if index >= (*face).num_h_metrics {
+        index = (*face).num_h_metrics - 1;
+    }
+    return u16_at(face, (*face).hmtx_off + index * 4) as f64;
+}
+
+// --- glyf/loca access ---------------------------------------------------------
+
+// Byte range of a glyph's outline data within the file. A zero-length range
+// means the glyph has no contours, which is normal for a space.
+pub fn glyph_range_start(face: *TextFace, glyph: u64) -> u64 {
+    if glyph >= (*face).num_glyphs {
+        return 0;
+    }
+    if (*face).long_loca {
+        return (*face).glyf_off + u32_at(face, (*face).loca_off + glyph * 4);
+    }
+    return (*face).glyf_off + u16_at(face, (*face).loca_off + glyph * 2) * 2;
+}
+
+pub fn glyph_range_end(face: *TextFace, glyph: u64) -> u64 {
+    if glyph >= (*face).num_glyphs {
+        return 0;
+    }
+    if (*face).long_loca {
+        return (*face).glyf_off + u32_at(face, (*face).loca_off + (glyph + 1) * 4);
+    }
+    return (*face).glyf_off + u16_at(face, (*face).loca_off + (glyph + 1) * 2) * 2;
+}
