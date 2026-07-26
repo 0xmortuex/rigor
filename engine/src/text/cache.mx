@@ -1,0 +1,242 @@
+// A cache of rasterized glyphs.
+//
+// A page reuses the same handful of glyphs hundreds of times — every 'e' at
+// body size is the same bitmap — but rasterizing one means parsing its
+// outline, flattening every curve and walking every edge four times per pixel
+// row. Caching by (face, glyph, size) turns all but the first occurrence into
+// a lookup.
+//
+// Storage is parallel arrays plus one shared coverage pool, the same arena
+// shape used everywhere else in the engine. Lookup is an open-addressed hash
+// table with linear probing; the bucket array holds entry index + 1 so that
+// zero means empty.
+//
+// There is no eviction. A rendered page touches a bounded set of glyph/size
+// pairs, so the cache converges; past a hard cap it simply stops admitting new
+// entries and those glyphs are rasterized every time, which is slower but
+// still correct.
+module engine.text.cache;
+
+import std.vec;
+import outline;
+import raster;
+import sfnt;
+
+resource struct TextGlyphCache {
+    // Keys.
+    face_ids: Vec<u64>,
+    glyph_ids: Vec<u64>,
+    sizes: Vec<u64>,
+    // Values: a span of the coverage pool plus the bitmap's shape.
+    offsets: Vec<u64>,
+    widths: Vec<u64>,
+    heights: Vec<u64>,
+    lefts: Vec<f64>,
+    tops: Vec<f64>,
+    pool: Vec<u8>,
+    // index + 1 into the key arrays, or 0 for an empty bucket.
+    buckets: Vec<u64>,
+    mask: u64,
+    hits: u64,
+    misses: u64,
+}
+
+fn initial_buckets() -> u64 { return 1024; }
+fn max_entries() -> u64 { return 4096; }
+
+pub fn new_cache() -> TextGlyphCache {
+    let created: TextGlyphCache = TextGlyphCache {
+        face_ids: vec.new<u64>(),
+        glyph_ids: vec.new<u64>(),
+        sizes: vec.new<u64>(),
+        offsets: vec.new<u64>(),
+        widths: vec.new<u64>(),
+        heights: vec.new<u64>(),
+        lefts: vec.new<f64>(),
+        tops: vec.new<f64>(),
+        pool: vec.new<u8>(),
+        buckets: vec.with_capacity<u64>(initial_buckets() + 1),
+        mask: initial_buckets() - 1,
+        hits: 0,
+        misses: 0,
+    };
+    for index: u64 in 0..initial_buckets() {
+        vec.push(&created.buckets, 0 as u64);
+    }
+    return move created;
+}
+
+pub fn destroy(cache: *TextGlyphCache) -> void {
+    vec.destroy(&(*cache).face_ids);
+    vec.destroy(&(*cache).glyph_ids);
+    vec.destroy(&(*cache).sizes);
+    vec.destroy(&(*cache).offsets);
+    vec.destroy(&(*cache).widths);
+    vec.destroy(&(*cache).heights);
+    vec.destroy(&(*cache).lefts);
+    vec.destroy(&(*cache).tops);
+    vec.destroy(&(*cache).pool);
+    vec.destroy(&(*cache).buckets);
+}
+
+pub fn entry_count(cache: *TextGlyphCache) -> u64 {
+    return (*cache).glyph_ids.length;
+}
+
+pub fn hits(cache: *TextGlyphCache) -> u64 { return (*cache).hits; }
+pub fn misses(cache: *TextGlyphCache) -> u64 { return (*cache).misses; }
+
+// A rendered glyph as the cache holds it: a view into the shared pool rather
+// than an owned bitmap, so a hit copies nothing.
+struct TextCachedGlyph {
+    found: bool,
+    offset: u64,
+    width: u64,
+    height: u64,
+    left: f64,
+    top: f64,
+}
+
+pub fn coverage_at(
+    cache: *TextGlyphCache,
+    entry: TextCachedGlyph,
+    x: u64,
+    y: u64
+) -> u8 {
+    if x >= entry.width || y >= entry.height {
+        return 0 as u8;
+    }
+    return (*cache).pool.data[entry.offset + y * entry.width + x];
+}
+
+// Mixing constants from the usual 64-bit finalizers; Mort's fixed-width
+// arithmetic wraps deterministically, which is what a hash wants.
+fn mix(face_id: u64, glyph: u64, size: u64) -> u64 {
+    let value: u64 = face_id * 0x9E3779B97F4A7C15;
+    value = value ^ (glyph * 0xC2B2AE3D27D4EB4F);
+    value = value ^ (size * 0x165667B19E3779F9);
+    value = value ^ (value >> 29);
+    value = value * 0xBF58476D1CE4E5B9;
+    value = value ^ (value >> 32);
+    return value;
+}
+
+// Quantize the pixel size so that sizes differing below a 64th of a pixel
+// share an entry; anything coarser would visibly mis-scale text.
+fn size_key(pixel_size: f64) -> u64 {
+    if pixel_size <= 0.0 {
+        return 0;
+    }
+    return (pixel_size * 64.0 + 0.5) as u64;
+}
+
+// Identify a face by its address. Faces live in the font set for the whole
+// render, so their addresses are stable and distinct.
+fn face_id(face: *TextFace) -> u64 {
+    return face as u64;
+}
+
+fn find_bucket(cache: *TextGlyphCache, id: u64, glyph: u64, size: u64) -> u64 {
+    let bucket: u64 = mix(id, glyph, size) & (*cache).mask;
+    loop {
+        let slot: u64 = (*cache).buckets.data[bucket];
+        if slot == 0 {
+            return bucket;
+        }
+        let entry: u64 = slot - 1;
+        if (*cache).face_ids.data[entry] == id
+            && (*cache).glyph_ids.data[entry] == glyph
+            && (*cache).sizes.data[entry] == size {
+            return bucket;
+        }
+        bucket = (bucket + 1) & (*cache).mask;
+    }
+}
+
+// Get a glyph's bitmap, rasterizing and storing it on the first request.
+// `scale` is device pixels per font unit, as engine.layout.metrics computes it.
+pub fn get(
+    cache: *TextGlyphCache,
+    face: *TextFace,
+    glyph: u64,
+    pixel_size: f64,
+    scale: f64
+) -> TextCachedGlyph {
+    let id: u64 = face_id(face);
+    let size: u64 = size_key(pixel_size);
+    let bucket: u64 = find_bucket(cache, id, glyph, size);
+    let slot: u64 = (*cache).buckets.data[bucket];
+    if slot != 0 {
+        let entry: u64 = slot - 1;
+        (*cache).hits = (*cache).hits + 1;
+        return TextCachedGlyph {
+            found: true,
+            offset: (*cache).offsets.data[entry],
+            width: (*cache).widths.data[entry],
+            height: (*cache).heights.data[entry],
+            left: (*cache).lefts.data[entry],
+            top: (*cache).tops.data[entry],
+        };
+    }
+
+    (*cache).misses = (*cache).misses + 1;
+    let shape: TextOutline = outline.build(face, glyph);
+    let bitmap: TextGlyphBitmap = raster.render(&shape, scale);
+    outline.destroy(&shape);
+
+    let result: TextCachedGlyph = TextCachedGlyph {
+        found: true,
+        offset: (*cache).pool.length,
+        width: bitmap.width,
+        height: bitmap.height,
+        left: bitmap.left,
+        top: bitmap.top,
+    };
+    if entry_count(cache) >= max_entries() {
+        // Full: copy the coverage into the pool anyway so the caller can read
+        // it, but do not index it. The bytes are reclaimed when the cache is
+        // destroyed, and this path is not expected on a real page.
+        for index: u64 in 0..(bitmap.width * bitmap.height) {
+            vec.push(&(*cache).pool, bitmap.coverage.data[index]);
+        }
+        raster.destroy(&bitmap);
+        return result;
+    }
+
+    for index: u64 in 0..(bitmap.width * bitmap.height) {
+        vec.push(&(*cache).pool, bitmap.coverage.data[index]);
+    }
+    vec.push(&(*cache).face_ids, id);
+    vec.push(&(*cache).glyph_ids, glyph);
+    vec.push(&(*cache).sizes, size);
+    vec.push(&(*cache).offsets, result.offset);
+    vec.push(&(*cache).widths, result.width);
+    vec.push(&(*cache).heights, result.height);
+    vec.push(&(*cache).lefts, result.left);
+    vec.push(&(*cache).tops, result.top);
+    (*cache).buckets.data[bucket] = entry_count(cache);
+    raster.destroy(&bitmap);
+
+    // Grow and rehash while the table is under three quarters full, so probe
+    // chains stay short.
+    if entry_count(cache) * 4 > ((*cache).mask + 1) * 3 {
+        grow(cache);
+    }
+    return result;
+}
+
+fn grow(cache: *TextGlyphCache) -> void {
+    let new_size: u64 = ((*cache).mask + 1) * 2;
+    vec.clear(&(*cache).buckets);
+    for index: u64 in 0..new_size {
+        vec.push(&(*cache).buckets, 0 as u64);
+    }
+    (*cache).mask = new_size - 1;
+    for entry: u64 in 0..entry_count(cache) {
+        let bucket: u64 = find_bucket(cache,
+            (*cache).face_ids.data[entry],
+            (*cache).glyph_ids.data[entry],
+            (*cache).sizes.data[entry]);
+        (*cache).buckets.data[bucket] = entry + 1;
+    }
+}

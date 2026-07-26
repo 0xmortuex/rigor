@@ -12,6 +12,7 @@ import engine.text.fonts;
 import engine.text.load;
 import engine.text.outline;
 import engine.text.raster;
+import engine.text.cache;
 import engine.text.utf8;
 
 fn load_sans() -> TextFace {
@@ -199,6 +200,84 @@ test "font selection falls back along the expected path" {
     assert(sfnt.is_ok(fonts.select(&set, fonts.family_serif(), true, false)));
     assert(sfnt.is_ok(fonts.select(&set, fonts.family_mono(), false, false)));
     fonts.destroy(&set);
+}
+
+test "the glyph cache returns identical coverage on a repeat request" {
+    let face: TextFace = load_sans();
+    let glyphs: TextGlyphCache = cache.new_cache();
+    let glyph: u64 = sfnt.glyph_for(&face, 'g' as u64);
+    let scale: f64 = 20.0 / sfnt.units_per_em(&face);
+
+    let first: TextCachedGlyph = cache.get(&glyphs, &face, glyph, 20.0, scale);
+    let second: TextCachedGlyph = cache.get(&glyphs, &face, glyph, 20.0, scale);
+    assert(cache.misses(&glyphs) == 1);
+    assert(cache.hits(&glyphs) == 1);
+    assert(first.width == second.width && first.height == second.height);
+    assert(first.offset == second.offset);
+
+    // And the cached bytes match what rasterizing directly produces.
+    let shape: TextOutline = outline.build(&face, glyph);
+    let direct: TextGlyphBitmap = raster.render(&shape, scale);
+    assert(direct.width == first.width && direct.height == first.height);
+    let same: bool = true;
+    for y: u64 in 0..direct.height {
+        for x: u64 in 0..direct.width {
+            if cache.coverage_at(&glyphs, first, x, y)
+            != raster.coverage_at(&direct, x, y) {
+                same = false;
+            }
+        }
+    }
+    assert(same);
+    raster.destroy(&direct);
+    outline.destroy(&shape);
+    cache.destroy(&glyphs);
+    sfnt.destroy(&face);
+}
+
+test "different sizes and glyphs are separate cache entries" {
+    let face: TextFace = load_sans();
+    let glyphs: TextGlyphCache = cache.new_cache();
+    let em: f64 = sfnt.units_per_em(&face);
+    let a: u64 = sfnt.glyph_for(&face, 'a' as u64);
+    let b: u64 = sfnt.glyph_for(&face, 'b' as u64);
+    cache.get(&glyphs, &face, a, 16.0, 16.0 / em);
+    cache.get(&glyphs, &face, a, 32.0, 32.0 / em);
+    cache.get(&glyphs, &face, b, 16.0, 16.0 / em);
+    assert(cache.entry_count(&glyphs) == 3);
+    assert(cache.misses(&glyphs) == 3);
+    assert(cache.hits(&glyphs) == 0);
+    // Re-requesting each one hits.
+    cache.get(&glyphs, &face, a, 16.0, 16.0 / em);
+    cache.get(&glyphs, &face, a, 32.0, 32.0 / em);
+    assert(cache.hits(&glyphs) == 2);
+    assert(cache.entry_count(&glyphs) == 3);
+    cache.destroy(&glyphs);
+    sfnt.destroy(&face);
+}
+
+test "the cache survives growing past its initial bucket count" {
+    let face: TextFace = load_sans();
+    let glyphs: TextGlyphCache = cache.new_cache();
+    let em: f64 = sfnt.units_per_em(&face);
+    // Enough distinct sizes to force at least one rehash.
+    for step: u64 in 0..900 {
+        let size: f64 = 8.0 + (step as f64) * 0.25;
+        cache.get(&glyphs, &face, sfnt.glyph_for(&face, 'x' as u64),
+        size, size / em);
+    }
+    assert(cache.entry_count(&glyphs) == 900);
+    // Every one of them must still be findable after the rehash.
+    let before: u64 = cache.hits(&glyphs);
+    for step: u64 in 0..900 {
+        let size: f64 = 8.0 + (step as f64) * 0.25;
+        cache.get(&glyphs, &face, sfnt.glyph_for(&face, 'x' as u64),
+        size, size / em);
+    }
+    assert(cache.hits(&glyphs) - before == 900);
+    assert(cache.entry_count(&glyphs) == 900);
+    cache.destroy(&glyphs);
+    sfnt.destroy(&face);
 }
 
 test "utf-8 decoding" {

@@ -21,8 +21,7 @@ import engine.layout.metrics;
 import engine.style.computed;
 import engine.text.sfnt;
 import engine.text.fonts;
-import engine.text.outline;
-import engine.text.raster;
+import engine.text.cache;
 import engine.text.utf8;
 
 fn paint_background(
@@ -104,20 +103,21 @@ fn paint_glyph(
     }
 }
 
-// Composite a rasterized glyph onto the canvas at the given origin, scaling
-// its coverage into the text colour's alpha.
+// Composite a cached glyph onto the canvas, scaling its coverage into the
+// text colour's alpha.
 fn blit_glyph(
     target: *Canvas,
-    bitmap: *TextGlyphBitmap,
+    glyphs: *TextGlyphCache,
+    entry: TextCachedGlyph,
     pen_x: f64,
     baseline_y: f64,
     color: StyleColor
 ) -> void {
-    let origin_x: f64 = pen_x + (*bitmap).left;
-    let origin_y: f64 = baseline_y + (*bitmap).top;
-    for row: u64 in 0..(*bitmap).height {
-        for column: u64 in 0..(*bitmap).width {
-            let coverage: u8 = raster.coverage_at(bitmap, column, row);
+    let origin_x: f64 = pen_x + entry.left;
+    let origin_y: f64 = baseline_y + entry.top;
+    for row: u64 in 0..entry.height {
+        for column: u64 in 0..entry.width {
+            let coverage: u8 = cache.coverage_at(glyphs, entry, column, row);
             if coverage == 0 as u8 {
                 continue;
             }
@@ -134,6 +134,7 @@ fn paint_text(
     target: *Canvas,
     tree: *LayoutTree,
     set: *TextFontSet,
+    glyphs: *TextGlyphCache,
     current: LayoutBox,
     style: ComputedStyle
 ) -> void {
@@ -159,11 +160,9 @@ fn paint_text(
         // every unmapped character, so it is skipped and only the advance
         // applies.
         if glyph != 0 {
-            let shape: TextOutline = outline.build(face, glyph);
-            let bitmap: TextGlyphBitmap = raster.render(&shape, scale);
-            blit_glyph(target, &bitmap, pen, baseline, style.color);
-            raster.destroy(&bitmap);
-            outline.destroy(&shape);
+            let entry: TextCachedGlyph =
+                cache.get(glyphs, face, glyph, style.font_size, scale);
+            blit_glyph(target, glyphs, entry, pen, baseline, style.color);
         }
         pen = pen + sfnt.advance_for_glyph(face, glyph) * scale;
         index = index + decoded.size;
@@ -220,13 +219,14 @@ fn paint_box(
     tree: *LayoutTree,
     styles: *StyleTree,
     set: *TextFontSet,
+    glyphs: *TextGlyphCache,
     index: u64
 ) -> void {
     let current: LayoutBox = box.get(tree, index);
     let style: ComputedStyle = computed.get(styles, current.style_node);
 
     if current.kind == box.box_text() {
-        paint_text(target, tree, set, current, style);
+        paint_text(target, tree, set, glyphs, current, style);
     } else if current.kind != box.box_anonymous() {
         // Anonymous boxes have no style of their own to paint; their content
         // is painted by their children.
@@ -236,7 +236,7 @@ fn paint_box(
 
     let child: u64 = current.first_child;
     while child != box.none() {
-        paint_box(target, tree, styles, set, child);
+        paint_box(target, tree, styles, set, glyphs, child);
         child = box.get(tree, child).next_sibling;
     }
 }
@@ -255,5 +255,11 @@ pub fn paint(
     if (*tree).root == box.none() {
         return;
     }
-    paint_box(target, tree, styles, set, (*tree).root);
+    // The cache lives for one paint. A page reuses each glyph many times
+    // within a single render, which is where the win is; keeping it across
+    // renders would need the caller to own it and matters only once
+    // incremental repaint exists.
+    let glyphs: TextGlyphCache = cache.new_cache();
+    paint_box(target, tree, styles, set, &glyphs, (*tree).root);
+    cache.destroy(&glyphs);
 }
