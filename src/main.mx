@@ -26,6 +26,9 @@ import engine.css.serialize as css_serialize;
 import engine.style.computed;
 import engine.style.cascade;
 import engine.style.ua;
+import engine.layout.box;
+import engine.layout.flow;
+import engine.layout.serialize as layout_serialize;
 
 extern fn getchar() -> c_int;
 extern fn putchar(character: c_int) -> c_int;
@@ -176,10 +179,12 @@ fn out_f64(out: *Vec<u8>, value: f64) -> void {
         out_str(out, "-");
         magnitude = 0.0 - magnitude;
     }
-    let whole: u64 = magnitude as u64;
-    out_u64(out, whole);
-    let hundredths: u64 = (((magnitude - (whole as f64)) * 100.0) + 0.5) as u64;
-    if hundredths > 0 && hundredths < 100 {
+    // Round before splitting, so accumulated float error near a whole number
+    // does not print as the integer below it.
+    let scaled: u64 = (magnitude * 100.0 + 0.5) as u64;
+    out_u64(out, scaled / 100);
+    let hundredths: u64 = scaled % 100;
+    if hundredths > 0 {
         out_str(out, ".");
         if hundredths < 10 {
             out_str(out, "0");
@@ -358,6 +363,21 @@ fn main() -> int {
     out_str(&out, "-- computed style --");
     out_line(&out);
     dump_styles(&out, &doc, &tree_styles, 0, 0);
+
+    // Lay the document out at a conventional 800px viewport.
+    let boxes: LayoutTree = box.new_tree();
+    flow.layout(&doc, &tree_styles, &boxes, 800.0);
+    out_str(&out, "-- layout --");
+    out_line(&out);
+    let layout_text: Vec<u8> = layout_serialize.tree_text(&boxes, &doc);
+    for index: u64 in 0..layout_text.length {
+        vec.push(&out, layout_text.data[index]);
+    }
+    vec.push(&out, 0 as u8);
+    print_raw(out.data);
+    vec.clear(&out);
+    vec.destroy(&layout_text);
+    box.destroy(&boxes);
 
     computed.destroy(&tree_styles);
     stylesheet.destroy(&ua_sheet);

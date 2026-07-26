@@ -54,15 +54,11 @@ fn push_number(out: *Vec<u8>, value: f64) -> void {
         vec.push(out, '-');
         magnitude = 0.0 - magnitude;
     }
-    let whole: u64 = magnitude as u64;
-    push_u64(out, whole);
-
-    let scaled: u64 = (((magnitude - (whole as f64)) * 10000.0) + 0.5) as u64;
-    if scaled >= 10000 {
-        // The rounding carried into the whole part, which push_u64 already
-        // printed; drop the fraction rather than print "1.10000".
-        return;
-    }
+    // Round the whole value before splitting it, so float error near an
+    // integer cannot print the value below it.
+    let ten_thousandths: u64 = (magnitude * 10000.0 + 0.5) as u64;
+    push_u64(out, ten_thousandths / 10000);
+    let scaled: u64 = ten_thousandths % 10000;
     let d0: u64 = (scaled / 1000) % 10;
     let d1: u64 = (scaled / 100) % 10;
     let d2: u64 = (scaled / 10) % 10;

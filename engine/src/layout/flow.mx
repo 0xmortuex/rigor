@@ -1,0 +1,664 @@
+// Normal flow layout — CSS 2.1 §9 and §10.
+//
+// Two passes. `build` turns the DOM plus computed styles into a box tree,
+// generating the anonymous block boxes the model requires; `layout` then
+// assigns geometry, walking the tree once and resolving each box against its
+// containing block.
+//
+// Implemented: block-level boxes in normal flow, the width constraint of
+// §10.3.3 (including `auto` margins centring a box), auto and fixed heights,
+// adjacent-sibling margin collapsing, and inline formatting with line boxes,
+// white-space processing, line breaking and text-align.
+//
+// Not implemented, and noted where each would go: floats, positioning other
+// than static, margin collapsing through parents or across empty boxes,
+// vertical-align other than baseline, inline borders and padding, and table
+// layout (table boxes lay out as ordinary blocks, which is enough to see them
+// but not to align columns).
+module engine.layout.flow;
+
+import std.vec;
+import box;
+import metrics;
+import engine.dom.node;
+import engine.style.computed;
+
+// --- Box tree construction ---------------------------------------------------
+
+fn is_block_level(display: u8) -> bool {
+    return display == computed.display_block()
+        || display == computed.display_list_item()
+        || display == computed.display_table()
+        || display == computed.display_table_row()
+        || display == computed.display_table_cell()
+        || display == computed.display_table_row_group();
+}
+
+fn style_of(styles: *StyleTree, dom_node: u64) -> ComputedStyle {
+    return computed.get(styles, dom_node);
+}
+
+fn is_space_byte(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 12 as u8
+        || c == 13 as u8;
+}
+
+fn is_all_whitespace(view: []const u8) -> bool {
+    for index: u64 in 0..len(view) {
+        if !is_space_byte(view[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Does this element have any block-level child box? That decides whether its
+// inline children need anonymous block wrappers (CSS 2.1 §9.2.1.1).
+fn has_block_children(
+    doc: *DomDocument,
+    styles: *StyleTree,
+    dom_parent: u64
+) -> bool {
+    let child: u64 = node.get(doc, dom_parent).first_child;
+    while child != node.none() {
+        let child_node: DomNode = node.get(doc, child);
+        if child_node.kind == node.kind_element() {
+            let display: u8 = style_of(styles, child).display;
+            if display != computed.display_none() && is_block_level(display) {
+                return true;
+            }
+        }
+        child = child_node.next_sibling;
+    }
+    return false;
+}
+
+struct BuildContext {
+    anonymous: u64,
+    needs_anonymous: bool,
+}
+
+fn inline_parent(
+    tree: *LayoutTree,
+    parent_box: u64,
+    style_node: u64,
+    context: *BuildContext
+) -> u64 {
+    if !(*context).needs_anonymous {
+        return parent_box;
+    }
+    if (*context).anonymous == box.none() {
+        let anonymous: u64 =
+            box.create(tree, box.box_anonymous(), node.none(), style_node);
+        box.append_child(tree, parent_box, anonymous);
+        (*context).anonymous = anonymous;
+    }
+    return (*context).anonymous;
+}
+
+fn build_children(
+    doc: *DomDocument,
+    styles: *StyleTree,
+    tree: *LayoutTree,
+    dom_parent: u64,
+    parent_box: u64,
+    style_node: u64
+) -> void {
+    let context: BuildContext = BuildContext {
+        anonymous: box.none(),
+        needs_anonymous: has_block_children(doc, styles, dom_parent),
+    };
+    let child: u64 = node.get(doc, dom_parent).first_child;
+    while child != node.none() {
+        let child_node: DomNode = node.get(doc, child);
+        if child_node.kind == node.kind_text() {
+            let text: []const u8 =
+                node.bytes(doc, child_node.data_off, child_node.data_len);
+            // Whitespace between block-level siblings generates no box.
+            let drop: bool = context.needs_anonymous && is_all_whitespace(text);
+            if !drop && child_node.data_len > 0 {
+                let target: u64 =
+                    inline_parent(tree, parent_box, style_node, &context);
+                let text_box: u64 =
+                    box.create(tree, box.box_text(), child, style_node);
+                box.append_child(tree, target, text_box);
+            }
+        } else if child_node.kind == node.kind_element() {
+            let display: u8 = style_of(styles, child).display;
+            if display != computed.display_none() {
+                if is_block_level(display) {
+                    // A block ends whatever anonymous run was open.
+                    context.anonymous = box.none();
+                    let block: u64 = box.create(tree, box.box_block(), child, child);
+                    box.append_child(tree, parent_box, block);
+                    build_children(doc, styles, tree, child, block, child);
+                } else {
+                    let target: u64 =
+                        inline_parent(tree, parent_box, style_node, &context);
+                    let inline_box: u64 =
+                        box.create(tree, box.box_inline(), child, child);
+                    box.append_child(tree, target, inline_box);
+                    build_children(doc, styles, tree, child, inline_box, child);
+                }
+            }
+        }
+        child = child_node.next_sibling;
+    }
+}
+
+// Build the box tree for `doc`. A document whose root element is
+// `display: none` produces no boxes at all.
+pub fn build(doc: *DomDocument, styles: *StyleTree, tree: *LayoutTree) -> void {
+    let child: u64 = node.get(doc, 0).first_child;
+    while child != node.none() {
+        let child_node: DomNode = node.get(doc, child);
+        if child_node.kind == node.kind_element() {
+            let display: u8 = style_of(styles, child).display;
+            if display != computed.display_none() {
+                let root: u64 = box.create(tree, box.box_block(), child, child);
+                (*tree).root = root;
+                build_children(doc, styles, tree, child, root, child);
+                return;
+            }
+        }
+        child = child_node.next_sibling;
+    }
+}
+
+// --- Used value resolution ---------------------------------------------------
+
+fn resolve(length: StyleLength, containing: f64) -> f64 {
+    if length.kind == computed.length_percent() {
+        return containing * length.value / 100.0;
+    }
+    if length.kind == computed.length_auto() {
+        return 0.0;
+    }
+    return length.value;
+}
+
+fn is_auto(length: StyleLength) -> bool {
+    return length.kind == computed.length_auto();
+}
+
+fn larger(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+// --- Block layout ------------------------------------------------------------
+
+// Lay out `box_index` as a block-level box. `x` is the left content edge of
+// the containing block and `y` is this box's final border-box top, which the
+// caller has already adjusted for collapsed margins.
+fn layout_block(
+    doc: *DomDocument,
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    box_index: u64,
+    x: f64,
+    y: f64,
+    containing_width: f64
+) -> void {
+    let current: LayoutBox = box.get(tree, box_index);
+    let style: ComputedStyle = style_of(styles, current.style_node);
+    // An anonymous box has no margins, borders or padding of its own; it is a
+    // pure container for inline content.
+    let anonymous: bool = current.kind == box.box_anonymous();
+
+    if !anonymous {
+        current.border_top = style.border_top_width;
+        current.border_right = style.border_right_width;
+        current.border_bottom = style.border_bottom_width;
+        current.border_left = style.border_left_width;
+        current.padding_top = resolve(style.padding_top, containing_width);
+        current.padding_right = resolve(style.padding_right, containing_width);
+        current.padding_bottom = resolve(style.padding_bottom, containing_width);
+        current.padding_left = resolve(style.padding_left, containing_width);
+        current.margin_top = resolve(style.margin_top, containing_width);
+        current.margin_bottom = resolve(style.margin_bottom, containing_width);
+    }
+    let edges: f64 = current.border_left + current.border_right
+        + current.padding_left + current.padding_right;
+
+    let width: f64 = 0.0;
+    if anonymous {
+        width = containing_width;
+    } else {
+        // §10.3.3: margin-left + border + padding + width + padding + border +
+        // margin-right must equal the containing block's width.
+        let margin_left: f64 = resolve(style.margin_left, containing_width);
+        let margin_right: f64 = resolve(style.margin_right, containing_width);
+        let left_auto: bool = is_auto(style.margin_left);
+        let right_auto: bool = is_auto(style.margin_right);
+        if is_auto(style.width) {
+            // An auto width absorbs the slack, so auto margins beside it are
+            // treated as zero.
+            width = containing_width - edges - margin_left - margin_right;
+        } else {
+            width = resolve(style.width, containing_width);
+            let slack: f64 =
+                containing_width - edges - width - margin_left - margin_right;
+            if left_auto && right_auto {
+                margin_left = slack / 2.0;
+                margin_right = slack / 2.0;
+            } else if left_auto {
+                margin_left = slack;
+            } else if right_auto {
+                margin_right = slack;
+            } else {
+                // Over-constrained: margin-right is the one that gives way.
+                margin_right = margin_right + slack;
+            }
+        }
+        current.margin_left = margin_left;
+        current.margin_right = margin_right;
+    }
+    if width < 0.0 {
+        width = 0.0;
+    }
+    current.width = width;
+    current.x = x + current.margin_left;
+    current.y = y;
+    box.set(tree, box_index, current);
+
+    let content_x: f64 = current.x + current.border_left + current.padding_left;
+    let content_y: f64 = current.y + current.border_top + current.padding_top;
+
+    let content_height: f64 = 0.0;
+    if first_child_is_inline(tree, box_index) {
+        content_height = layout_inline_content(
+            doc, tree, styles, box_index, content_x, content_y, width);
+    } else {
+        content_height = layout_block_children(
+            doc, tree, styles, box_index, content_x, content_y, width);
+    }
+
+    current = box.get(tree, box_index);
+    if anonymous || is_auto(style.height) {
+        current.height = content_height;
+    } else {
+        current.height = resolve(style.height, containing_width);
+    }
+    box.set(tree, box_index, current);
+}
+
+fn first_child_is_inline(tree: *LayoutTree, box_index: u64) -> bool {
+    let first: u64 = box.get(tree, box_index).first_child;
+    if first == box.none() {
+        return false;
+    }
+    let kind: u8 = box.get(tree, first).kind;
+    return kind == box.box_inline() || kind == box.box_text();
+}
+
+// The top margin a child will use, needed before it is laid out so sibling
+// margins can be collapsed.
+fn child_top_margin(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    child: u64,
+    containing_width: f64
+) -> f64 {
+    let child_box: LayoutBox = box.get(tree, child);
+    if child_box.kind == box.box_anonymous() {
+        return 0.0;
+    }
+    return resolve(style_of(styles, child_box.style_node).margin_top,
+        containing_width);
+}
+
+// Stack block children vertically, collapsing adjacent sibling margins.
+fn layout_block_children(
+    doc: *DomDocument,
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    parent: u64,
+    content_x: f64,
+    content_y: f64,
+    content_width: f64
+) -> f64 {
+    let cursor: f64 = content_y;
+    let previous_bottom: f64 = 0.0;
+    let first: bool = true;
+    let child: u64 = box.get(tree, parent).first_child;
+    while child != box.none() {
+        let top_margin: f64 =
+            child_top_margin(tree, styles, child, content_width);
+        // §8.3.1: adjacent siblings' vertical margins collapse to the larger
+        // of the two rather than summing.
+        let gap: f64 = top_margin;
+        if !first {
+            gap = larger(previous_bottom, top_margin);
+        }
+        let child_y: f64 = cursor + gap;
+        layout_block(doc, tree, styles, child, content_x, child_y, content_width);
+        let placed: LayoutBox = box.get(tree, child);
+        cursor = placed.y + box.border_box_height(placed);
+        previous_bottom = placed.margin_bottom;
+        first = false;
+        child = placed.next_sibling;
+    }
+    // The bottom margin of the last child is left outside the parent's height:
+    // collapsing through the parent is not implemented, and adding it here
+    // would double the gap compared with a browser.
+    return cursor - content_y;
+}
+
+// --- Inline layout -----------------------------------------------------------
+
+struct InlineState {
+    container: u64,
+    x: f64,
+    line_top: f64,
+    line_height: f64,
+    // Whether a collapsible space is pending before the next word.
+    pending_space: bool,
+    line_empty: bool,
+    origin_x: f64,
+    available: f64,
+    // The fragment most recently emitted on this line. A space that separates
+    // two elements — the one in `in <b>Mort</b>` — belongs to the text run
+    // before it, not to the element after, so it is appended here rather than
+    // opening the next fragment.
+    last_fragment: u64,
+}
+
+fn layout_inline_content(
+    doc: *DomDocument,
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    container: u64,
+    content_x: f64,
+    content_y: f64,
+    content_width: f64
+) -> f64 {
+    let state: InlineState = InlineState {
+        container: container,
+        x: content_x,
+        line_top: content_y,
+        line_height: 0.0,
+        pending_space: false,
+        line_empty: true,
+        origin_x: content_x,
+        available: content_width,
+        last_fragment: box.none(),
+    };
+    layout_inline_children(doc, tree, styles, container, &state);
+    if !state.line_empty {
+        align_line(tree, styles, &state);
+        return state.line_top + state.line_height - content_y;
+    }
+    return state.line_top - content_y;
+}
+
+fn layout_inline_children(
+    doc: *DomDocument,
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    parent: u64,
+    state: *InlineState
+) -> void {
+    let child: u64 = box.get(tree, parent).first_child;
+    while child != box.none() {
+        let child_box: LayoutBox = box.get(tree, child);
+        let next: u64 = child_box.next_sibling;
+        if child_box.kind == box.box_text() {
+            place_text(doc, tree, styles, child, state);
+        } else if child_box.kind == box.box_inline() {
+            // An inline box's geometry is the extent of its fragments. Inline
+            // borders and padding are not implemented; recording the extent is
+            // enough for paint to draw a background behind it.
+            let start_x: f64 = (*state).x;
+            let start_y: f64 = (*state).line_top;
+            layout_inline_children(doc, tree, styles, child, state);
+            let updated: LayoutBox = box.get(tree, child);
+            updated.x = start_x;
+            updated.y = start_y;
+            updated.width = (*state).x - start_x;
+            if updated.width < 0.0 {
+                updated.width = 0.0;
+            }
+            updated.height = (*state).line_top + (*state).line_height - start_y;
+            box.set(tree, child, updated);
+        }
+        child = next;
+    }
+}
+
+// Break one text node into fragments and place them on lines. Reads from the
+// DOM rather than the layout tree's own buffer, because that buffer is being
+// appended to here and its backing store may move.
+fn place_text(
+    doc: *DomDocument,
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    text_box: u64,
+    state: *InlineState
+) -> void {
+    let current: LayoutBox = box.get(tree, text_box);
+    let style: ComputedStyle = style_of(styles, current.style_node);
+    let font_size: f64 = style.font_size;
+    let preserve: bool = style.white_space == computed.white_space_pre();
+    let nowrap: bool = style.white_space == computed.white_space_nowrap();
+
+    let source_node: DomNode = node.get(doc, current.node);
+    let source_off: u64 = source_node.data_off;
+    let source_len: u64 = source_node.data_len;
+
+    let fragment_start: u64 = box.text_length(tree);
+    let fragment_width: f64 = 0.0;
+    let first_fragment: bool = true;
+    let index: u64 = 0;
+
+    while index < source_len {
+        let c: u8 = dom_byte(doc, source_off, index);
+
+        if preserve {
+            if c == 10 as u8 {
+                first_fragment = flush_fragment(tree, styles, text_box, state,
+                    fragment_start, fragment_width, first_fragment);
+                break_line(tree, styles, state);
+                fragment_start = box.text_length(tree);
+                fragment_width = 0.0;
+                index = index + 1;
+                continue;
+            }
+            box.push_byte(tree, c);
+            let advance: f64 = metrics.char_width(c, font_size);
+            fragment_width = fragment_width + advance;
+            (*state).x = (*state).x + advance;
+            (*state).line_empty = false;
+            grow_line(state, style.line_height);
+            index = index + 1;
+            continue;
+        }
+
+        // §16.6.1: a run of white space collapses to a single space, and one
+        // at the start of a line is dropped.
+        if is_space_byte(c) {
+            while index < source_len
+                && is_space_byte(dom_byte(doc, source_off, index)) {
+                index = index + 1;
+            }
+            if !(*state).line_empty {
+                (*state).pending_space = true;
+            }
+            continue;
+        }
+
+        let word_start: u64 = index;
+        while index < source_len
+            && !is_space_byte(dom_byte(doc, source_off, index)) {
+            index = index + 1;
+        }
+        let word_len: u64 = index - word_start;
+        let word: []const u8 =
+            node.bytes(doc, source_off + word_start, word_len);
+        let word_width: f64 = metrics.text_width(word, font_size);
+        let space_width: f64 = 0.0;
+        if (*state).pending_space {
+            space_width = metrics.char_width(' ', font_size);
+        }
+
+        let overflows: bool = !nowrap && !(*state).line_empty
+            && (*state).x + space_width + word_width
+                > (*state).origin_x + (*state).available;
+        if overflows {
+            first_fragment = flush_fragment(tree, styles, text_box, state,
+                fragment_start, fragment_width, first_fragment);
+            break_line(tree, styles, state);
+            fragment_start = box.text_length(tree);
+            fragment_width = 0.0;
+            (*state).pending_space = false;
+            space_width = 0.0;
+        }
+        if (*state).pending_space {
+            box.push_byte(tree, ' ');
+            (*state).x = (*state).x + space_width;
+            (*state).pending_space = false;
+            if fragment_width == 0.0 && (*state).last_fragment != box.none() {
+                // Nothing accumulated here yet, so the space separates this
+                // fragment from the previous one and belongs to that one. It
+                // sits at the buffer's end, immediately after that fragment's
+                // bytes, so extending it is just a longer length.
+                let previous: LayoutBox =
+                    box.get(tree, (*state).last_fragment);
+                previous.text_len = previous.text_len + 1;
+                previous.width = previous.width + space_width;
+                box.set(tree, (*state).last_fragment, previous);
+                fragment_start = box.text_length(tree);
+            } else {
+                fragment_width = fragment_width + space_width;
+            }
+        }
+        for step: u64 in 0..word_len {
+            box.push_byte(tree, dom_byte(doc, source_off, word_start + step));
+        }
+        fragment_width = fragment_width + word_width;
+        (*state).x = (*state).x + word_width;
+        (*state).line_empty = false;
+        grow_line(state, style.line_height);
+    }
+    flush_fragment(tree, styles, text_box, state, fragment_start,
+        fragment_width, first_fragment);
+}
+
+fn dom_byte(doc: *DomDocument, offset: u64, index: u64) -> u8 {
+    let view: []const u8 = node.bytes(doc, offset + index, 1);
+    return view[0];
+}
+
+fn grow_line(state: *InlineState, line_height: f64) -> void {
+    if line_height > (*state).line_height {
+        (*state).line_height = line_height;
+    }
+}
+
+// Emit the accumulated bytes as a positioned fragment. The first fragment of a
+// text box reuses that box; later ones become new siblings. Returns the new
+// value of the caller's `reuse` flag.
+fn flush_fragment(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    text_box: u64,
+    state: *InlineState,
+    fragment_start: u64,
+    fragment_width: f64,
+    reuse: bool
+) -> bool {
+    let length: u64 = box.text_length(tree) - fragment_start;
+    if length == 0 {
+        return reuse;
+    }
+    let template: LayoutBox = box.get(tree, text_box);
+    let style: ComputedStyle = style_of(styles, template.style_node);
+    let target: u64 = text_box;
+    if !reuse {
+        target = box.create(tree, box.box_text(), template.node,
+            template.style_node);
+        box.append_child(tree, template.parent, target);
+    }
+    let fragment: LayoutBox = box.get(tree, target);
+    fragment.text_off = fragment_start;
+    fragment.text_len = length;
+    fragment.x = (*state).x - fragment_width;
+    fragment.y = (*state).line_top;
+    fragment.width = fragment_width;
+    fragment.height = style.line_height;
+    fragment.baseline = metrics.ascent(style.font_size);
+    box.set(tree, target, fragment);
+    grow_line(state, style.line_height);
+    (*state).last_fragment = target;
+    return false;
+}
+
+fn break_line(tree: *LayoutTree, styles: *StyleTree, state: *InlineState) -> void {
+    align_line(tree, styles, state);
+    (*state).line_top = (*state).line_top + (*state).line_height;
+    (*state).x = (*state).origin_x;
+    (*state).line_height = 0.0;
+    (*state).line_empty = true;
+    (*state).pending_space = false;
+    (*state).last_fragment = box.none();
+}
+
+// Apply text-align to the fragments sitting on the current line.
+fn align_line(tree: *LayoutTree, styles: *StyleTree, state: *InlineState) -> void {
+    let style: ComputedStyle =
+        style_of(styles, box.get(tree, (*state).container).style_node);
+    if style.text_align == computed.text_align_left()
+        || style.text_align == computed.text_align_justify() {
+        return;
+    }
+    let slack: f64 = (*state).available - ((*state).x - (*state).origin_x);
+    if slack <= 0.0 {
+        return;
+    }
+    let shift: f64 = slack;
+    if style.text_align == computed.text_align_center() {
+        shift = slack / 2.0;
+    }
+    shift_line(tree, (*state).container, (*state).line_top, shift);
+}
+
+fn shift_line(tree: *LayoutTree, parent: u64, line_top: f64, shift: f64) -> void {
+    let child: u64 = box.get(tree, parent).first_child;
+    while child != box.none() {
+        let child_box: LayoutBox = box.get(tree, child);
+        if child_box.kind == box.box_text() && child_box.y == line_top {
+            child_box.x = child_box.x + shift;
+            box.set(tree, child, child_box);
+        } else if child_box.kind == box.box_inline() {
+            shift_line(tree, child, line_top, shift);
+        }
+        child = child_box.next_sibling;
+    }
+}
+
+// --- Entry point -------------------------------------------------------------
+
+// Build and lay out `doc` into `tree` at the given viewport width.
+pub fn layout(
+    doc: *DomDocument,
+    styles: *StyleTree,
+    tree: *LayoutTree,
+    viewport_width: f64
+) -> void {
+    build(doc, styles, tree);
+    if (*tree).root == box.none() {
+        return;
+    }
+    layout_block(doc, tree, styles, (*tree).root, 0.0, 0.0, viewport_width);
+}
+
+// The total height the document occupies, for sizing a canvas.
+pub fn document_height(tree: *LayoutTree) -> f64 {
+    if (*tree).root == box.none() {
+        return 0.0;
+    }
+    let root: LayoutBox = box.get(tree, (*tree).root);
+    return root.y + box.border_box_height(root) + root.margin_bottom;
+}

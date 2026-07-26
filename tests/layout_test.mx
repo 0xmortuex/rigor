@@ -1,0 +1,336 @@
+// Normal flow layout (CSS 2.1 §9, §10).
+//
+// Expected trees use the layout dump engine.layout.serialize emits, so a
+// failure reads as a geometry diff.
+
+import std.vec;
+import std.string;
+import engine.html.preprocess;
+import engine.html.treebuilder;
+import engine.html.tokens;
+import engine.dom.node;
+import engine.css.preprocess as css_preprocess;
+import engine.css.tokenizer as css_tokenizer;
+import engine.css.tokens as css_tokens;
+import engine.css.parser as css_parser;
+import engine.css.stylesheet;
+import engine.style.computed;
+import engine.style.cascade;
+import engine.style.ua;
+import engine.layout.box;
+import engine.layout.flow;
+import engine.layout.serialize as layout_serialize;
+
+resource struct Laid {
+    html_normalized: Vec<u8>,
+    html_sink: HtmlTokenSink,
+    doc: DomDocument,
+    ua_normalized: Vec<u8>,
+    ua_sink: CssTokenSink,
+    ua_sheet: CssStylesheet,
+    css_normalized: Vec<u8>,
+    css_sink: CssTokenSink,
+    sheet: CssStylesheet,
+    styles: StyleTree,
+    boxes: LayoutTree,
+}
+
+fn parse_css(source: *u8, sink: *CssTokenSink, sheet: *CssStylesheet) -> Vec<u8> {
+    let text: Vec<u8> =
+    css_preprocess.normalize(source as *const u8, str_len(source));
+    let t: CssTokenizer = css_tokenizer.new(text.data as *const u8, text.length);
+    css_tokenizer.run(&t, sink);
+    css_parser.parse_stylesheet(sheet, sink);
+    return move text;
+}
+
+fn build(html: *u8, css: *u8, viewport: f64) -> Laid {
+    let html_sink: HtmlTokenSink = tokens.new_sink();
+    let html_normalized: Vec<u8> =
+    preprocess.normalize(html as *const u8, str_len(html), &html_sink);
+    let doc: DomDocument = node.new_document();
+    treebuilder.parse(html_normalized.data as *const u8,
+    html_normalized.length, &doc, &html_sink);
+
+    let ua_sink: CssTokenSink = css_tokens.new_sink();
+    let ua_sheet: CssStylesheet = stylesheet.new_stylesheet();
+    let ua_normalized: Vec<u8> =
+    parse_css(ua.stylesheet_text(), &ua_sink, &ua_sheet);
+
+    let css_sink: CssTokenSink = css_tokens.new_sink();
+    let sheet: CssStylesheet = stylesheet.new_stylesheet();
+    let css_normalized: Vec<u8> = parse_css(css, &css_sink, &sheet);
+
+    let styles: StyleTree = computed.new_tree(node.node_count(&doc));
+    cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &styles);
+
+    let boxes: LayoutTree = box.new_tree();
+    flow.layout(&doc, &styles, &boxes, viewport);
+
+    return Laid {
+        html_normalized: move html_normalized,
+        html_sink: move html_sink,
+        doc: move doc,
+        ua_normalized: move ua_normalized,
+        ua_sink: move ua_sink,
+        ua_sheet: move ua_sheet,
+        css_normalized: move css_normalized,
+        css_sink: move css_sink,
+        sheet: move sheet,
+        styles: move styles,
+        boxes: move boxes,
+    };
+}
+
+fn destroy(l: *Laid) -> void {
+    box.destroy(&(*l).boxes);
+    computed.destroy(&(*l).styles);
+    stylesheet.destroy(&(*l).sheet);
+    css_tokens.destroy(&(*l).css_sink);
+    vec.destroy(&(*l).css_normalized);
+    stylesheet.destroy(&(*l).ua_sheet);
+    css_tokens.destroy(&(*l).ua_sink);
+    vec.destroy(&(*l).ua_normalized);
+    node.destroy(&(*l).doc);
+    tokens.destroy(&(*l).html_sink);
+    vec.destroy(&(*l).html_normalized);
+}
+
+fn dump_is(l: *Laid, expected: *u8) -> bool {
+    let text: Vec<u8> = layout_serialize.tree_text(&(*l).boxes, &(*l).doc);
+    let want: u64 = str_len(expected);
+    let ok: bool = text.length == want;
+    if ok {
+        for index: u64 in 0..want {
+            if text.data[index] != expected[index] {
+                ok = false;
+            }
+        }
+    }
+    vec.destroy(&text);
+    return ok;
+}
+
+fn near(actual: f64, expected: f64) -> bool {
+    let difference: f64 = actual - expected;
+    if difference < 0.0 {
+        difference = 0.0 - difference;
+    }
+    return difference < 0.01;
+}
+
+// Find a box by the tag name of the element it came from.
+fn box_for(l: *Laid, tag: *u8) -> LayoutBox {
+    let wanted: []const u8 = slice(tag as *const u8, str_len(tag));
+    for index: u64 in 0..box.box_count(&(*l).boxes) {
+        let candidate: LayoutBox = box.get(&(*l).boxes, index);
+        if candidate.node != node.none() && candidate.kind != box.box_text() {
+            let element: DomNode = node.get(&(*l).doc, candidate.node);
+            if element.kind == node.kind_element()
+            && element.name_len == len(wanted) {
+                let name: []const u8 =
+                node.bytes(&(*l).doc, element.name_off, element.name_len);
+                let same: bool = true;
+                for step: u64 in 0..len(name) {
+                    if name[step] != wanted[step] {
+                        same = false;
+                    }
+                }
+                if same {
+                    return candidate;
+                }
+            }
+        }
+    }
+    return box.empty_box(box.box_block());
+}
+
+test "a block fills its containing block's width" {
+    let l: Laid = build("<div>x</div>", "body { margin: 0 }", 800.0);
+    let div: LayoutBox = box_for(&l, "div");
+    assert(near(div.width, 800.0));
+    assert(near(div.x, 0.0));
+    destroy(&l);
+}
+
+test "body's default margin insets it" {
+    let l: Laid = build("<div>x</div>", "", 800.0);
+    let body: LayoutBox = box_for(&l, "body");
+    assert(near(body.x, 8.0));
+    assert(near(body.y, 8.0));
+    assert(near(body.width, 784.0));
+    destroy(&l);
+}
+
+test "borders and padding shrink the content box" {
+    let l: Laid = build("<div>x</div>",
+    "body { margin: 0 } div { border: 5px solid red; padding: 10px }",
+    800.0);
+    let div: LayoutBox = box_for(&l, "div");
+    assert(near(div.width, 770.0));
+    assert(near(div.border_left, 5.0));
+    assert(near(div.padding_left, 10.0));
+    destroy(&l);
+}
+
+test "a percentage width resolves against the containing block" {
+    let l: Laid = build("<div>x</div>", "body { margin: 0 } div { width: 25% }",
+    800.0);
+    assert(near(box_for(&l, "div").width, 200.0));
+    destroy(&l);
+}
+
+test "auto margins centre a fixed-width block" {
+    let l: Laid = build("<div>x</div>",
+    "body { margin: 0 } div { width: 400px; margin-left: auto; margin-right: auto }",
+    800.0);
+    let div: LayoutBox = box_for(&l, "div");
+    assert(near(div.margin_left, 200.0));
+    assert(near(div.x, 200.0));
+    destroy(&l);
+}
+
+test "an over-constrained block gives way on margin-right" {
+    let l: Laid = build("<div>x</div>",
+    "body { margin: 0 } div { width: 300px; margin-left: 50px; margin-right: 50px }",
+    800.0);
+    let div: LayoutBox = box_for(&l, "div");
+    assert(near(div.x, 50.0));
+    assert(near(div.margin_right, 450.0));
+    destroy(&l);
+}
+
+test "blocks stack vertically" {
+    let l: Laid = build("<div>a</div><div>b</div>",
+    "body { margin: 0 } div { height: 50px; margin: 0 }", 800.0);
+    assert(dump_is(&l,
+    "block <html> at (0,0) size 800x100\n  block <body> at (0,0) size 800x100\n    block <div> at (0,0) size 800x50\n      text \"a\" at (0,0) size 8.48x19.2\n    block <div> at (0,50) size 800x50\n      text \"b\" at (0,50) size 8.48x19.2\n"));
+    destroy(&l);
+}
+
+test "adjacent sibling margins collapse to the larger" {
+    let l: Laid = build("<div id=a>a</div><div id=b>b</div>",
+    "body { margin: 0 } div { height: 10px } #a { margin-bottom: 30px } #b { margin-top: 10px }",
+    800.0);
+    // The second div starts 30px below the first, not 40px: the 30px bottom
+    // margin and the 10px top margin collapse to the larger of the two.
+    assert(dump_is(&l,
+    "block <html> at (0,0) size 800x50\n  block <body> at (0,0) size 800x50\n    block <div> at (0,0) size 800x10 margin 0 0 30 0\n      text \"a\" at (0,0) size 8.48x19.2\n    block <div> at (0,40) size 800x10 margin 10 0 0 0\n      text \"b\" at (0,40) size 8.48x19.2\n"));
+    destroy(&l);
+}
+
+test "an auto height wraps its children" {
+    let l: Laid = build("<div><p>x</p></div>",
+    "body { margin: 0 } p { margin: 0; height: 40px }", 800.0);
+    assert(near(box_for(&l, "div").height, 40.0));
+    destroy(&l);
+}
+
+test "a fixed height is used verbatim" {
+    let l: Laid = build("<div><p>x</p></div>",
+    "body { margin: 0 } div { height: 200px } p { margin: 0 }", 800.0);
+    assert(near(box_for(&l, "div").height, 200.0));
+    destroy(&l);
+}
+
+test "display none produces no box" {
+    let l: Laid = build("<div>a</div><span>b</span>",
+    "body { margin: 0 } div { display: none }", 800.0);
+    // With the div gone, body has only inline content, so no anonymous block
+    // is generated and the span is an inline box directly inside it.
+    assert(dump_is(&l,
+    "block <html> at (0,0) size 800x19.2\n  block <body> at (0,0) size 800x19.2\n    inline <span> at (0,0) size 8.48x19.2\n      text \"b\" at (0,0) size 8.48x19.2\n"));
+    destroy(&l);
+}
+
+test "inline content beside a block gets an anonymous box" {
+    let l: Laid = build("<div>loose<p>para</p></div>",
+    "body { margin: 0 } p { margin: 0 }", 800.0);
+    assert(dump_is(&l,
+    "block <html> at (0,0) size 800x38.4\n  block <body> at (0,0) size 800x38.4\n    block <div> at (0,0) size 800x38.4\n      anon (anonymous) at (0,0) size 800x19.2\n        text \"loose\" at (0,0) size 37.76x19.2\n      block <p> at (0,19.2) size 800x19.2\n        text \"para\" at (0,19.2) size 30.72x19.2\n"));
+    destroy(&l);
+}
+
+test "whitespace between blocks generates no box" {
+    let l: Laid = build("<div>\n  <p>x</p>\n</div>",
+    "body { margin: 0 } p { margin: 0 }", 800.0);
+    assert(dump_is(&l,
+    "block <html> at (0,0) size 800x19.2\n  block <body> at (0,0) size 800x19.2\n    block <div> at (0,0) size 800x19.2\n      block <p> at (0,0) size 800x19.2\n        text \"x\" at (0,0) size 8.48x19.2\n"));
+    destroy(&l);
+}
+
+test "runs of whitespace inside text collapse to one space" {
+    let l: Laid = build("<p>a   \n  b</p>", "body { margin: 0 } p { margin: 0 }",
+    800.0);
+    assert(dump_is(&l,
+    "block <html> at (0,0) size 800x19.2\n  block <body> at (0,0) size 800x19.2\n    block <p> at (0,0) size 800x19.2\n      text \"a b\" at (0,0) size 21.12x19.2\n"));
+    destroy(&l);
+}
+
+test "text wraps at the content edge" {
+    let l: Laid = build("<p>aaa bbb ccc ddd</p>",
+    "body { margin: 0 } p { margin: 0; width: 60px }", 800.0);
+    let boxes_text: Vec<u8> = layout_serialize.tree_text(&l.boxes, &l.doc);
+    // Four short words at 60px wide must occupy more than one line.
+    assert(box_for(&l, "p").height > 19.2);
+    vec.destroy(&boxes_text);
+    destroy(&l);
+}
+
+test "a preserved newline breaks the line" {
+    let l: Laid = build("<pre>a\nb</pre>", "body { margin: 0 } pre { margin: 0 }",
+    800.0);
+    assert(near(box_for(&l, "pre").height, 38.4));
+    destroy(&l);
+}
+
+test "text-align center shifts the line" {
+    let l: Laid = build("<p>hi</p>",
+    "body { margin: 0 } p { margin: 0; width: 100px; text-align: center }",
+    800.0);
+    // "hi" is far narrower than 100px, so its fragment starts well right of 0.
+    let fragment: LayoutBox = first_text_box(&l);
+    assert(fragment.x > 30.0);
+    destroy(&l);
+}
+
+fn first_text_box(l: *Laid) -> LayoutBox {
+    for index: u64 in 0..box.box_count(&(*l).boxes) {
+        let candidate: LayoutBox = box.get(&(*l).boxes, index);
+        if candidate.kind == box.box_text() && candidate.text_len > 0 {
+            return candidate;
+        }
+    }
+    return box.empty_box(box.box_text());
+}
+
+test "the space between two elements belongs to the earlier text" {
+    let l: Laid = build("<p>in <b>bold</b>.</p>",
+    "body { margin: 0 } p { margin: 0 }", 800.0);
+    let fragment: LayoutBox = first_text_box(&l);
+    let text: []const u8 =
+    box.text_bytes(&l.boxes, fragment.text_off, fragment.text_len);
+    assert(len(text) == 3);
+    assert(text[2] == ' ');
+    destroy(&l);
+}
+
+test "font size scales the line height and text width" {
+    let small: Laid = build("<p>x</p>",
+    "body { margin: 0 } p { margin: 0; font-size: 10px }", 800.0);
+    let big: Laid = build("<p>x</p>",
+    "body { margin: 0 } p { margin: 0; font-size: 40px }", 800.0);
+    assert(near(box_for(&small, "p").height, 12.0));
+    assert(near(box_for(&big, "p").height, 48.0));
+    destroy(&small);
+    destroy(&big);
+}
+
+test "nested blocks inherit the narrowed containing block" {
+    let l: Laid = build("<div><div><p>x</p></div></div>",
+    "body { margin: 0 } div { padding: 10px } p { margin: 0 }", 800.0);
+    // 800 - 20 - 20 = 760 for the paragraph.
+    assert(near(box_for(&l, "p").width, 760.0));
+    assert(near(box_for(&l, "p").x, 20.0));
+    destroy(&l);
+}

@@ -41,7 +41,13 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       (hex, rgb(), named), keywords, and the box shorthands
 - [ ] `inherit` / `initial` / `unset` keywords and custom properties
 - [ ] `@media` query evaluation (rules inside one currently always apply)
-- [ ] Layout: block + inline formatting, box model
+- [x] Layout: the box tree with anonymous boxes, block formatting (widths,
+      auto margins, heights, sibling margin collapsing) and inline formatting
+      (line boxes, white-space collapsing, line breaking, text-align)
+- [ ] Real font metrics — `engine/src/layout/metrics.mx` currently estimates
+      advances from a width table, so text is proportional but not accurate
+- [ ] Floats, static positioning beyond normal flow, parent/child margin
+      collapsing, inline borders and padding
 - [ ] Paint: software rasterizer, bitmap font text first
 - [ ] Window: Win32 via `extern fn` FFI (CreateWindowExA + StretchDIBits)
 

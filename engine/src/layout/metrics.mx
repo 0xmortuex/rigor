@@ -1,0 +1,66 @@
+// Font metrics.
+//
+// PLACEHOLDER. Real metrics come from parsing an actual font file, which is a
+// milestone-2 item; until then advances are estimated from a small width table
+// so that line breaking and box sizing behave proportionally rather than
+// monospaced. Text will not be pixel-accurate against a browser, and it is not
+// meant to be — but every consumer of metrics goes through this module, so
+// swapping in real ones is a change to this file alone.
+//
+// Widths are expressed as a fraction of the font size, which is roughly how
+// they scale in a real proportional face.
+module engine.layout.metrics;
+
+// Advance width of one ASCII byte, as a fraction of the font size.
+fn advance_ratio(c: u8) -> f64 {
+    if c == ' ' { return 0.26; }
+    if c == 'i' || c == 'l' || c == 'j' || c == '.' || c == ',' || c == ':'
+        || c == ';' || c == 39 as u8 || c == '|' || c == '!' {
+        return 0.24;
+    }
+    if c == 'f' || c == 't' || c == 'r' || c == 'I' || c == '(' || c == ')'
+        || c == '[' || c == ']' || c == '-' || c == '"' {
+        return 0.33;
+    }
+    if c == 'm' || c == 'w' || c == 'M' || c == 'W' {
+        return 0.83;
+    }
+    if c >= 'A' && c <= 'Z' {
+        return 0.62;
+    }
+    if c >= '0' && c <= '9' {
+        return 0.56;
+    }
+    if c >= 'a' && c <= 'z' {
+        return 0.53;
+    }
+    // Everything else, including the lead byte of a multi-byte sequence.
+    return 0.55;
+}
+
+// Width of a byte run at `font_size`. Continuation bytes of a UTF-8 sequence
+// contribute nothing, so one multi-byte character is measured once.
+pub fn text_width(view: []const u8, font_size: f64) -> f64 {
+    let total: f64 = 0.0;
+    for index: u64 in 0..len(view) {
+        let c: u8 = view[index];
+        if (c & (0xC0 as u8)) != 0x80 as u8 {
+            total = total + advance_ratio(c) * font_size;
+        }
+    }
+    return total;
+}
+
+pub fn char_width(c: u8, font_size: f64) -> f64 {
+    return advance_ratio(c) * font_size;
+}
+
+// Distance from the top of a line box to the text baseline. The 0.8 split
+// matches the usual ascent/descent ratio closely enough for layout.
+pub fn ascent(font_size: f64) -> f64 {
+    return font_size * 0.8;
+}
+
+pub fn descent(font_size: f64) -> f64 {
+    return font_size * 0.2;
+}

@@ -1,0 +1,202 @@
+// The layout tree — CSS 2.1 §9 "visual formatting model".
+//
+// A box tree is not the DOM. Elements with `display: none` produce no box at
+// all; an element whose children mix block and inline content gets anonymous
+// block boxes wrapped around the inline runs; and one text node can produce
+// several fragments when it breaks across lines. So this is its own arena,
+// with each box pointing back at the DOM node it came from (or none() for the
+// anonymous ones).
+//
+// Geometry is stored as used values in CSS pixels, filled in during layout:
+// `x`/`y` are the border-box corner in document coordinates, and `width`/
+// `height` are the *content* box, with the surrounding margin, border and
+// padding kept alongside so paint can reconstruct every edge.
+module engine.layout.box;
+
+import std.vec;
+import engine.style.computed;
+
+// Box kinds.
+pub fn box_block() -> u8 { return 0 as u8; }
+pub fn box_inline() -> u8 { return 1 as u8; }
+// An anonymous block box, generated to hold inline content that would
+// otherwise be a sibling of a block box (CSS 2.1 §9.2.1.1).
+pub fn box_anonymous() -> u8 { return 2 as u8; }
+// A run of text, positioned on one line. One DOM text node can produce many.
+pub fn box_text() -> u8 { return 3 as u8; }
+
+struct LayoutBox {
+    kind: u8,
+    // The DOM node this box came from; none() for anonymous boxes.
+    node: u64,
+    // The node whose computed style applies. For anonymous boxes that is the
+    // nearest non-anonymous ancestor's node, since anonymous boxes inherit
+    // everything and set nothing.
+    style_node: u64,
+
+    parent: u64,
+    first_child: u64,
+    last_child: u64,
+    next_sibling: u64,
+
+    // Text boxes: the byte range of the DOM pool this fragment renders.
+    text_off: u64,
+    text_len: u64,
+
+    // Used geometry, in CSS pixels.
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+
+    margin_top: f64,
+    margin_right: f64,
+    margin_bottom: f64,
+    margin_left: f64,
+    border_top: f64,
+    border_right: f64,
+    border_bottom: f64,
+    border_left: f64,
+    padding_top: f64,
+    padding_right: f64,
+    padding_bottom: f64,
+    padding_left: f64,
+
+    // Text boxes: the baseline offset from the fragment's top, so paint can
+    // place glyphs without re-deriving font metrics.
+    baseline: f64,
+}
+
+resource struct LayoutTree {
+    boxes: Vec<LayoutBox>,
+    // Rendered text. White-space processing (CSS 2.1 §16.6) collapses runs of
+    // spaces and drops them at line edges, so the bytes a fragment draws are
+    // not the bytes the DOM holds; the processed text is written here and
+    // fragments reference this buffer rather than the DOM pool.
+    text: Vec<u8>,
+    root: u64,
+}
+
+// Index 0 is a permanently unused sentinel so that 0 can mean "no box", the
+// same convention the DOM arena uses for its Document node.
+pub fn none() -> u64 { return 0; }
+
+pub fn new_tree() -> LayoutTree {
+    let tree: LayoutTree = LayoutTree {
+        boxes: vec.new<LayoutBox>(),
+        text: vec.new<u8>(),
+        root: 0,
+    };
+    vec.push(&tree.boxes, empty_box(box_block()));
+    return move tree;
+}
+
+pub fn destroy(tree: *LayoutTree) -> void {
+    vec.destroy(&(*tree).boxes);
+    vec.destroy(&(*tree).text);
+    (*tree).root = 0;
+}
+
+// Append rendered text and return its offset in the tree's text buffer.
+pub fn push_text(tree: *LayoutTree, view: []const u8) -> u64 {
+    let offset: u64 = (*tree).text.length;
+    for index: u64 in 0..len(view) {
+        vec.push(&(*tree).text, view[index]);
+    }
+    return offset;
+}
+
+pub fn push_byte(tree: *LayoutTree, value: u8) -> void {
+    vec.push(&(*tree).text, value);
+}
+
+pub fn text_length(tree: *LayoutTree) -> u64 {
+    return (*tree).text.length;
+}
+
+pub fn text_bytes(tree: *LayoutTree, offset: u64, length: u64) -> []const u8 {
+    let base: *const u8 = (*tree).text.data as *const u8;
+    return slice((&base[offset]) as *const u8, length);
+}
+
+pub fn empty_box(kind: u8) -> LayoutBox {
+    return LayoutBox {
+        kind: kind,
+        node: 0, style_node: 0,
+        parent: 0, first_child: 0, last_child: 0, next_sibling: 0,
+        text_off: 0, text_len: 0,
+        x: 0.0, y: 0.0, width: 0.0, height: 0.0,
+        margin_top: 0.0, margin_right: 0.0,
+        margin_bottom: 0.0, margin_left: 0.0,
+        border_top: 0.0, border_right: 0.0,
+        border_bottom: 0.0, border_left: 0.0,
+        padding_top: 0.0, padding_right: 0.0,
+        padding_bottom: 0.0, padding_left: 0.0,
+        baseline: 0.0,
+    };
+}
+
+pub fn box_count(tree: *LayoutTree) -> u64 {
+    return (*tree).boxes.length;
+}
+
+pub fn get(tree: *LayoutTree, index: u64) -> LayoutBox {
+    match vec.get(&(*tree).boxes, index) {
+        Option<LayoutBox>.Some(value) => { return value; },
+        Option<LayoutBox>.None => { return empty_box(box_block()); },
+    }
+}
+
+pub fn set(tree: *LayoutTree, index: u64, value: LayoutBox) -> void {
+    vec.set(&(*tree).boxes, index, value);
+}
+
+pub fn create(tree: *LayoutTree, kind: u8, node: u64, style_node: u64) -> u64 {
+    let value: LayoutBox = empty_box(kind);
+    value.node = node;
+    value.style_node = style_node;
+    let index: u64 = (*tree).boxes.length;
+    vec.push(&(*tree).boxes, value);
+    return index;
+}
+
+pub fn append_child(tree: *LayoutTree, parent: u64, child: u64) -> void {
+    let child_box: LayoutBox = get(tree, child);
+    child_box.parent = parent;
+    child_box.next_sibling = none();
+    let parent_box: LayoutBox = get(tree, parent);
+    if parent_box.last_child == none() {
+        parent_box.first_child = child;
+    } else {
+        let previous: LayoutBox = get(tree, parent_box.last_child);
+        previous.next_sibling = child;
+        set(tree, parent_box.last_child, previous);
+    }
+    parent_box.last_child = child;
+    set(tree, child, child_box);
+    set(tree, parent, parent_box);
+}
+
+// The full outer width of a box: content plus padding, borders and margins.
+pub fn outer_width(value: LayoutBox) -> f64 {
+    return value.margin_left + value.border_left + value.padding_left
+        + value.width
+        + value.padding_right + value.border_right + value.margin_right;
+}
+
+pub fn outer_height(value: LayoutBox) -> f64 {
+    return value.margin_top + value.border_top + value.padding_top
+        + value.height
+        + value.padding_bottom + value.border_bottom + value.margin_bottom;
+}
+
+// The border box, which is what paint fills and strokes.
+pub fn border_box_width(value: LayoutBox) -> f64 {
+    return value.border_left + value.padding_left + value.width
+        + value.padding_right + value.border_right;
+}
+
+pub fn border_box_height(value: LayoutBox) -> f64 {
+    return value.border_top + value.padding_top + value.height
+        + value.padding_bottom + value.border_bottom;
+}

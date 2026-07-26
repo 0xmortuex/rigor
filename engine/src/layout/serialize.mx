@@ -1,0 +1,139 @@
+// Render a layout tree as text.
+//
+// Layout tree dumps are how engines are actually debugged and regression
+// tested — the geometry is the whole output of the stage, so seeing it as
+// numbers is more useful than seeing it as pixels:
+//
+//     block   <body> at (8,8) size 784x36
+//       block   <p> at (8,8) size 784x18
+//         text  "Hello world" at (8,8) size 68x18
+module engine.layout.serialize;
+
+import std.vec;
+import box;
+import engine.dom.node;
+
+fn push_str(out: *Vec<u8>, text: *u8) -> void {
+    let index: u64 = 0;
+    while text[index] != 0 as u8 {
+        vec.push(out, text[index]);
+        index = index + 1;
+    }
+}
+
+fn push_view(out: *Vec<u8>, view: []const u8) -> void {
+    for index: u64 in 0..len(view) {
+        vec.push(out, view[index]);
+    }
+}
+
+fn push_u64(out: *Vec<u8>, value: u64) -> void {
+    if value >= 10 {
+        push_u64(out, value / 10);
+    }
+    vec.push(out, '0' + ((value % 10) as u8));
+}
+
+// Two decimal places, with trailing zeros trimmed, so whole pixels read as
+// whole numbers. Rounding happens on the whole value before it is split, so a
+// float that is 7.99999 from accumulated error prints as 8 rather than 7.
+fn push_f64(out: *Vec<u8>, value: f64) -> void {
+    let magnitude: f64 = value;
+    if magnitude < 0.0 {
+        vec.push(out, '-');
+        magnitude = 0.0 - magnitude;
+    }
+    let scaled: u64 = (magnitude * 100.0 + 0.5) as u64;
+    push_u64(out, scaled / 100);
+    let hundredths: u64 = scaled % 100;
+    if hundredths == 0 {
+        return;
+    }
+    vec.push(out, '.');
+    vec.push(out, '0' + ((hundredths / 10) as u8));
+    if hundredths % 10 > 0 {
+        vec.push(out, '0' + ((hundredths % 10) as u8));
+    }
+}
+
+fn kind_name(kind: u8) -> *u8 {
+    if kind == box.box_block() { return "block"; }
+    if kind == box.box_inline() { return "inline"; }
+    if kind == box.box_anonymous() { return "anon"; }
+    return "text";
+}
+
+fn write_box(
+    out: *Vec<u8>,
+    tree: *LayoutTree,
+    doc: *DomDocument,
+    index: u64,
+    depth: u64
+) -> void {
+    let current: LayoutBox = box.get(tree, index);
+    for step: u64 in 0..depth {
+        push_str(out, "  ");
+    }
+    push_str(out, kind_name(current.kind));
+    push_str(out, " ");
+
+    if current.kind == box.box_text() {
+        push_str(out, "\"");
+        push_view(out, box.text_bytes(tree, current.text_off, current.text_len));
+        push_str(out, "\"");
+    } else if current.node != node.none() {
+        let element: DomNode = node.get(doc, current.node);
+        push_str(out, "<");
+        push_view(out, node.bytes(doc, element.name_off, element.name_len));
+        push_str(out, ">");
+    } else {
+        push_str(out, "(anonymous)");
+    }
+
+    push_str(out, " at (");
+    push_f64(out, current.x);
+    push_str(out, ",");
+    push_f64(out, current.y);
+    push_str(out, ") size ");
+    push_f64(out, current.width);
+    push_str(out, "x");
+    push_f64(out, current.height);
+    if current.margin_top != 0.0 || current.margin_left != 0.0
+        || current.margin_bottom != 0.0 || current.margin_right != 0.0 {
+        push_str(out, " margin ");
+        push_f64(out, current.margin_top);
+        push_str(out, " ");
+        push_f64(out, current.margin_right);
+        push_str(out, " ");
+        push_f64(out, current.margin_bottom);
+        push_str(out, " ");
+        push_f64(out, current.margin_left);
+    }
+    if current.border_top != 0.0 || current.border_left != 0.0 {
+        push_str(out, " border ");
+        push_f64(out, current.border_top);
+    }
+    if current.padding_top != 0.0 || current.padding_left != 0.0 {
+        push_str(out, " padding ");
+        push_f64(out, current.padding_top);
+        push_str(out, " ");
+        push_f64(out, current.padding_left);
+    }
+    vec.push(out, 10 as u8);
+
+    let child: u64 = current.first_child;
+    while child != box.none() {
+        write_box(out, tree, doc, child, depth + 1);
+        child = box.get(tree, child).next_sibling;
+    }
+}
+
+// Serialize the whole layout tree into a fresh owned buffer, which the caller
+// must eventually vec.destroy.
+pub fn tree_text(tree: *LayoutTree, doc: *DomDocument) -> Vec<u8> {
+    let out: Vec<u8> = vec.new<u8>();
+    if (*tree).root != box.none() {
+        write_box(&out, tree, doc, (*tree).root, 0);
+    }
+    return move out;
+}

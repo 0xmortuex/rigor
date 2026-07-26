@@ -109,8 +109,13 @@ by the tree builder). The harness prints the skip count on every run.
 - **Computed values**: lengths resolved to pixels (em, rem, pt, cm, …),
   percentages kept for layout, colors from hex/rgb()/named, and the margin,
   padding and border shorthands.
+- **Layout** (CSS 2.1 §9–§10): the box tree with anonymous block boxes, the
+  block width constraint including `auto` margins centring a box, auto and
+  fixed heights, adjacent-sibling margin collapsing, and inline formatting
+  with line boxes, white-space collapsing, line breaking and `text-align`.
 - **`rigor` CLI**: pipe HTML in, get the token stream, the parsed tree, the
-  parsed stylesheet, and the computed style of every element out.
+  parsed stylesheet, the computed style of every element, and the laid-out
+  box tree with its geometry.
 
 ```
 > '<!DOCTYPE html><p class="x">Hi &amp; bye</p>' | rigor
@@ -158,6 +163,19 @@ a[href^="https"]:hover
       <p>  display:block font:16px/700 color:rgb(80 80 80) margin:8px 0px 8px 0px
 ```
 
+…and laid out to real geometry:
+
+```
+-- layout --
+block <html> at (0,0) size 800x179.68
+  block <body> at (8,8) size 784x171.68 margin 8 8 8 8
+    block <h1> at (8,29.44) size 784x38.4 margin 21.44 0 21.44 0
+      text "Rigor" at (8,29.44) size 72x38.4
+    block <div> at (8,89.28) size 470.4x54.4 margin 0 277.6 0 0 border 2 padding 16 16
+      block <p> at (26,115.28) size 470.4x19.2 margin 8 0 8 0
+        text "A browser engine." at (26,115.28) size 126.08x19.2
+```
+
 ## Build
 
 Requires the [Mort toolchain](https://github.com/0xmortuex/Mort) (`mortc`).
@@ -182,6 +200,7 @@ engine/            the engine library (Mort package `engine`) — embeddable
   src/dom/         the DOM arena and its html5lib-format serializer
   src/css/         preprocessing, tokenizer, parser, selectors, matching
   src/style/       the cascade, computed values, the UA stylesheet
+  src/layout/      the box tree, normal flow, font metrics
 src/main.mx        the rigor developer CLI
 tests/             spec-behavior tests (mortc test)
 conformance/       batch driver binary for the html5lib suites
