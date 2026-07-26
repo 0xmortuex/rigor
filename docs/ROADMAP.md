@@ -12,11 +12,13 @@ HTML + CSS in, pixels in a window out. No JavaScript.
 - [x] Repo + package layout (engine as an embeddable Mort package)
 - [x] Input preprocessing (§13.2.3.5: BOM, newlines)
 - [x] HTML tokenizer (§13.2.5) — tags, attributes, comments, doctypes,
-      RCDATA/RAWTEXT/PLAINTEXT, numeric + core named character references,
+      RCDATA/RAWTEXT/PLAINTEXT, numeric + named character references,
       spec-named parse errors
-- [ ] Full named-entity table generated from entities.json (2231 names,
+- [x] Full named-entity table generated from entities.json (2231 names,
       `tools/gen_entities.py` → `engine/src/html/entities.mx`)
-- [ ] html5lib-tests tokenizer conformance harness (the tokenizer's WPT)
+- [x] html5lib-tests tokenizer conformance harness — **6887/6887 tokens and
+      1737/1737 parse-error codes**; 145 cases skipped pending script-data
+      and CDATA states
 - [ ] Tree construction → DOM (§13.2.6): insertion modes, open-elements stack,
       active formatting elements; script-data tokenizer states land here
 - [ ] CSS tokenizer + parser (css-syntax-3), selectors (selectors-4 subset)

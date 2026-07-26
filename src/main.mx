@@ -113,9 +113,10 @@ fn dump_token(out: *Vec<u8>, sink: *HtmlTokenSink, index: u64) -> void {
 
 fn main() -> int {
     let raw: Vec<u8> = read_stdin();
-    let normalized: Vec<u8> =
-    preprocess.normalize(raw.data as *const u8, raw.length);
+    // Raw document bytes, so the byte stream decoder runs first.
     let sink: HtmlTokenSink = tokens.new_sink();
+    let normalized: Vec<u8> =
+    preprocess.decode_and_normalize(raw.data as *const u8, raw.length, &sink);
     let t: HtmlTokenizer =
     tokenizer.new(normalized.data as *const u8, normalized.length);
     tokenizer.run(&t, &sink);

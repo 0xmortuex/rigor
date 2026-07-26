@@ -172,6 +172,23 @@ pub fn set_rawtext(t: *HtmlTokenizer) -> void { (*t).state = ST_RAWTEXT; }
 pub fn set_plaintext(t: *HtmlTokenizer) -> void { (*t).state = ST_PLAINTEXT; }
 pub fn set_data(t: *HtmlTokenizer) -> void { (*t).state = ST_DATA; }
 
+// Seed the "appropriate end tag" name without having tokenized a start tag.
+// Tree construction needs this when it resumes a tokenizer in a text state,
+// and the html5lib conformance harness needs it for `lastStartTag`.
+pub fn set_last_start_tag(
+    t: *HtmlTokenizer,
+    s: *HtmlTokenSink,
+    name: *const u8,
+    length: u64
+) -> void {
+    (*t).last_start_off = (*s).pool.length;
+    (*t).last_start_len = length;
+    for index: u64 in 0..length {
+        vec.push(&(*s).pool, to_lower(name[index]));
+    }
+    (*t).has_last_start = true;
+}
+
 pub fn done(t: *HtmlTokenizer) -> bool {
     return (*t).eof_done;
 }

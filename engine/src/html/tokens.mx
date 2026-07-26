@@ -200,6 +200,11 @@ pub fn err_noncharacter_character_reference() -> u32 { return 40 as u32; }
 pub fn err_control_character_reference() -> u32 { return 41 as u32; }
 pub fn err_end_tag_with_attributes() -> u32 { return 42 as u32; }
 pub fn err_end_tag_with_trailing_solidus() -> u32 { return 43 as u32; }
+// Reported while preprocessing the input stream (§13.2.3.5), before
+// tokenization begins.
+pub fn err_control_character_in_input_stream() -> u32 { return 44 as u32; }
+pub fn err_noncharacter_in_input_stream() -> u32 { return 45 as u32; }
+pub fn err_surrogate_in_input_stream() -> u32 { return 46 as u32; }
 
 pub fn error_name(code: u32) -> *u8 {
     if code == 1 as u32 { return "unexpected-null-character"; }
@@ -245,5 +250,8 @@ pub fn error_name(code: u32) -> *u8 {
     if code == 41 as u32 { return "control-character-reference"; }
     if code == 42 as u32 { return "end-tag-with-attributes"; }
     if code == 43 as u32 { return "end-tag-with-trailing-solidus"; }
+    if code == 44 as u32 { return "control-character-in-input-stream"; }
+    if code == 45 as u32 { return "noncharacter-in-input-stream"; }
+    if code == 46 as u32 { return "surrogate-in-input-stream"; }
     return "unknown-parse-error";
 }

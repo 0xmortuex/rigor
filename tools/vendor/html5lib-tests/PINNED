@@ -1,0 +1,10 @@
+Vendored from https://github.com/html5lib/html5lib-tests
+path:   tokenizer/
+commit: 0b8d24c160a811555fa16119903e14143b07687a
+date:   fetched 2026-07-26
+
+Only the tokenizer suites are vendored. xmlViolation.test is deliberately
+excluded: it tests XML-serialization behavior, not the HTML tokenizer.
+
+Refresh by re-downloading the same file list at a newer commit and updating
+the hash above in the same change.

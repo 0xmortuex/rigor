@@ -1,0 +1,10 @@
+[package]
+name = "rigor_conformance"
+version = "0.1.0"
+
+[build]
+sources = ["src/**/*.mx"]
+std = ["json", "vec", "option", "bytes"]
+
+[dependencies]
+engine = "../engine"

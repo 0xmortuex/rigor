@@ -1,30 +1,133 @@
-// Input stream preprocessing — WHATWG HTML §13.2.3.5.
+// Input stream handling ahead of the tokenizer.
 //
-// Before tokenization, U+000D U+000A (CRLF) pairs and any remaining lone
-// U+000D (CR) are normalized to a single U+000A (LF). The tokenizer then
-// never sees a raw CR, exactly as the specification requires.
+// Two distinct stages live here, and the distinction matters:
 //
-// Byte-encoding note: rigor tokenizes UTF-8 bytes directly. Every character
-// the state machine dispatches on is ASCII, so multi-byte sequences flow
-// through text, names, and attribute values untouched. Charset sniffing and
-// decoding of non-UTF-8 documents (§13.2.3) is a later, separate stage.
+//   strip_bom  — part of *byte stream decoding* (§13.2.3.3). A byte order
+//                mark is consumed by the decoder while turning bytes into
+//                characters; it never reaches the tokenizer. Callers holding
+//                a character stream (already-decoded text) must NOT apply it,
+//                because U+FEFF is then an ordinary character that passes
+//                through — html5lib's tokenizer suites check exactly this.
+//
+//   normalize  — *preprocessing the input stream* (§13.2.3.5), which runs on
+//                the character stream. It normalizes newlines (U+000D U+000A
+//                pairs and lone U+000D become a single U+000A, so the
+//                tokenizer never sees a raw CR) and reports the three
+//                input-stream parse errors: surrogates, noncharacters, and
+//                controls other than ASCII whitespace and U+0000.
+//
+// Because those errors are found here, they land in the sink ahead of every
+// tokenizer error. Each one carries its offset, so a caller that needs strict
+// document order can sort the error list by `pos`.
+//
+// Byte-encoding note: rigor works on UTF-8 bytes directly, and normalize
+// copies bytes through unchanged — it decodes only to inspect each character.
+// Every character the tokenizer dispatches on is ASCII, so multi-byte
+// sequences flow through text, names, and attribute values untouched.
+// Charset sniffing and decoding of non-UTF-8 documents (§13.2.3.2) is a later
+// stage that will sit in front of strip_bom.
 module engine.html.preprocess;
 
 import std.vec;
+import tokens;
 
-// Copy `length` bytes from `input` into a fresh owned buffer with newlines
-// normalized. The caller owns the returned Vec.
-pub fn normalize(input: *const u8, length: u64) -> Vec<u8> {
-    let out: Vec<u8> = vec.with_capacity<u8>(length + 1);
-    let pos: u64 = 0;
-    // A leading UTF-8 byte order mark belongs to the byte stream decoder
-    // (§13.2.3.5); the tokenizer must never see it.
+// Byte length of a leading UTF-8 byte order mark: 3 when present, else 0.
+// §13.2.3.3 — the decoder consumes it.
+pub fn strip_bom(input: *const u8, length: u64) -> u64 {
     if length >= 3
         && input[0] == 0xEF as u8
         && input[1] == 0xBB as u8
         && input[2] == 0xBF as u8 {
-        pos = 3;
+        return 3;
     }
+    return 0;
+}
+
+// One decoded character: its code point and how many bytes it occupied.
+struct PreprocessChar {
+    cp: u32,
+    size: u64,
+}
+
+// Decode the UTF-8 sequence at `pos`. Malformed input yields the lead byte as
+// a single-byte character; encoding errors belong to the byte stream decoder,
+// and this stage must not stall on them.
+fn decode(input: *const u8, length: u64, pos: u64) -> PreprocessChar {
+    let lead: u8 = input[pos];
+    if lead < 0x80 as u8 {
+        return PreprocessChar { cp: lead as u32, size: 1 };
+    }
+    let extra: u64 = 0;
+    let cp: u32 = 0 as u32;
+    if lead >= 0xF0 as u8 && lead <= 0xF4 as u8 {
+        extra = 3;
+        cp = (lead & (0x07 as u8)) as u32;
+    } else if lead >= 0xE0 as u8 && lead <= 0xEF as u8 {
+        extra = 2;
+        cp = (lead & (0x0F as u8)) as u32;
+    } else if lead >= 0xC2 as u8 && lead <= 0xDF as u8 {
+        extra = 1;
+        cp = (lead & (0x1F as u8)) as u32;
+    } else {
+        return PreprocessChar { cp: lead as u32, size: 1 };
+    }
+    if pos + extra >= length {
+        return PreprocessChar { cp: lead as u32, size: 1 };
+    }
+    for step: u64 in 1..(extra + 1) {
+        let cont: u8 = input[pos + step];
+        if (cont & (0xC0 as u8)) != 0x80 as u8 {
+            return PreprocessChar { cp: lead as u32, size: 1 };
+        }
+        cp = (cp << 6) | ((cont & (0x3F as u8)) as u32);
+    }
+    return PreprocessChar { cp: cp, size: 1 + extra };
+}
+
+// ASCII whitespace per the HTML definition: TAB, LF, FF, CR, SPACE. Note that
+// U+000B VERTICAL TAB is deliberately absent, so it is a control error.
+fn is_ascii_whitespace(cp: u32) -> bool {
+    return cp == 0x09 as u32 || cp == 0x0A as u32 || cp == 0x0C as u32
+        || cp == 0x0D as u32 || cp == 0x20 as u32;
+}
+
+fn is_control(cp: u32) -> bool {
+    return cp <= 0x1F as u32 || (cp >= 0x7F as u32 && cp <= 0x9F as u32);
+}
+
+fn is_noncharacter(cp: u32) -> bool {
+    if cp >= 0xFDD0 as u32 && cp <= 0xFDEF as u32 {
+        return true;
+    }
+    let low: u32 = cp & (0xFFFF as u32);
+    return low == 0xFFFE as u32 || low == 0xFFFF as u32;
+}
+
+fn is_surrogate(cp: u32) -> bool {
+    return cp >= 0xD800 as u32 && cp <= 0xDFFF as u32;
+}
+
+// Report the §13.2.3.5 input-stream error for `cp`, if any. `at` is the
+// character's offset in the normalized output.
+fn check(sink: *HtmlTokenSink, cp: u32, at: u64) -> void {
+    if is_surrogate(cp) {
+        vec.push(&(*sink).errors, HtmlParseError {
+            code: tokens.err_surrogate_in_input_stream(), pos: at });
+    } else if is_noncharacter(cp) {
+        vec.push(&(*sink).errors, HtmlParseError {
+            code: tokens.err_noncharacter_in_input_stream(), pos: at });
+    } else if cp != 0 as u32 && is_control(cp) && !is_ascii_whitespace(cp) {
+        vec.push(&(*sink).errors, HtmlParseError {
+            code: tokens.err_control_character_in_input_stream(), pos: at });
+    }
+}
+
+// §13.2.3.5. Copy `length` characters from `input` into a fresh owned buffer
+// with newlines normalized, recording input-stream parse errors into `sink`.
+// The caller owns the returned Vec.
+pub fn normalize(input: *const u8, length: u64, sink: *HtmlTokenSink) -> Vec<u8> {
+    let out: Vec<u8> = vec.with_capacity<u8>(length + 1);
+    let pos: u64 = 0;
     while pos < length {
         let c: u8 = input[pos];
         if c == 13 as u8 {
@@ -34,10 +137,30 @@ pub fn normalize(input: *const u8, length: u64) -> Vec<u8> {
             } else {
                 pos = pos + 1;
             }
-        } else {
+        } else if c < 0x80 as u8 {
+            check(sink, c as u32, out.length);
             vec.push(&out, c);
             pos = pos + 1;
+        } else {
+            let decoded: PreprocessChar = decode(input, length, pos);
+            check(sink, decoded.cp, out.length);
+            for step: u64 in 0..decoded.size {
+                vec.push(&out, input[pos + step]);
+            }
+            pos = pos + decoded.size;
         }
     }
     return move out;
+}
+
+// Convenience for callers that hold raw document bytes (a file, a response
+// body): decode then preprocess, in that order.
+pub fn decode_and_normalize(
+    input: *const u8,
+    length: u64,
+    sink: *HtmlTokenSink
+) -> Vec<u8> {
+    let start: u64 = strip_bom(input, length);
+    let decoded: Vec<u8> = normalize(&input[start], length - start, sink);
+    return move decoded;
 }

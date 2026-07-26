@@ -9,7 +9,7 @@ import engine.html.tokenizer;
 import engine.html.tokens;
 
 fn tokenize_into(text: *u8, sink: *HtmlTokenSink) -> void {
-    let normalized: Vec<u8> = preprocess.normalize(text as *const u8, str_len(text));
+    let normalized: Vec<u8> = preprocess.normalize(text as *const u8, str_len(text), sink);
     let t: HtmlTokenizer =
     tokenizer.new(normalized.data as *const u8, normalized.length);
     tokenizer.run(&t, sink);
@@ -245,6 +245,71 @@ test "unknown named reference stays literal" {
     assert(has_error(&sink, tokens.err_unknown_named_character_reference()));
 }
 
+test "full entity table: longest name in the table" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    // U+2233, encoded UTF-8 as E2 88 B3.
+    tokenize_into("&CounterClockwiseContourIntegral;", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 3);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[0] == 0xE2 as u8);
+    assert(got[1] == 0x88 as u8);
+    assert(got[2] == 0xB3 as u8);
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "full entity table: two-code-point expansion" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    // &NotEqualTilde; is U+2242 U+0338 — three plus two UTF-8 bytes.
+    tokenize_into("&NotEqualTilde;", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 5);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[0] == 0xE2 as u8);
+    assert(got[1] == 0x89 as u8);
+    assert(got[2] == 0x82 as u8);
+    assert(got[3] == 0xCC as u8);
+    assert(got[4] == 0xB8 as u8);
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "full entity table: longest match wins over a shorter prefix" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    // Both "not" and "notin;" are in the table; "notin;" must win.
+    tokenize_into("&notin;", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 3);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[0] == 0xE2 as u8);
+    assert(got[1] == 0x88 as u8);
+    assert(got[2] == 0x89 as u8);
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "full entity table: legacy prefix match without semicolon" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    // "&notit;" has no table entry, but legacy "&not" does: U+00AC then "it;".
+    tokenize_into("&notit;", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 5);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[0] == 0xC2 as u8);
+    assert(got[1] == 0xAC as u8);
+    assert(got[2] == 'i');
+    assert(got[3] == 't');
+    assert(got[4] == ';');
+    assert(has_error(&sink,
+    tokens.err_missing_semicolon_after_character_reference()));
+}
+
+test "full entity table: names are case-sensitive" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    // &Amp; is not in the table (only &amp; and &AMP;), so it stays literal.
+    tokenize_into("&Amp;", &sink);
+    assert(data_is(&sink, 0, "&Amp;"));
+    assert(has_error(&sink, tokens.err_unknown_named_character_reference()));
+}
+
 test "character reference inside attribute value" {
     let sink: HtmlTokenSink = tokens.new_sink();
     tokenize_into("<a href=\"?a=1&amp;b=2\">", &sink);
@@ -263,7 +328,7 @@ test "rcdata flushes non-matching end tags as text" {
     let sink: HtmlTokenSink = tokens.new_sink();
     let source: *u8 = "<title>a</tix</title>";
     let normalized: Vec<u8> =
-    preprocess.normalize(source as *const u8, str_len(source));
+    preprocess.normalize(source as *const u8, str_len(source), &sink);
     let t: HtmlTokenizer =
     tokenizer.new(normalized.data as *const u8, normalized.length);
     // Pump until the <title> start tag is out, then switch the tokenizer to
@@ -283,7 +348,7 @@ test "rawtext ignores markup until its end tag" {
     let sink: HtmlTokenSink = tokens.new_sink();
     let source: *u8 = "<style>p<b{}</style>";
     let normalized: Vec<u8> =
-    preprocess.normalize(source as *const u8, str_len(source));
+    preprocess.normalize(source as *const u8, str_len(source), &sink);
     let t: HtmlTokenizer =
     tokenizer.new(normalized.data as *const u8, normalized.length);
     assert(tokenizer.pump(&t, &sink));
@@ -304,7 +369,7 @@ test "newlines are normalized before tokenizing" {
     vec.push(&raw, 13 as u8);
     vec.push(&raw, 'c');
     let normalized: Vec<u8> =
-    preprocess.normalize(raw.data as *const u8, raw.length);
+    preprocess.normalize(raw.data as *const u8, raw.length, &sink);
     let t: HtmlTokenizer =
     tokenizer.new(normalized.data as *const u8, normalized.length);
     tokenizer.run(&t, &sink);
@@ -318,7 +383,7 @@ test "newlines are normalized before tokenizing" {
     assert(got[4] == 'c');
 }
 
-test "leading utf-8 byte order mark is stripped" {
+test "byte stream decoding strips a leading byte order mark" {
     let sink: HtmlTokenSink = tokens.new_sink();
     let raw: Vec<u8> = vec.new<u8>();
     vec.push(&raw, 0xEF as u8);
@@ -326,12 +391,77 @@ test "leading utf-8 byte order mark is stripped" {
     vec.push(&raw, 0xBF as u8);
     vec.push(&raw, 'h');
     vec.push(&raw, 'i');
+    let decoded: Vec<u8> =
+    preprocess.decode_and_normalize(raw.data as *const u8, raw.length, &sink);
+    let t: HtmlTokenizer =
+    tokenizer.new(decoded.data as *const u8, decoded.length);
+    tokenizer.run(&t, &sink);
+    assert(data_is(&sink, 0, "hi"));
+}
+
+test "U+FEFF in a character stream passes through untouched" {
+    // The BOM is consumed by the byte stream decoder (§13.2.3.3), not by
+    // input preprocessing (§13.2.3.5). Given an already-decoded character
+    // stream, U+FEFF is an ordinary character.
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let raw: Vec<u8> = vec.new<u8>();
+    vec.push(&raw, 0xEF as u8);
+    vec.push(&raw, 0xBB as u8);
+    vec.push(&raw, 0xBF as u8);
+    vec.push(&raw, 'h');
     let normalized: Vec<u8> =
-    preprocess.normalize(raw.data as *const u8, raw.length);
+    preprocess.normalize(raw.data as *const u8, raw.length, &sink);
     let t: HtmlTokenizer =
     tokenizer.new(normalized.data as *const u8, normalized.length);
     tokenizer.run(&t, &sink);
-    assert(data_is(&sink, 0, "hi"));
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 4);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[0] == 0xEF as u8);
+    assert(got[3] == 'h');
+}
+
+test "input stream reports control characters but passes them through" {
+    // U+000B is a control and is NOT ASCII whitespace under the HTML
+    // definition, so preprocessing flags it (§13.2.3.5) while the character
+    // itself still reaches the tokenizer.
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let raw: Vec<u8> = vec.new<u8>();
+    vec.push(&raw, 'a');
+    vec.push(&raw, 11 as u8);
+    let normalized: Vec<u8> =
+    preprocess.normalize(raw.data as *const u8, raw.length, &sink);
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.run(&t, &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 2);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[1] == 11 as u8);
+    assert(has_error(&sink, tokens.err_control_character_in_input_stream()));
+}
+
+test "input stream does not flag ascii whitespace as a control" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("a\tb c", &sink);
+    assert(!has_error(&sink, tokens.err_control_character_in_input_stream()));
+}
+
+test "input stream reports noncharacters" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let raw: Vec<u8> = vec.new<u8>();
+    // U+FFFF is a noncharacter; UTF-8 EF BF BF.
+    vec.push(&raw, 0xEF as u8);
+    vec.push(&raw, 0xBF as u8);
+    vec.push(&raw, 0xBF as u8);
+    let normalized: Vec<u8> =
+    preprocess.normalize(raw.data as *const u8, raw.length, &sink);
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.run(&t, &sink);
+    assert(has_error(&sink, tokens.err_noncharacter_in_input_stream()));
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 3);
 }
 
 test "null byte in data is a parse error but passes through" {
