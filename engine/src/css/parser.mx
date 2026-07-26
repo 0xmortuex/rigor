@@ -1,0 +1,413 @@
+// CSS parsing — CSS Syntax Module Level 3 §5.
+//
+// The spec defines parsing over a stream of *component values* built by
+// "consume a component value" (§5.4.7), which recursively groups {}, [] and ()
+// into blocks. rigor works directly over the flat token stream instead and
+// tracks nesting depth as it scans, which is equivalent for the grammar the
+// spec actually uses — every algorithm here only ever needs "skip to the end
+// of the current block" or "stop at the top-level semicolon". Keeping the
+// tokens flat means declaration values stay as a token range rather than a
+// second parallel tree.
+//
+// Implemented: parse a stylesheet (§5.4.1), consume a qualified rule
+// (§5.4.3), consume an at-rule (§5.4.2), and consume a list of declarations
+// (§5.4.4) including !important. @media and @supports keep their nested rules;
+// other at-rules keep their prelude and skip their block.
+module engine.css.parser;
+
+import std.vec;
+import tokens;
+import stylesheet;
+import selectors;
+
+struct CssParser {
+    pos: u64,
+    limit: u64,
+}
+
+fn kind_at(s: *CssTokenSink, index: u64) -> u8 {
+    return tokens.get_token(s, index).kind;
+}
+
+fn at_end(p: *CssParser, s: *CssTokenSink) -> bool {
+    return (*p).pos >= (*p).limit || kind_at(s, (*p).pos) == tokens.kind_eof();
+}
+
+fn skip_whitespace(p: *CssParser, s: *CssTokenSink) -> void {
+    while !at_end(p, s) && kind_at(s, (*p).pos) == tokens.kind_whitespace() {
+        (*p).pos = (*p).pos + 1;
+    }
+}
+
+// True for the token kinds that open a block and must be matched.
+fn opens_block(kind: u8) -> bool {
+    return kind == tokens.kind_open_curly() || kind == tokens.kind_open_square()
+        || kind == tokens.kind_open_paren() || kind == tokens.kind_function();
+}
+
+fn closes_block(kind: u8) -> bool {
+    return kind == tokens.kind_close_curly()
+        || kind == tokens.kind_close_square()
+        || kind == tokens.kind_close_paren();
+}
+
+// Advance past a balanced block whose opening token is at `pos`. Returns the
+// index just past the matching close token.
+fn skip_block(p: *CssParser, s: *CssTokenSink) -> void {
+    let depth: u64 = 0;
+    while !at_end(p, s) {
+        let kind: u8 = kind_at(s, (*p).pos);
+        if opens_block(kind) {
+            depth = depth + 1;
+        } else if closes_block(kind) {
+            depth = depth - 1;
+            if depth == 0 {
+                (*p).pos = (*p).pos + 1;
+                return;
+            }
+        }
+        (*p).pos = (*p).pos + 1;
+    }
+}
+
+// Parse a whole stylesheet (§5.4.1) from the sink's tokens.
+pub fn parse_stylesheet(sheet: *CssStylesheet, s: *CssTokenSink) -> void {
+    let p: CssParser = CssParser { pos: 0, limit: tokens.token_count(s) };
+    parse_rules(sheet, s, &p, &(*sheet).top_level, true);
+}
+
+// Consume rules until the end of the current block (or of the stylesheet).
+// Appends each rule's index to `out`.
+fn parse_rules(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    p: *CssParser,
+    out: *Vec<u64>,
+    top_level: bool
+) -> void {
+    loop {
+        if at_end(p, s) {
+            return;
+        }
+        let kind: u8 = kind_at(s, (*p).pos);
+        if kind == tokens.kind_whitespace() {
+            (*p).pos = (*p).pos + 1;
+            continue;
+        }
+        if kind == tokens.kind_close_curly() {
+            // End of the enclosing block; the caller consumes the brace.
+            return;
+        }
+        if kind == tokens.kind_cdo() || kind == tokens.kind_cdc() {
+            // Only ignorable at the top level; inside a block they are junk
+            // that a qualified rule would swallow anyway.
+            (*p).pos = (*p).pos + 1;
+            continue;
+        }
+        if kind == tokens.kind_at_keyword() {
+            let rule: u64 = consume_at_rule(sheet, s, p);
+            if rule < (*sheet).rules.length {
+                vec.push(out, rule);
+            }
+            continue;
+        }
+        let rule: u64 = consume_qualified_rule(sheet, s, p);
+        if rule < (*sheet).rules.length {
+            vec.push(out, rule);
+        }
+    }
+}
+
+// §5.4.3 "consume a qualified rule". The prelude is the selector list.
+fn consume_qualified_rule(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    p: *CssParser
+) -> u64 {
+    let prelude_first: u64 = (*p).pos;
+    let depth: u64 = 0;
+    let block_start: u64 = (*p).limit;
+    while !at_end(p, s) {
+        let kind: u8 = kind_at(s, (*p).pos);
+        if depth == 0 && kind == tokens.kind_open_curly() {
+            block_start = (*p).pos;
+            break;
+        }
+        if opens_block(kind) {
+            depth = depth + 1;
+        } else if closes_block(kind) {
+            if depth == 0 {
+                // A stray closer at the top level: the rule is malformed.
+                (*p).pos = (*p).pos + 1;
+                return (*sheet).rules.length;
+            }
+            depth = depth - 1;
+        }
+        (*p).pos = (*p).pos + 1;
+    }
+    if block_start == (*p).limit {
+        // No block before end of input: the rule is dropped (§5.4.3).
+        return (*sheet).rules.length;
+    }
+
+    let rule: CssRule = stylesheet.empty_rule();
+    rule.kind = stylesheet.rule_style();
+    rule.has_block = true;
+    rule.selector_first = (*sheet).selectors.length;
+    rule.selector_count =
+        selectors.parse_list(sheet, s, prelude_first, block_start);
+    rule.prelude_first = prelude_first;
+    rule.prelude_count = block_start - prelude_first;
+
+    // Step into the block and read declarations.
+    (*p).pos = block_start + 1;
+    rule.decl_first = (*sheet).declarations.length;
+    rule.decl_count = consume_declarations(sheet, s, p);
+    // Consume the closing brace when it is there.
+    if !at_end(p, s) && kind_at(s, (*p).pos) == tokens.kind_close_curly() {
+        (*p).pos = (*p).pos + 1;
+    }
+
+    let index: u64 = (*sheet).rules.length;
+    vec.push(&(*sheet).rules, rule);
+    return index;
+}
+
+// §5.4.2 "consume an at-rule".
+fn consume_at_rule(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    p: *CssParser
+) -> u64 {
+    let name_token: CssToken = tokens.get_token(s, (*p).pos);
+    (*p).pos = (*p).pos + 1;
+    let prelude_first: u64 = (*p).pos;
+
+    let depth: u64 = 0;
+    let block_start: u64 = (*p).limit;
+    let ended_with_semicolon: bool = false;
+    while !at_end(p, s) {
+        let kind: u8 = kind_at(s, (*p).pos);
+        if depth == 0 && kind == tokens.kind_semicolon() {
+            ended_with_semicolon = true;
+            break;
+        }
+        if depth == 0 && kind == tokens.kind_open_curly() {
+            block_start = (*p).pos;
+            break;
+        }
+        if opens_block(kind) {
+            depth = depth + 1;
+        } else if closes_block(kind) {
+            if depth == 0 {
+                break;
+            }
+            depth = depth - 1;
+        }
+        (*p).pos = (*p).pos + 1;
+    }
+    let prelude_count: u64 = (*p).pos - prelude_first;
+
+    let rule: CssRule = stylesheet.empty_rule();
+    rule.kind = stylesheet.rule_at();
+    rule.name_off = stylesheet.intern(sheet, tokens.token_value(s, name_token));
+    rule.name_len = name_token.value_len;
+    rule.prelude_first = prelude_first;
+    rule.prelude_count = prelude_count;
+
+    if ended_with_semicolon {
+        // A statement at-rule such as @import or @charset.
+        (*p).pos = (*p).pos + 1;
+        let index: u64 = (*sheet).rules.length;
+        vec.push(&(*sheet).rules, rule);
+        return index;
+    }
+    if block_start == (*p).limit {
+        return (*sheet).rules.length;
+    }
+
+    rule.has_block = true;
+    (*p).pos = block_start + 1;
+    if at_rule_holds_rules(sheet, s, name_token) {
+        // @media / @supports: the block holds rules, so recurse.
+        let children: Vec<u64> = vec.new<u64>();
+        parse_rules(sheet, s, p, &children, false);
+        rule.child_first = (*sheet).rules.length;
+        // Children were appended to `rules` during the recursion; record them
+        // by copying their indices into a contiguous run the rule can point at.
+        // The indices are already contiguous in practice, but a nested at-rule
+        // could interleave, so store the count and the first child explicitly.
+        if children.length > 0 {
+            match vec.get(&children, 0) {
+                Option<u64>.Some(first) => { rule.child_first = first; },
+                Option<u64>.None => {},
+            }
+        }
+        rule.child_count = children.length;
+        vec.destroy(&children);
+    } else {
+        rule.decl_first = (*sheet).declarations.length;
+        rule.decl_count = consume_declarations(sheet, s, p);
+    }
+    if !at_end(p, s) && kind_at(s, (*p).pos) == tokens.kind_close_curly() {
+        (*p).pos = (*p).pos + 1;
+    }
+
+    let index: u64 = (*sheet).rules.length;
+    vec.push(&(*sheet).rules, rule);
+    return index;
+}
+
+fn at_rule_holds_rules(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    name_token: CssToken
+) -> bool {
+    let name: []const u8 = tokens.token_value(s, name_token);
+    return equals_ci(name, "media") || equals_ci(name, "supports")
+        || equals_ci(name, "layer") || equals_ci(name, "container")
+        || equals_ci(name, "scope");
+}
+
+fn equals_ci(view: []const u8, text: *u8) -> bool {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if len(view) != length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        let a: u8 = view[index];
+        if a >= 'A' && a <= 'Z' {
+            a = a + 32 as u8;
+        }
+        if a != text[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// §5.4.4 "consume a list of declarations", stopping at the block's closing
+// brace. Returns how many declarations were appended.
+fn consume_declarations(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    p: *CssParser
+) -> u64 {
+    let count: u64 = 0;
+    loop {
+        if at_end(p, s) {
+            return count;
+        }
+        let kind: u8 = kind_at(s, (*p).pos);
+        if kind == tokens.kind_close_curly() {
+            return count;
+        }
+        if kind == tokens.kind_whitespace() || kind == tokens.kind_semicolon() {
+            (*p).pos = (*p).pos + 1;
+            continue;
+        }
+        if kind == tokens.kind_at_keyword() {
+            // A nested at-rule inside a declaration block; skip it.
+            consume_at_rule(sheet, s, p);
+            continue;
+        }
+        if consume_declaration(sheet, s, p) {
+            count = count + 1;
+        }
+    }
+}
+
+// §5.4.5 "consume a declaration". Returns true when one was produced.
+fn consume_declaration(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    p: *CssParser
+) -> bool {
+    if kind_at(s, (*p).pos) != tokens.kind_ident() {
+        skip_to_declaration_end(p, s);
+        return false;
+    }
+    let name_token: CssToken = tokens.get_token(s, (*p).pos);
+    (*p).pos = (*p).pos + 1;
+    skip_whitespace(p, s);
+    if at_end(p, s) || kind_at(s, (*p).pos) != tokens.kind_colon() {
+        skip_to_declaration_end(p, s);
+        return false;
+    }
+    (*p).pos = (*p).pos + 1;
+    skip_whitespace(p, s);
+
+    let value_first: u64 = (*p).pos;
+    skip_to_declaration_end(p, s);
+    let value_last: u64 = (*p).pos;
+    // Trim trailing whitespace from the value range.
+    while value_last > value_first
+        && kind_at(s, value_last - 1) == tokens.kind_whitespace() {
+        value_last = value_last - 1;
+    }
+
+    // §5.4.5 step 5: a trailing "!important" is stripped from the value.
+    let important: bool = false;
+    let scan: u64 = value_last;
+    while scan > value_first && kind_at(s, scan - 1) == tokens.kind_whitespace() {
+        scan = scan - 1;
+    }
+    if scan > value_first && kind_at(s, scan - 1) == tokens.kind_ident() {
+        let word: CssToken = tokens.get_token(s, scan - 1);
+        if equals_ci(tokens.token_value(s, word), "important") {
+            let before: u64 = scan - 1;
+            while before > value_first
+                && kind_at(s, before - 1) == tokens.kind_whitespace() {
+                before = before - 1;
+            }
+            if before > value_first {
+                let bang: CssToken = tokens.get_token(s, before - 1);
+                if bang.kind == tokens.kind_delim() && bang.delim == ('!' as u32) {
+                    important = true;
+                    value_last = before - 1;
+                    while value_last > value_first
+                        && kind_at(s, value_last - 1) == tokens.kind_whitespace() {
+                        value_last = value_last - 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if value_last == value_first {
+        // A declaration with no value is invalid and is dropped.
+        return false;
+    }
+    vec.push(&(*sheet).declarations, CssDeclaration {
+        name_off: stylesheet.intern(sheet, tokens.token_value(s, name_token)),
+        name_len: name_token.value_len,
+        value_first: value_first,
+        value_count: value_last - value_first,
+        important: important,
+    });
+    return true;
+}
+
+// Advance to the semicolon that ends this declaration, or to the closing brace
+// of the block, skipping over any nested blocks on the way.
+fn skip_to_declaration_end(p: *CssParser, s: *CssTokenSink) -> void {
+    let depth: u64 = 0;
+    while !at_end(p, s) {
+        let kind: u8 = kind_at(s, (*p).pos);
+        if depth == 0 && kind == tokens.kind_semicolon() {
+            return;
+        }
+        if depth == 0 && kind == tokens.kind_close_curly() {
+            return;
+        }
+        if opens_block(kind) {
+            depth = depth + 1;
+        } else if closes_block(kind) && depth > 0 {
+            depth = depth - 1;
+        }
+        (*p).pos = (*p).pos + 1;
+    }
+}

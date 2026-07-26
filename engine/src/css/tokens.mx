@@ -1,0 +1,167 @@
+// Token output of the CSS tokenizer — CSS Syntax Module Level 3 §4
+// (https://drafts.csswg.org/css-syntax-3/).
+//
+// Same arena shape the HTML side proved out: tokens are plain data in one
+// Vec<CssToken>, every string (ident names, string contents, urls, dimension
+// units) lives in a shared byte pool addressed by (offset, length), and parse
+// errors are values rather than exceptions.
+module engine.css.tokens;
+
+import std.vec;
+
+// --- Token kinds -------------------------------------------------------------
+// §4.2 "token" definitions. Cross-module code reads these through the
+// accessors, because Mort globals are file-scope.
+
+pub fn kind_whitespace() -> u8 { return 0 as u8; }
+pub fn kind_ident() -> u8 { return 1 as u8; }
+pub fn kind_function() -> u8 { return 2 as u8; }
+pub fn kind_at_keyword() -> u8 { return 3 as u8; }
+pub fn kind_hash() -> u8 { return 4 as u8; }
+pub fn kind_string() -> u8 { return 5 as u8; }
+pub fn kind_bad_string() -> u8 { return 6 as u8; }
+pub fn kind_url() -> u8 { return 7 as u8; }
+pub fn kind_bad_url() -> u8 { return 8 as u8; }
+pub fn kind_delim() -> u8 { return 9 as u8; }
+pub fn kind_number() -> u8 { return 10 as u8; }
+pub fn kind_percentage() -> u8 { return 11 as u8; }
+pub fn kind_dimension() -> u8 { return 12 as u8; }
+pub fn kind_cdo() -> u8 { return 13 as u8; }
+pub fn kind_cdc() -> u8 { return 14 as u8; }
+pub fn kind_colon() -> u8 { return 15 as u8; }
+pub fn kind_semicolon() -> u8 { return 16 as u8; }
+pub fn kind_comma() -> u8 { return 17 as u8; }
+pub fn kind_open_square() -> u8 { return 18 as u8; }
+pub fn kind_close_square() -> u8 { return 19 as u8; }
+pub fn kind_open_paren() -> u8 { return 20 as u8; }
+pub fn kind_close_paren() -> u8 { return 21 as u8; }
+pub fn kind_open_curly() -> u8 { return 22 as u8; }
+pub fn kind_close_curly() -> u8 { return 23 as u8; }
+pub fn kind_eof() -> u8 { return 24 as u8; }
+
+// A hash token's type flag (§4.2). "id" hashes are valid ID selectors;
+// unrestricted ones are only usable as values such as colours.
+pub fn hash_unrestricted() -> u8 { return 0 as u8; }
+pub fn hash_id() -> u8 { return 1 as u8; }
+
+struct CssToken {
+    kind: u8,
+    // Ident, function, at-keyword, hash, string and url tokens: the value.
+    // Dimension tokens: the unit. Others: unused.
+    value_off: u64,
+    value_len: u64,
+    // Number, percentage and dimension tokens.
+    number: f64,
+    is_integer: bool,
+    // Delim tokens: the code point itself.
+    delim: u32,
+    hash_type: u8,
+    // Byte offset in the preprocessed input, for diagnostics.
+    pos: u64,
+}
+
+struct CssParseError {
+    code: u32,
+    pos: u64,
+}
+
+resource struct CssTokenSink {
+    tokens: Vec<CssToken>,
+    pool: Vec<u8>,
+    errors: Vec<CssParseError>,
+}
+
+pub fn new_sink() -> CssTokenSink {
+    return CssTokenSink {
+        tokens: vec.new<CssToken>(),
+        pool: vec.new<u8>(),
+        errors: vec.new<CssParseError>(),
+    };
+}
+
+pub fn destroy(sink: *CssTokenSink) -> void {
+    vec.destroy(&(*sink).tokens);
+    vec.destroy(&(*sink).pool);
+    vec.destroy(&(*sink).errors);
+}
+
+pub fn empty_token() -> CssToken {
+    return CssToken {
+        kind: 0 as u8,
+        value_off: 0, value_len: 0,
+        number: 0.0, is_integer: true,
+        delim: 0 as u32,
+        hash_type: 0 as u8,
+        pos: 0,
+    };
+}
+
+pub fn token_count(sink: *CssTokenSink) -> u64 {
+    return (*sink).tokens.length;
+}
+
+pub fn get_token(sink: *CssTokenSink, index: u64) -> CssToken {
+    match vec.get(&(*sink).tokens, index) {
+        Option<CssToken>.Some(token) => { return token; },
+        Option<CssToken>.None => {
+            let eof: CssToken = empty_token();
+            eof.kind = kind_eof();
+            return eof;
+        },
+    }
+}
+
+pub fn pool_bytes(sink: *CssTokenSink, offset: u64, length: u64) -> []const u8 {
+    let base: *const u8 = (*sink).pool.data as *const u8;
+    return slice((&base[offset]) as *const u8, length);
+}
+
+// The string a token carries: an ident's name, a string's contents, a url's
+// target, a dimension's unit. Empty for tokens that carry none.
+pub fn token_value(sink: *CssTokenSink, token: CssToken) -> []const u8 {
+    return pool_bytes(sink, token.value_off, token.value_len);
+}
+
+pub fn error_count(sink: *CssTokenSink) -> u64 {
+    return (*sink).errors.length;
+}
+
+pub fn get_error(sink: *CssTokenSink, index: u64) -> CssParseError {
+    match vec.get(&(*sink).errors, index) {
+        Option<CssParseError>.Some(error) => { return error; },
+        Option<CssParseError>.None => {
+            return CssParseError { code: 0 as u32, pos: 0 };
+        },
+    }
+}
+
+// --- Parse error codes -------------------------------------------------------
+// CSS Syntax names its failures inline rather than in a table, so these are
+// named after the algorithm step that reports them.
+
+pub fn err_unterminated_string() -> u32 { return 1 as u32; }
+pub fn err_newline_in_string() -> u32 { return 2 as u32; }
+pub fn err_unterminated_url() -> u32 { return 3 as u32; }
+pub fn err_bad_url() -> u32 { return 4 as u32; }
+pub fn err_invalid_escape() -> u32 { return 5 as u32; }
+pub fn err_unterminated_comment() -> u32 { return 6 as u32; }
+pub fn err_unexpected_eof_in_block() -> u32 { return 7 as u32; }
+pub fn err_unexpected_close_brace() -> u32 { return 8 as u32; }
+pub fn err_invalid_declaration() -> u32 { return 9 as u32; }
+pub fn err_invalid_selector() -> u32 { return 10 as u32; }
+pub fn err_invalid_at_rule() -> u32 { return 11 as u32; }
+
+pub fn error_name(code: u32) -> *u8 {
+    if code == 1 as u32 { return "unterminated-string"; }
+    if code == 2 as u32 { return "newline-in-string"; }
+    if code == 3 as u32 { return "unterminated-url"; }
+    if code == 4 as u32 { return "bad-url"; }
+    if code == 5 as u32 { return "invalid-escape"; }
+    if code == 6 as u32 { return "unterminated-comment"; }
+    if code == 7 as u32 { return "unexpected-eof-in-block"; }
+    if code == 8 as u32 { return "unexpected-close-brace"; }
+    if code == 9 as u32 { return "invalid-declaration"; }
+    if code == 10 as u32 { return "invalid-selector"; }
+    if code == 11 as u32 { return "invalid-at-rule"; }
+    return "unknown-css-error";
+}

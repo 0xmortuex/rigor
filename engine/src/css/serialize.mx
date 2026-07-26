@@ -1,0 +1,290 @@
+// Render a parsed stylesheet back to readable text.
+//
+// This is a debugging and testing aid, not a spec-compliant CSS serializer
+// (css-syntax-3 §9 defines that, and it matters for `cssText`; nothing needs
+// it yet). The shape here is chosen to make a diff obvious:
+//
+//     p.intro, #main > a
+//       color: red
+//       margin: 0 !important
+//     @media screen
+//       p
+//         color: blue
+//
+// Declaration values are rendered from their token range in the sink that
+// produced the stylesheet, so both must be passed in.
+module engine.css.serialize;
+
+import std.vec;
+import tokens;
+import stylesheet;
+
+fn push_str(out: *Vec<u8>, text: *u8) -> void {
+    let index: u64 = 0;
+    while text[index] != 0 as u8 {
+        vec.push(out, text[index]);
+        index = index + 1;
+    }
+}
+
+fn push_view(out: *Vec<u8>, view: []const u8) -> void {
+    for index: u64 in 0..len(view) {
+        vec.push(out, view[index]);
+    }
+}
+
+fn push_indent(out: *Vec<u8>, depth: u64) -> void {
+    for step: u64 in 0..depth {
+        push_str(out, "  ");
+    }
+}
+
+fn push_u64(out: *Vec<u8>, value: u64) -> void {
+    if value >= 10 {
+        push_u64(out, value / 10);
+    }
+    vec.push(out, '0' + ((value % 10) as u8));
+}
+
+// Numbers print with at most four fractional digits and no trailing zeros,
+// which is enough to read a stylesheet back without float noise.
+fn push_number(out: *Vec<u8>, value: f64) -> void {
+    let magnitude: f64 = value;
+    if magnitude < 0.0 {
+        vec.push(out, '-');
+        magnitude = 0.0 - magnitude;
+    }
+    let whole: u64 = magnitude as u64;
+    push_u64(out, whole);
+
+    let scaled: u64 = (((magnitude - (whole as f64)) * 10000.0) + 0.5) as u64;
+    if scaled >= 10000 {
+        // The rounding carried into the whole part, which push_u64 already
+        // printed; drop the fraction rather than print "1.10000".
+        return;
+    }
+    let d0: u64 = (scaled / 1000) % 10;
+    let d1: u64 = (scaled / 100) % 10;
+    let d2: u64 = (scaled / 10) % 10;
+    let d3: u64 = scaled % 10;
+    let count: u64 = 4;
+    if d3 == 0 { count = 3; }
+    if count == 3 && d2 == 0 { count = 2; }
+    if count == 2 && d1 == 0 { count = 1; }
+    if count == 1 && d0 == 0 { count = 0; }
+    if count == 0 {
+        return;
+    }
+    vec.push(out, '.');
+    vec.push(out, '0' + (d0 as u8));
+    if count >= 2 { vec.push(out, '0' + (d1 as u8)); }
+    if count >= 3 { vec.push(out, '0' + (d2 as u8)); }
+    if count >= 4 { vec.push(out, '0' + (d3 as u8)); }
+}
+
+fn write_token(out: *Vec<u8>, s: *CssTokenSink, token: CssToken) -> void {
+    let kind: u8 = token.kind;
+    if kind == tokens.kind_whitespace() {
+        vec.push(out, ' ');
+    } else if kind == tokens.kind_ident() {
+        push_view(out, tokens.token_value(s, token));
+    } else if kind == tokens.kind_function() {
+        push_view(out, tokens.token_value(s, token));
+        vec.push(out, '(');
+    } else if kind == tokens.kind_at_keyword() {
+        vec.push(out, '@');
+        push_view(out, tokens.token_value(s, token));
+    } else if kind == tokens.kind_hash() {
+        vec.push(out, '#');
+        push_view(out, tokens.token_value(s, token));
+    } else if kind == tokens.kind_string() {
+        vec.push(out, '"');
+        push_view(out, tokens.token_value(s, token));
+        vec.push(out, '"');
+    } else if kind == tokens.kind_url() {
+        push_str(out, "url(");
+        push_view(out, tokens.token_value(s, token));
+        vec.push(out, ')');
+    } else if kind == tokens.kind_number() {
+        push_number(out, token.number);
+    } else if kind == tokens.kind_percentage() {
+        push_number(out, token.number);
+        vec.push(out, '%');
+    } else if kind == tokens.kind_dimension() {
+        push_number(out, token.number);
+        push_view(out, tokens.token_value(s, token));
+    } else if kind == tokens.kind_delim() {
+        vec.push(out, token.delim as u8);
+    } else if kind == tokens.kind_colon() {
+        vec.push(out, ':');
+    } else if kind == tokens.kind_semicolon() {
+        vec.push(out, ';');
+    } else if kind == tokens.kind_comma() {
+        vec.push(out, ',');
+    } else if kind == tokens.kind_open_square() {
+        vec.push(out, '[');
+    } else if kind == tokens.kind_close_square() {
+        vec.push(out, ']');
+    } else if kind == tokens.kind_open_paren() {
+        vec.push(out, '(');
+    } else if kind == tokens.kind_close_paren() {
+        vec.push(out, ')');
+    } else if kind == tokens.kind_bad_string() {
+        push_str(out, "<bad-string>");
+    } else if kind == tokens.kind_bad_url() {
+        push_str(out, "<bad-url>");
+    }
+}
+
+fn write_simple(
+    out: *Vec<u8>,
+    sheet: *CssStylesheet,
+    simple: CssSimpleSelector
+) -> void {
+    let kind: u8 = simple.kind;
+    let name: []const u8 =
+        stylesheet.bytes(sheet, simple.name_off, simple.name_len);
+    if kind == stylesheet.simple_type() {
+        push_view(out, name);
+    } else if kind == stylesheet.simple_universal() {
+        vec.push(out, '*');
+    } else if kind == stylesheet.simple_class() {
+        vec.push(out, '.');
+        push_view(out, name);
+    } else if kind == stylesheet.simple_id() {
+        vec.push(out, '#');
+        push_view(out, name);
+    } else if kind == stylesheet.simple_pseudo_class() {
+        vec.push(out, ':');
+        push_view(out, name);
+    } else if kind == stylesheet.simple_pseudo_element() {
+        push_str(out, "::");
+        push_view(out, name);
+    } else {
+        vec.push(out, '[');
+        push_view(out, name);
+        if simple.matcher != stylesheet.match_exists() {
+            if simple.matcher == stylesheet.match_includes() { vec.push(out, '~'); }
+            else if simple.matcher == stylesheet.match_dash() { vec.push(out, '|'); }
+            else if simple.matcher == stylesheet.match_prefix() { vec.push(out, '^'); }
+            else if simple.matcher == stylesheet.match_suffix() { vec.push(out, '$'); }
+            else if simple.matcher == stylesheet.match_substring() { vec.push(out, '*'); }
+            vec.push(out, '=');
+            vec.push(out, '"');
+            push_view(out, stylesheet.bytes(sheet, simple.value_off, simple.value_len));
+            vec.push(out, '"');
+            if simple.case_insensitive {
+                push_str(out, " i");
+            }
+        }
+        vec.push(out, ']');
+    }
+}
+
+fn write_selector(
+    out: *Vec<u8>,
+    sheet: *CssStylesheet,
+    selector: CssSelector
+) -> void {
+    for step: u64 in 0..selector.compound_count {
+        let compound: CssCompound =
+            stylesheet.get_compound(sheet, selector.compound_first + step);
+        let combinator: u8 = compound.combinator;
+        if combinator == stylesheet.combinator_descendant() {
+            vec.push(out, ' ');
+        } else if combinator == stylesheet.combinator_child() {
+            push_str(out, " > ");
+        } else if combinator == stylesheet.combinator_next_sibling() {
+            push_str(out, " + ");
+        } else if combinator == stylesheet.combinator_subsequent_sibling() {
+            push_str(out, " ~ ");
+        }
+        for item: u64 in 0..compound.simple_count {
+            write_simple(out, sheet,
+                stylesheet.get_simple(sheet, compound.simple_first + item));
+        }
+    }
+}
+
+fn write_declarations(
+    out: *Vec<u8>,
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    rule: CssRule,
+    depth: u64
+) -> void {
+    for step: u64 in 0..rule.decl_count {
+        let declaration: CssDeclaration =
+            stylesheet.get_declaration(sheet, rule.decl_first + step);
+        push_indent(out, depth);
+        push_view(out,
+            stylesheet.bytes(sheet, declaration.name_off, declaration.name_len));
+        push_str(out, ": ");
+        for token_step: u64 in 0..declaration.value_count {
+            write_token(out, s,
+                tokens.get_token(s, declaration.value_first + token_step));
+        }
+        if declaration.important {
+            push_str(out, " !important");
+        }
+        vec.push(out, 10 as u8);
+    }
+}
+
+fn write_rule(
+    out: *Vec<u8>,
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    index: u64,
+    depth: u64
+) -> void {
+    let rule: CssRule = stylesheet.get_rule(sheet, index);
+    push_indent(out, depth);
+    if rule.kind == stylesheet.rule_at() {
+        vec.push(out, '@');
+        push_view(out, stylesheet.bytes(sheet, rule.name_off, rule.name_len));
+        let prelude_end: u64 = rule.prelude_count;
+        while prelude_end > 0
+            && tokens.get_token(s, rule.prelude_first + prelude_end - 1).kind
+                == tokens.kind_whitespace() {
+            prelude_end = prelude_end - 1;
+        }
+        for step: u64 in 0..prelude_end {
+            write_token(out, s, tokens.get_token(s, rule.prelude_first + step));
+        }
+        vec.push(out, 10 as u8);
+        for child: u64 in 0..rule.child_count {
+            write_rule(out, sheet, s, rule.child_first + child, depth + 1);
+        }
+        write_declarations(out, sheet, s, rule, depth + 1);
+        return;
+    }
+    let written: u64 = 0;
+    for step: u64 in 0..rule.selector_count {
+        let selector: CssSelector =
+            stylesheet.get_selector(sheet, rule.selector_first + step);
+        if !selector.valid {
+            continue;
+        }
+        if written > 0 {
+            push_str(out, ", ");
+        }
+        write_selector(out, sheet, selector);
+        written = written + 1;
+    }
+    if written == 0 {
+        push_str(out, "<invalid selector>");
+    }
+    vec.push(out, 10 as u8);
+    write_declarations(out, sheet, s, rule, depth + 1);
+}
+
+// Serialize the whole stylesheet into a fresh owned buffer, which the caller
+// must eventually vec.destroy.
+pub fn stylesheet_text(sheet: *CssStylesheet, s: *CssTokenSink) -> Vec<u8> {
+    let out: Vec<u8> = vec.new<u8>();
+    for index: u64 in 0..stylesheet.rule_count(sheet) {
+        write_rule(&out, sheet, s, stylesheet.top_level_rule(sheet, index), 0);
+    }
+    return move out;
+}

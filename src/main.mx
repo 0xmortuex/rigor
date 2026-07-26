@@ -14,8 +14,15 @@ import engine.html.preprocess;
 import engine.html.tokenizer;
 import engine.html.tokens;
 import engine.html.treebuilder;
+import engine.html.tagnames;
 import engine.dom.node;
 import engine.dom.serialize;
+import engine.css.preprocess as css_preprocess;
+import engine.css.tokenizer as css_tokenizer;
+import engine.css.tokens as css_tokens;
+import engine.css.parser as css_parser;
+import engine.css.stylesheet;
+import engine.css.serialize as css_serialize;
 
 extern fn getchar() -> c_int;
 extern fn putchar(character: c_int) -> c_int;
@@ -125,6 +132,33 @@ fn dump_token(out: *Vec<u8>, sink: *HtmlTokenSink, index: u64) -> void {
     out_line(out);
 }
 
+// Collect the text of every <style> element in the document, in tree order,
+// into one buffer — which is what the cascade will do too.
+fn gather_style_text(doc: *DomDocument, out: *Vec<u8>, index: u64) -> void {
+    let n: DomNode = node.get(doc, index);
+    if n.kind == node.kind_element() && n.tag == tagnames.tag_style() {
+        let child: u64 = n.first_child;
+        while child != node.none() {
+            let child_node: DomNode = node.get(doc, child);
+            if child_node.kind == node.kind_text() {
+                let text: []const u8 =
+                node.bytes(doc, child_node.data_off, child_node.data_len);
+                for step: u64 in 0..len(text) {
+                    vec.push(out, text[step]);
+                }
+            }
+            child = child_node.next_sibling;
+        }
+        vec.push(out, 10 as u8);
+    }
+    let child: u64 = n.first_child;
+    while child != node.none() {
+        gather_style_text(doc, out, child);
+        let child_node: DomNode = node.get(doc, child);
+        child = child_node.next_sibling;
+    }
+}
+
 fn main() -> int {
     let raw: Vec<u8> = read_stdin();
     // Raw document bytes, so the byte stream decoder runs first.
@@ -152,6 +186,34 @@ fn main() -> int {
     vec.push(&out, 0 as u8);
     print_raw(out.data);
     vec.clear(&out);
+
+    let style_text: Vec<u8> = vec.new<u8>();
+    gather_style_text(&doc, &style_text, 0);
+    if style_text.length > 0 {
+        out_str(&out, "-- stylesheet --");
+        out_line(&out);
+        let css_normalized: Vec<u8> =
+        css_preprocess.normalize(style_text.data as *const u8, style_text.length);
+        let css_sink: CssTokenSink = css_tokens.new_sink();
+        let css_t: CssTokenizer =
+        css_tokenizer.new(css_normalized.data as *const u8, css_normalized.length);
+        css_tokenizer.run(&css_t, &css_sink);
+        let sheet: CssStylesheet = stylesheet.new_stylesheet();
+        css_parser.parse_stylesheet(&sheet, &css_sink);
+        let css_text: Vec<u8> = css_serialize.stylesheet_text(&sheet, &css_sink);
+        for index: u64 in 0..css_text.length {
+            vec.push(&out, css_text.data[index]);
+        }
+        vec.push(&out, 0 as u8);
+        print_raw(out.data);
+        vec.clear(&out);
+        vec.destroy(&css_text);
+        stylesheet.destroy(&sheet);
+        css_tokens.destroy(&css_sink);
+        vec.destroy(&css_normalized);
+    }
+    vec.destroy(&style_text);
+
     let errors: u64 = tokens.error_count(&sink);
     if errors > 0 {
         out_str(&out, "-- parse errors --");

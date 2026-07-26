@@ -1,0 +1,276 @@
+// Spec-behavior tests for the CSS tokenizer (CSS Syntax Level 3 §4).
+
+import std.vec;
+import std.string;
+import engine.css.preprocess;
+import engine.css.tokenizer;
+import engine.css.tokens;
+
+fn tokenize(source: *u8, sink: *CssTokenSink) -> void {
+    let normalized: Vec<u8> =
+    preprocess.normalize(source as *const u8, str_len(source));
+    let t: CssTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.run(&t, sink);
+}
+
+fn kind_at(sink: *CssTokenSink, index: u64) -> u8 {
+    return tokens.get_token(sink, index).kind;
+}
+
+fn value_is(sink: *CssTokenSink, index: u64, expected: *u8) -> bool {
+    let token: CssToken = tokens.get_token(sink, index);
+    let want: u64 = str_len(expected);
+    if token.value_len != want {
+        return false;
+    }
+    let got: []const u8 = tokens.token_value(sink, token);
+    for i: u64 in 0..want {
+        if got[i] != expected[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn has_error(sink: *CssTokenSink, code: u32) -> bool {
+    for index: u64 in 0..tokens.error_count(sink) {
+        if tokens.get_error(sink, index).code == code {
+            return true;
+        }
+    }
+    return false;
+}
+
+test "identifier" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("color", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_ident());
+    assert(value_is(&sink, 0, "color"));
+    assert(kind_at(&sink, 1) == tokens.kind_eof());
+}
+
+test "a simple declaration tokenizes into its parts" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("color:red;", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_ident());
+    assert(kind_at(&sink, 1) == tokens.kind_colon());
+    assert(kind_at(&sink, 2) == tokens.kind_ident());
+    assert(value_is(&sink, 2, "red"));
+    assert(kind_at(&sink, 3) == tokens.kind_semicolon());
+}
+
+test "whitespace runs collapse into one token" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("a   \n  b", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_ident());
+    assert(kind_at(&sink, 1) == tokens.kind_whitespace());
+    assert(kind_at(&sink, 2) == tokens.kind_ident());
+    assert(kind_at(&sink, 3) == tokens.kind_eof());
+}
+
+test "comments are skipped entirely" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("a/* note */b", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_ident());
+    assert(value_is(&sink, 0, "a"));
+    assert(kind_at(&sink, 1) == tokens.kind_ident());
+    assert(value_is(&sink, 1, "b"));
+}
+
+test "unterminated comment is a parse error" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("a/* oops", &sink);
+    assert(has_error(&sink, tokens.err_unterminated_comment()));
+}
+
+test "integers and numbers keep their type flag" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("10 2.5", &sink);
+    let first: CssToken = tokens.get_token(&sink, 0);
+    assert(first.kind == tokens.kind_number());
+    assert(first.is_integer);
+    assert(first.number > 9.9 && first.number < 10.1);
+    let second: CssToken = tokens.get_token(&sink, 2);
+    assert(second.kind == tokens.kind_number());
+    assert(!second.is_integer);
+    assert(second.number > 2.49 && second.number < 2.51);
+}
+
+test "dimensions carry a unit" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("16px", &sink);
+    let token: CssToken = tokens.get_token(&sink, 0);
+    assert(token.kind == tokens.kind_dimension());
+    assert(token.number > 15.9 && token.number < 16.1);
+    assert(value_is(&sink, 0, "px"));
+}
+
+test "percentages" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("50%", &sink);
+    let token: CssToken = tokens.get_token(&sink, 0);
+    assert(token.kind == tokens.kind_percentage());
+    assert(token.number > 49.9 && token.number < 50.1);
+}
+
+test "signed and exponent numbers" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("-3 +4 1e2", &sink);
+    let negative: CssToken = tokens.get_token(&sink, 0);
+    assert(negative.number < -2.9 && negative.number > -3.1);
+    let positive: CssToken = tokens.get_token(&sink, 2);
+    assert(positive.number > 3.9 && positive.number < 4.1);
+    let exponent: CssToken = tokens.get_token(&sink, 4);
+    assert(exponent.number > 99.9 && exponent.number < 100.1);
+}
+
+test "hash tokens record whether they are valid ids" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("#main #1x", &sink);
+    let first: CssToken = tokens.get_token(&sink, 0);
+    assert(first.kind == tokens.kind_hash());
+    assert(first.hash_type == tokens.hash_id());
+    assert(value_is(&sink, 0, "main"));
+    let second: CssToken = tokens.get_token(&sink, 2);
+    assert(second.kind == tokens.kind_hash());
+    assert(second.hash_type == tokens.hash_unrestricted());
+}
+
+test "strings in both quote styles" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("\"a b\" 'c'", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_string());
+    assert(value_is(&sink, 0, "a b"));
+    assert(kind_at(&sink, 2) == tokens.kind_string());
+    assert(value_is(&sink, 2, "c"));
+}
+
+test "a newline inside a string makes it a bad-string" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("\"oops\nx", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_bad_string());
+    assert(has_error(&sink, tokens.err_newline_in_string()));
+}
+
+test "unterminated string is a parse error" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("\"abc", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_string());
+    assert(value_is(&sink, 0, "abc"));
+    assert(has_error(&sink, tokens.err_unterminated_string()));
+}
+
+test "hex escapes decode to code points" {
+    let sink: CssTokenSink = tokens.new_sink();
+    // \41 is "A"; the trailing space is the escape terminator, not content.
+    tokenize("\\41 bc", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_ident());
+    assert(value_is(&sink, 0, "Abc"));
+}
+
+test "escaped non-hex character is literal" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("a\\:b", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_ident());
+    assert(value_is(&sink, 0, "a:b"));
+}
+
+test "functions" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("rgb(1,2,3)", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_function());
+    assert(value_is(&sink, 0, "rgb"));
+    assert(kind_at(&sink, 1) == tokens.kind_number());
+    assert(kind_at(&sink, 2) == tokens.kind_comma());
+    assert(kind_at(&sink, 6) == tokens.kind_close_paren());
+}
+
+test "unquoted url is a url token" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("url( a/b.png )", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_url());
+    assert(value_is(&sink, 0, "a/b.png"));
+}
+
+test "quoted url is an ordinary function token" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("url(\"x.png\")", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_function());
+    assert(value_is(&sink, 0, "url"));
+    assert(kind_at(&sink, 1) == tokens.kind_string());
+    assert(value_is(&sink, 1, "x.png"));
+}
+
+test "url containing a quote is a bad-url" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("url(a'b)", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_bad_url());
+    assert(has_error(&sink, tokens.err_bad_url()));
+}
+
+test "at-keywords" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("@media screen", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_at_keyword());
+    assert(value_is(&sink, 0, "media"));
+}
+
+test "cdo and cdc" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("<!-- -->", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_cdo());
+    assert(kind_at(&sink, 2) == tokens.kind_cdc());
+}
+
+test "custom property names keep their leading dashes" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("--brand-color", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_ident());
+    assert(value_is(&sink, 0, "--brand-color"));
+}
+
+test "delimiters that are not part of a larger token" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("a > b", &sink);
+    let token: CssToken = tokens.get_token(&sink, 2);
+    assert(token.kind == tokens.kind_delim());
+    assert(token.delim == ('>' as u32));
+}
+
+test "a rule tokenizes into braces and declarations" {
+    let sink: CssTokenSink = tokens.new_sink();
+    tokenize("p{margin:0}", &sink);
+    assert(kind_at(&sink, 0) == tokens.kind_ident());
+    assert(kind_at(&sink, 1) == tokens.kind_open_curly());
+    assert(kind_at(&sink, 2) == tokens.kind_ident());
+    assert(kind_at(&sink, 3) == tokens.kind_colon());
+    assert(kind_at(&sink, 4) == tokens.kind_number());
+    assert(kind_at(&sink, 5) == tokens.kind_close_curly());
+}
+
+test "carriage returns and form feeds normalize to newlines" {
+    let raw: Vec<u8> = vec.new<u8>();
+    vec.push(&raw, 'a');
+    vec.push(&raw, 13 as u8);
+    vec.push(&raw, 10 as u8);
+    vec.push(&raw, 12 as u8);
+    vec.push(&raw, 'b');
+    let normalized: Vec<u8> = preprocess.normalize(raw.data as *const u8, raw.length);
+    assert(normalized.length == 4);
+    assert(normalized.data[1] == 10 as u8);
+    assert(normalized.data[2] == 10 as u8);
+    vec.destroy(&normalized);
+    vec.destroy(&raw);
+}
+
+test "null bytes become the replacement character" {
+    let raw: Vec<u8> = vec.new<u8>();
+    vec.push(&raw, 'a');
+    vec.push(&raw, 0 as u8);
+    let normalized: Vec<u8> = preprocess.normalize(raw.data as *const u8, raw.length);
+    assert(normalized.length == 4);
+    assert(normalized.data[1] == 0xEF as u8);
+    vec.destroy(&normalized);
+    vec.destroy(&raw);
+}

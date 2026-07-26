@@ -9,12 +9,18 @@ Rigor is the classic engine pipeline, each stage an independent module of the
  bytes ──► preprocess ──► tokenizer ──► tree builder ──► DOM
                 (§13.2.3.5)   (§13.2.5)      (§13.2.6)
  CSS  ──► css tokenizer ──► parser ──► cascade ──► computed style
-                                   (css-syntax-3)   (css-cascade)
+              (§4)          (§5)      (css-cascade)
  DOM + style ──► layout tree ──► paint ──► framebuffer ──► window
 ```
 
-Only the stages up to the tokenizer exist today; the pipeline shape is the
-contract the rest is built into. See ROADMAP.md for sequencing.
+Everything up to and including CSS parsing exists today. The cascade, layout
+and paint do not; the pipeline shape is the contract they get built into. See
+ROADMAP.md for sequencing.
+
+The two preprocessing stages stay separate rather than sharing code, because
+the specs genuinely differ: HTML normalizes newlines but passes U+0000 through
+for the tokenizer to report as a parse error, while CSS folds NUL to U+FFFD
+before the tokenizer ever sees it, and also folds form feeds.
 
 ## Arenas, not object graphs
 
@@ -35,7 +41,15 @@ attributes, parse errors, and one byte pool. The DOM (`DomDocument`) is the
 second: nodes, attributes, and a byte pool, with parents, children and
 siblings as node indices. Index 0 is always the Document, which is never
 anyone's child or sibling — so 0 doubles as the "no node" sentinel and no
-separate null value is needed.
+separate null value is needed. `CssTokenSink` and `CssStylesheet` are the
+third and fourth.
+
+The one place a stage does *not* copy is CSS declaration values: a declaration
+holds a token range into the sink that produced it, rather than a copy. Values
+are parsed lazily and per property, and most declarations lose the cascade, so
+copying every value token up front would be work thrown away. Names are copied,
+which keeps a stylesheet self-contained enough to outlive its sink and to be
+cascaded against sheets from other origins.
 
 String pieces accumulate **append-only at the pool's end**, so a maximal text
 run stays one contiguous span even when character references are decoded into

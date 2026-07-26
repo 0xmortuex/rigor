@@ -30,8 +30,13 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       (tests9–tests12 and tests21, ~120 cases)
 - [ ] `select` insertion modes, `template` contents, fragment parsing
       (`innerHTML`)
-- [ ] CSS tokenizer + parser (css-syntax-3), selectors (selectors-4 subset)
-- [ ] Style cascade: matching, specificity, inheritance, computed values
+- [x] CSS tokenizer (css-syntax-3 §4) and parser (§5): rules, at-rules,
+      declarations, `!important`
+- [x] Selectors (selectors-4): type/universal/class/id/attribute/pseudo,
+      the four combinators, selector lists, specificity
+- [ ] Selector *matching* against the DOM (the parsing half is done)
+- [ ] Style cascade: origin and order, inheritance, computed values
+- [ ] Property value parsing: lengths, colors, keywords, shorthands
 - [ ] Layout: block + inline formatting, box model
 - [ ] Paint: software rasterizer, bitmap font text first
 - [ ] Window: Win32 via `extern fn` FFI (CreateWindowExA + StretchDIBits)

@@ -1,0 +1,400 @@
+// Spec-behavior tests for CSS parsing (Syntax Level 3 §5) and selector
+// parsing (Selectors Level 4).
+
+import std.vec;
+import std.string;
+import engine.css.preprocess;
+import engine.css.tokenizer;
+import engine.css.tokens;
+import engine.css.parser;
+import engine.css.stylesheet;
+
+resource struct ParsedCss {
+    normalized: Vec<u8>,
+    sink: CssTokenSink,
+    sheet: CssStylesheet,
+}
+
+fn parse(source: *u8) -> ParsedCss {
+    let normalized: Vec<u8> =
+    preprocess.normalize(source as *const u8, str_len(source));
+    let sink: CssTokenSink = tokens.new_sink();
+    let t: CssTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.run(&t, &sink);
+    let sheet: CssStylesheet = stylesheet.new_stylesheet();
+    parser.parse_stylesheet(&sheet, &sink);
+    return ParsedCss {
+        normalized: move normalized,
+        sink: move sink,
+        sheet: move sheet,
+    };
+}
+
+fn destroy(parsed: *ParsedCss) -> void {
+    stylesheet.destroy(&(*parsed).sheet);
+    tokens.destroy(&(*parsed).sink);
+    vec.destroy(&(*parsed).normalized);
+}
+
+fn view_is(view: []const u8, expected: *u8) -> bool {
+    let want: u64 = str_len(expected);
+    if len(view) != want {
+        return false;
+    }
+    for index: u64 in 0..want {
+        if view[index] != expected[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn nth_rule(parsed: *ParsedCss, index: u64) -> CssRule {
+    return stylesheet.get_rule(&(*parsed).sheet,
+    stylesheet.top_level_rule(&(*parsed).sheet, index));
+}
+
+fn decl_name_is(parsed: *ParsedCss, rule: CssRule, offset: u64, name: *u8) -> bool {
+    let declaration: CssDeclaration =
+    stylesheet.get_declaration(&(*parsed).sheet, rule.decl_first + offset);
+    return view_is(stylesheet.bytes(&(*parsed).sheet,
+    declaration.name_off, declaration.name_len), name);
+}
+
+// The declaration's value, rendered back from its token range.
+fn decl_value_is(parsed: *ParsedCss, rule: CssRule, offset: u64, expected: *u8) -> bool {
+    let declaration: CssDeclaration =
+    stylesheet.get_declaration(&(*parsed).sheet, rule.decl_first + offset);
+    let out: Vec<u8> = vec.new<u8>();
+    for step: u64 in 0..declaration.value_count {
+        let token: CssToken =
+        tokens.get_token(&(*parsed).sink, declaration.value_first + step);
+        if token.kind == tokens.kind_whitespace() {
+            vec.push(&out, ' ');
+        } else if token.kind == tokens.kind_ident()
+        || token.kind == tokens.kind_dimension() {
+            let value: []const u8 = tokens.token_value(&(*parsed).sink, token);
+            if token.kind == tokens.kind_dimension() {
+                append_number(&out, token.number);
+            }
+            for i: u64 in 0..len(value) {
+                vec.push(&out, value[i]);
+            }
+        } else if token.kind == tokens.kind_number() {
+            append_number(&out, token.number);
+        } else if token.kind == tokens.kind_hash() {
+            vec.push(&out, '#');
+            let value: []const u8 = tokens.token_value(&(*parsed).sink, token);
+            for i: u64 in 0..len(value) {
+                vec.push(&out, value[i]);
+            }
+        } else if token.kind == tokens.kind_comma() {
+            vec.push(&out, ',');
+        }
+    }
+    let ok: bool = view_is(vec.as_const_slice(&out), expected);
+    vec.destroy(&out);
+    return ok;
+}
+
+fn append_number(out: *Vec<u8>, value: f64) -> void {
+    let whole: i64 = value as i64;
+    if whole < 0 {
+        vec.push(out, '-');
+        whole = 0 - whole;
+    }
+    append_u64(out, whole as u64);
+}
+
+fn append_u64(out: *Vec<u8>, value: u64) -> void {
+    if value >= 10 {
+        append_u64(out, value / 10);
+    }
+    vec.push(out, '0' + ((value % 10) as u8));
+}
+
+fn first_simple(parsed: *ParsedCss, rule: CssRule) -> CssSimpleSelector {
+    let selector: CssSelector =
+    stylesheet.get_selector(&(*parsed).sheet, rule.selector_first);
+    let compound: CssCompound =
+    stylesheet.get_compound(&(*parsed).sheet, selector.compound_first);
+    return stylesheet.get_simple(&(*parsed).sheet, compound.simple_first);
+}
+
+test "a single style rule" {
+    let parsed: ParsedCss = parse("p { color: red; }");
+    assert(stylesheet.rule_count(&parsed.sheet) == 1);
+    let rule: CssRule = nth_rule(&parsed, 0);
+    assert(rule.kind == stylesheet.rule_style());
+    assert(rule.selector_count == 1);
+    assert(rule.decl_count == 1);
+    assert(decl_name_is(&parsed, rule, 0, "color"));
+    assert(decl_value_is(&parsed, rule, 0, "red"));
+    destroy(&parsed);
+}
+
+test "several declarations, last one needing no semicolon" {
+    let parsed: ParsedCss = parse("p { margin: 0; padding: 4px }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    assert(rule.decl_count == 2);
+    assert(decl_name_is(&parsed, rule, 0, "margin"));
+    assert(decl_name_is(&parsed, rule, 1, "padding"));
+    assert(decl_value_is(&parsed, rule, 1, "4px"));
+    destroy(&parsed);
+}
+
+test "multi-value declaration keeps its whole value" {
+    let parsed: ParsedCss = parse("p { margin: 1px 2px }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    assert(decl_value_is(&parsed, rule, 0, "1px 2px"));
+    destroy(&parsed);
+}
+
+test "important is stripped from the value and flagged" {
+    let parsed: ParsedCss = parse("p { color: red !important; }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let declaration: CssDeclaration =
+    stylesheet.get_declaration(&parsed.sheet, rule.decl_first);
+    assert(declaration.important);
+    assert(decl_value_is(&parsed, rule, 0, "red"));
+    destroy(&parsed);
+}
+
+test "a declaration with no colon is dropped, the rest survive" {
+    let parsed: ParsedCss = parse("p { oops; color: red; }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    assert(rule.decl_count == 1);
+    assert(decl_name_is(&parsed, rule, 0, "color"));
+    destroy(&parsed);
+}
+
+test "comments between declarations" {
+    let parsed: ParsedCss = parse("p { /* c */ color: red; /* d */ }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    assert(rule.decl_count == 1);
+    destroy(&parsed);
+}
+
+test "several rules" {
+    let parsed: ParsedCss = parse("a { color: red } b { color: blue }");
+    assert(stylesheet.rule_count(&parsed.sheet) == 2);
+    destroy(&parsed);
+}
+
+test "selector list" {
+    let parsed: ParsedCss = parse("h1, h2 , h3 { margin: 0 }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    assert(rule.selector_count == 3);
+    destroy(&parsed);
+}
+
+test "type selector specificity is 0,0,1" {
+    let parsed: ParsedCss = parse("p { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let selector: CssSelector =
+    stylesheet.get_selector(&parsed.sheet, rule.selector_first);
+    assert(selector.valid);
+    assert(stylesheet.specificity_ids(selector.specificity) == 0 as u32);
+    assert(stylesheet.specificity_classes(selector.specificity) == 0 as u32);
+    assert(stylesheet.specificity_types(selector.specificity) == 1 as u32);
+    destroy(&parsed);
+}
+
+test "id, class and type specificity" {
+    let parsed: ParsedCss = parse("#a .b p { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let selector: CssSelector =
+    stylesheet.get_selector(&parsed.sheet, rule.selector_first);
+    assert(stylesheet.specificity_ids(selector.specificity) == 1 as u32);
+    assert(stylesheet.specificity_classes(selector.specificity) == 1 as u32);
+    assert(stylesheet.specificity_types(selector.specificity) == 1 as u32);
+    assert(selector.compound_count == 3);
+    destroy(&parsed);
+}
+
+test "class selector" {
+    let parsed: ParsedCss = parse(".intro { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let simple: CssSimpleSelector = first_simple(&parsed, rule);
+    assert(simple.kind == stylesheet.simple_class());
+    assert(view_is(stylesheet.bytes(&parsed.sheet, simple.name_off, simple.name_len),
+    "intro"));
+    destroy(&parsed);
+}
+
+test "id selector" {
+    let parsed: ParsedCss = parse("#main { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let simple: CssSimpleSelector = first_simple(&parsed, rule);
+    assert(simple.kind == stylesheet.simple_id());
+    assert(view_is(stylesheet.bytes(&parsed.sheet, simple.name_off, simple.name_len),
+    "main"));
+    destroy(&parsed);
+}
+
+test "universal selector" {
+    let parsed: ParsedCss = parse("* { margin: 0 }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let simple: CssSimpleSelector = first_simple(&parsed, rule);
+    assert(simple.kind == stylesheet.simple_universal());
+    destroy(&parsed);
+}
+
+test "compound selector combines simple selectors" {
+    let parsed: ParsedCss = parse("p.intro#main { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let selector: CssSelector =
+    stylesheet.get_selector(&parsed.sheet, rule.selector_first);
+    assert(selector.compound_count == 1);
+    let compound: CssCompound =
+    stylesheet.get_compound(&parsed.sheet, selector.compound_first);
+    assert(compound.simple_count == 3);
+    destroy(&parsed);
+}
+
+test "combinators are recorded on the following compound" {
+    let parsed: ParsedCss = parse("div > p + span ~ a { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let selector: CssSelector =
+    stylesheet.get_selector(&parsed.sheet, rule.selector_first);
+    assert(selector.compound_count == 4);
+    let second: CssCompound =
+    stylesheet.get_compound(&parsed.sheet, selector.compound_first + 1);
+    assert(second.combinator == stylesheet.combinator_child());
+    let third: CssCompound =
+    stylesheet.get_compound(&parsed.sheet, selector.compound_first + 2);
+    assert(third.combinator == stylesheet.combinator_next_sibling());
+    let fourth: CssCompound =
+    stylesheet.get_compound(&parsed.sheet, selector.compound_first + 3);
+    assert(fourth.combinator == stylesheet.combinator_subsequent_sibling());
+    destroy(&parsed);
+}
+
+test "descendant combinator comes from whitespace" {
+    let parsed: ParsedCss = parse("div p { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let selector: CssSelector =
+    stylesheet.get_selector(&parsed.sheet, rule.selector_first);
+    assert(selector.compound_count == 2);
+    let second: CssCompound =
+    stylesheet.get_compound(&parsed.sheet, selector.compound_first + 1);
+    assert(second.combinator == stylesheet.combinator_descendant());
+    destroy(&parsed);
+}
+
+test "attribute selector with a matcher" {
+    let parsed: ParsedCss = parse("a[href^=\"https\"] { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let selector: CssSelector =
+    stylesheet.get_selector(&parsed.sheet, rule.selector_first);
+    let compound: CssCompound =
+    stylesheet.get_compound(&parsed.sheet, selector.compound_first);
+    assert(compound.simple_count == 2);
+    let attribute: CssSimpleSelector =
+    stylesheet.get_simple(&parsed.sheet, compound.simple_first + 1);
+    assert(attribute.kind == stylesheet.simple_attribute());
+    assert(attribute.matcher == stylesheet.match_prefix());
+    assert(view_is(
+    stylesheet.bytes(&parsed.sheet, attribute.name_off, attribute.name_len),
+    "href"));
+    assert(view_is(
+    stylesheet.bytes(&parsed.sheet, attribute.value_off, attribute.value_len),
+    "https"));
+    destroy(&parsed);
+}
+
+test "bare attribute selector" {
+    let parsed: ParsedCss = parse("[disabled] { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let simple: CssSimpleSelector = first_simple(&parsed, rule);
+    assert(simple.kind == stylesheet.simple_attribute());
+    assert(simple.matcher == stylesheet.match_exists());
+    destroy(&parsed);
+}
+
+test "attribute selector case-insensitivity flag" {
+    let parsed: ParsedCss = parse("[type=text i] { color: red }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    let simple: CssSimpleSelector = first_simple(&parsed, rule);
+    assert(simple.case_insensitive);
+    destroy(&parsed);
+}
+
+test "pseudo-class and pseudo-element" {
+    let parsed: ParsedCss = parse("a:hover { color: red } p::before { color: blue }");
+    let hover: CssRule = nth_rule(&parsed, 0);
+    let hover_selector: CssSelector =
+    stylesheet.get_selector(&parsed.sheet, hover.selector_first);
+    let hover_compound: CssCompound =
+    stylesheet.get_compound(&parsed.sheet, hover_selector.compound_first);
+    let hover_simple: CssSimpleSelector =
+    stylesheet.get_simple(&parsed.sheet, hover_compound.simple_first + 1);
+    assert(hover_simple.kind == stylesheet.simple_pseudo_class());
+    assert(stylesheet.specificity_classes(hover_selector.specificity) == 1 as u32);
+
+    let before: CssRule = nth_rule(&parsed, 1);
+    let before_selector: CssSelector =
+    stylesheet.get_selector(&parsed.sheet, before.selector_first);
+    let before_compound: CssCompound =
+    stylesheet.get_compound(&parsed.sheet, before_selector.compound_first);
+    let before_simple: CssSimpleSelector =
+    stylesheet.get_simple(&parsed.sheet, before_compound.simple_first + 1);
+    assert(before_simple.kind == stylesheet.simple_pseudo_element());
+    assert(stylesheet.specificity_types(before_selector.specificity) == 2 as u32);
+    destroy(&parsed);
+}
+
+test "at-rule with a semicolon" {
+    let parsed: ParsedCss = parse("@import \"a.css\"; p { color: red }");
+    assert(stylesheet.rule_count(&parsed.sheet) == 2);
+    let at: CssRule = nth_rule(&parsed, 0);
+    assert(at.kind == stylesheet.rule_at());
+    assert(view_is(stylesheet.bytes(&parsed.sheet, at.name_off, at.name_len),
+    "import"));
+    assert(!at.has_block);
+    destroy(&parsed);
+}
+
+test "media at-rule keeps its nested rules" {
+    let parsed: ParsedCss = parse("@media screen { p { color: red } a { color: blue } }");
+    assert(stylesheet.rule_count(&parsed.sheet) == 1);
+    let at: CssRule = nth_rule(&parsed, 0);
+    assert(at.kind == stylesheet.rule_at());
+    assert(at.has_block);
+    assert(at.child_count == 2);
+    let child: CssRule = stylesheet.get_rule(&parsed.sheet, at.child_first);
+    assert(child.kind == stylesheet.rule_style());
+    assert(child.decl_count == 1);
+    destroy(&parsed);
+}
+
+test "unknown at-rule with a block does not eat the following rule" {
+    let parsed: ParsedCss = parse("@font-face { src: x } p { color: red }");
+    assert(stylesheet.rule_count(&parsed.sheet) == 2);
+    let following: CssRule = nth_rule(&parsed, 1);
+    assert(following.kind == stylesheet.rule_style());
+    assert(following.decl_count == 1);
+    destroy(&parsed);
+}
+
+test "html comment delimiters are ignored at the top level" {
+    let parsed: ParsedCss = parse("<!-- p { color: red } -->");
+    assert(stylesheet.rule_count(&parsed.sheet) == 1);
+    destroy(&parsed);
+}
+
+test "a rule with no block at end of input is dropped" {
+    let parsed: ParsedCss = parse("p { color: red } a, b");
+    assert(stylesheet.rule_count(&parsed.sheet) == 1);
+    destroy(&parsed);
+}
+
+test "declaration values may contain functions and parentheses" {
+    let parsed: ParsedCss = parse("p { color: rgb(1, 2, 3); margin: 0 }");
+    let rule: CssRule = nth_rule(&parsed, 0);
+    assert(rule.decl_count == 2);
+    assert(decl_name_is(&parsed, rule, 0, "color"));
+    assert(decl_name_is(&parsed, rule, 1, "margin"));
+    destroy(&parsed);
+}

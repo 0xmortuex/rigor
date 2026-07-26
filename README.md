@@ -9,10 +9,10 @@ this project runs on: every algorithm is implemented from the WHATWG/CSSWG
 specification it cites, error recovery included, and progress is measured in
 passing conformance tests, not vibes.
 
-> **Status: pre-alpha.** HTML parses end to end — tokenizer at 100% and tree
-> construction at 81% of the html5lib conformance suites. CSS, layout and
-> paint are roadmap. See [docs/ROADMAP.md](docs/ROADMAP.md) for the honest
-> ledger.
+> **Status: pre-alpha.** HTML parses end to end (tokenizer at 100% and tree
+> construction at 81% of the html5lib conformance suites) and CSS parses into
+> rules, selectors and declarations. The cascade, layout and paint are
+> roadmap. See [docs/ROADMAP.md](docs/ROADMAP.md) for the honest ledger.
 
 ```
 > '<b>1<p>2</b>3</p>' | rigor
@@ -91,7 +91,16 @@ by the tree builder). The harness prints the skip count on every run.
   active formatting elements, and the adoption agency algorithm.
 - **DOM**: a flat-arena tree with elements, text, comments, doctypes and
   attributes, plus a serializer that emits the html5lib tree format.
-- **`rigor` CLI**: pipe HTML in, get the token stream and the parsed tree out.
+- **CSS tokenizer** (Syntax Level 3 §4): every token type, the escape and
+  numeric algorithms, url vs function disambiguation, and bad-string/bad-url
+  recovery.
+- **CSS parser** (§5): stylesheets, style rules, at-rules (with `@media` and
+  friends keeping their nested rules), declarations and `!important`.
+- **Selectors** (Selectors Level 4): type, universal, class, id, attribute
+  (all six matchers plus the `i` flag), pseudo-classes and pseudo-elements,
+  the four combinators, selector lists, and specificity.
+- **`rigor` CLI**: pipe HTML in, get the token stream, the parsed tree, and
+  the parsed stylesheet out.
 
 ```
 > '<!DOCTYPE html><p class="x">Hi &amp; bye</p>' | rigor
@@ -108,6 +117,23 @@ eof
 |     <p>
 |       class="x"
 |       "Hi & bye"
+```
+
+CSS in a `<style>` element is parsed too:
+
+```
+-- stylesheet --
+body
+  margin: 0
+  font-family: "Inter", sans-serif
+#main > p.intro, h1
+  color: #333
+  font-size: 1.5em !important
+a[href^="https"]:hover
+  color: rgb(0, 100, 200)
+@media screen
+  .wide
+    width: 60%
 ```
 
 ## Build
@@ -132,6 +158,7 @@ python tools/gen_tags.py --check
 engine/            the engine library (Mort package `engine`) — embeddable
   src/html/        preprocessing, tokenizer, entities, tag names, tree builder
   src/dom/         the DOM arena and its html5lib-format serializer
+  src/css/         preprocessing, tokenizer, parser, selectors, stylesheet
 src/main.mx        the rigor developer CLI
 tests/             spec-behavior tests (mortc test)
 conformance/       batch driver binary for the html5lib suites

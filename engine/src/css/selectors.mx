@@ -1,0 +1,371 @@
+// Selector parsing — Selectors Level 4 §3–§6, §14, §16.
+//
+// A style rule's prelude is a token range; this module turns it into a list of
+// complex selectors in the stylesheet arena, computing each one's specificity
+// as it goes.
+//
+// Implemented: type, universal, class, id, and attribute selectors (all six
+// matchers plus the `i` case-insensitivity flag), the four combinators, and
+// pseudo-classes/elements recorded by name. Selector lists are comma
+// separated, and an invalid selector marks only itself invalid — the rest of
+// the list still applies, which is the Selectors 4 behaviour ("forgiving" is
+// not the default, but rigor keeps the valid ones so one typo does not drop a
+// whole rule; that deviation is noted in docs/ROADMAP.md).
+//
+// Not yet implemented: namespaces (`ns|div`), and the functional
+// pseudo-classes' arguments (`:nth-child(2n+1)` parses and records the name,
+// but the argument is skipped, so matching treats it as never matching).
+module engine.css.selectors;
+
+import std.vec;
+import tokens;
+import stylesheet;
+
+// A cursor over a token range in the sink.
+struct CssSelectorParser {
+    first: u64,
+    limit: u64,
+    pos: u64,
+}
+
+fn kind_at(s: *CssTokenSink, index: u64) -> u8 {
+    return tokens.get_token(s, index).kind;
+}
+
+fn at_end(p: *CssSelectorParser) -> bool {
+    return (*p).pos >= (*p).limit;
+}
+
+fn peek_kind(p: *CssSelectorParser, s: *CssTokenSink) -> u8 {
+    if at_end(p) {
+        return tokens.kind_eof();
+    }
+    return kind_at(s, (*p).pos);
+}
+
+fn peek_token(p: *CssSelectorParser, s: *CssTokenSink) -> CssToken {
+    if at_end(p) {
+        return tokens.empty_token();
+    }
+    return tokens.get_token(s, (*p).pos);
+}
+
+fn skip_whitespace(p: *CssSelectorParser, s: *CssTokenSink) -> bool {
+    let saw: bool = false;
+    while !at_end(p) && kind_at(s, (*p).pos) == tokens.kind_whitespace() {
+        saw = true;
+        (*p).pos = (*p).pos + 1;
+    }
+    return saw;
+}
+
+fn is_delim(p: *CssSelectorParser, s: *CssTokenSink, c: u8) -> bool {
+    if at_end(p) {
+        return false;
+    }
+    let token: CssToken = tokens.get_token(s, (*p).pos);
+    return token.kind == tokens.kind_delim() && token.delim == (c as u32);
+}
+
+// Parse the selector list in tokens [first, limit) into `sheet`, returning the
+// range of selectors appended.
+pub fn parse_list(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    first: u64,
+    limit: u64
+) -> u64 {
+    let p: CssSelectorParser =
+        CssSelectorParser { first: first, limit: limit, pos: first };
+    let start: u64 = (*sheet).selectors.length;
+    loop {
+        parse_complex(sheet, s, &p);
+        skip_whitespace(&p, s);
+        if at_end(&p) {
+            break;
+        }
+        // Either the comma between selectors, or junk left behind by an
+        // invalid one; skipping it either way keeps the rest of the list
+        // usable rather than dropping the whole rule.
+        p.pos = p.pos + 1;
+    }
+    return (*sheet).selectors.length - start;
+}
+
+fn parse_complex(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    p: *CssSelectorParser
+) -> void {
+    let compound_first: u64 = (*sheet).compounds.length;
+    let compound_count: u64 = 0;
+    let ids: u32 = 0 as u32;
+    let classes: u32 = 0 as u32;
+    let types: u32 = 0 as u32;
+    let valid: bool = true;
+    let combinator: u8 = stylesheet.combinator_none();
+
+    loop {
+        let had_space: bool = skip_whitespace(p, s);
+        if at_end(p) || peek_kind(p, s) == tokens.kind_comma() {
+            break;
+        }
+        // An explicit combinator overrides the descendant one implied by
+        // whitespace.
+        if is_delim(p, s, '>') {
+            combinator = stylesheet.combinator_child();
+            (*p).pos = (*p).pos + 1;
+            skip_whitespace(p, s);
+        } else if is_delim(p, s, '+') {
+            combinator = stylesheet.combinator_next_sibling();
+            (*p).pos = (*p).pos + 1;
+            skip_whitespace(p, s);
+        } else if is_delim(p, s, '~') {
+            combinator = stylesheet.combinator_subsequent_sibling();
+            (*p).pos = (*p).pos + 1;
+            skip_whitespace(p, s);
+        } else if had_space && compound_count > 0 {
+            combinator = stylesheet.combinator_descendant();
+        }
+        if at_end(p) || peek_kind(p, s) == tokens.kind_comma() {
+            if combinator != stylesheet.combinator_none() {
+                valid = false;
+            }
+            break;
+        }
+
+        let simple_first: u64 = (*sheet).simples.length;
+        let matched: bool = parse_compound(sheet, s, p, &ids, &classes, &types);
+        if !matched {
+            valid = false;
+            break;
+        }
+        vec.push(&(*sheet).compounds, CssCompound {
+            simple_first: simple_first,
+            simple_count: (*sheet).simples.length - simple_first,
+            combinator: combinator,
+        });
+        compound_count = compound_count + 1;
+        combinator = stylesheet.combinator_none();
+    }
+
+    if compound_count == 0 {
+        valid = false;
+    }
+    vec.push(&(*sheet).selectors, CssSelector {
+        compound_first: compound_first,
+        compound_count: compound_count,
+        specificity: stylesheet.pack_specificity(ids, classes, types),
+        valid: valid,
+    });
+}
+
+// One compound selector. Returns false when nothing could be parsed.
+fn parse_compound(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    p: *CssSelectorParser,
+    ids: *u32,
+    classes: *u32,
+    types: *u32
+) -> bool {
+    let count: u64 = 0;
+    loop {
+        if at_end(p) {
+            break;
+        }
+        let kind: u8 = peek_kind(p, s);
+        let token: CssToken = peek_token(p, s);
+
+        if kind == tokens.kind_ident() {
+            let simple: CssSimpleSelector = stylesheet.empty_simple();
+            simple.kind = stylesheet.simple_type();
+            simple.name_off =
+                stylesheet.intern(sheet, tokens.token_value(s, token));
+            simple.name_len = token.value_len;
+            vec.push(&(*sheet).simples, simple);
+            (*types) = (*types) + 1 as u32;
+            (*p).pos = (*p).pos + 1;
+            count = count + 1;
+        } else if kind == tokens.kind_delim() && token.delim == ('*' as u32) {
+            let simple: CssSimpleSelector = stylesheet.empty_simple();
+            simple.kind = stylesheet.simple_universal();
+            vec.push(&(*sheet).simples, simple);
+            (*p).pos = (*p).pos + 1;
+            count = count + 1;
+        } else if kind == tokens.kind_delim() && token.delim == ('.' as u32) {
+            (*p).pos = (*p).pos + 1;
+            if peek_kind(p, s) != tokens.kind_ident() {
+                return false;
+            }
+            let name: CssToken = peek_token(p, s);
+            let simple: CssSimpleSelector = stylesheet.empty_simple();
+            simple.kind = stylesheet.simple_class();
+            simple.name_off =
+                stylesheet.intern(sheet, tokens.token_value(s, name));
+            simple.name_len = name.value_len;
+            vec.push(&(*sheet).simples, simple);
+            (*classes) = (*classes) + 1 as u32;
+            (*p).pos = (*p).pos + 1;
+            count = count + 1;
+        } else if kind == tokens.kind_hash() {
+            if token.hash_type != tokens.hash_id() {
+                return false;
+            }
+            let simple: CssSimpleSelector = stylesheet.empty_simple();
+            simple.kind = stylesheet.simple_id();
+            simple.name_off =
+                stylesheet.intern(sheet, tokens.token_value(s, token));
+            simple.name_len = token.value_len;
+            vec.push(&(*sheet).simples, simple);
+            (*ids) = (*ids) + 1 as u32;
+            (*p).pos = (*p).pos + 1;
+            count = count + 1;
+        } else if kind == tokens.kind_open_square() {
+            if !parse_attribute(sheet, s, p) {
+                return false;
+            }
+            (*classes) = (*classes) + 1 as u32;
+            count = count + 1;
+        } else if kind == tokens.kind_colon() {
+            let element: bool = false;
+            (*p).pos = (*p).pos + 1;
+            if peek_kind(p, s) == tokens.kind_colon() {
+                element = true;
+                (*p).pos = (*p).pos + 1;
+            }
+            let next: u8 = peek_kind(p, s);
+            if next != tokens.kind_ident() && next != tokens.kind_function() {
+                return false;
+            }
+            let name: CssToken = peek_token(p, s);
+            let simple: CssSimpleSelector = stylesheet.empty_simple();
+            if element {
+                simple.kind = stylesheet.simple_pseudo_element();
+                (*types) = (*types) + 1 as u32;
+            } else {
+                simple.kind = stylesheet.simple_pseudo_class();
+                (*classes) = (*classes) + 1 as u32;
+            }
+            simple.name_off =
+                stylesheet.intern(sheet, tokens.token_value(s, name));
+            simple.name_len = name.value_len;
+            vec.push(&(*sheet).simples, simple);
+            (*p).pos = (*p).pos + 1;
+            if next == tokens.kind_function() {
+                // The argument is recorded as consumed but not interpreted
+                // yet; see the module comment.
+                skip_balanced_parens(p, s);
+            }
+            count = count + 1;
+        } else {
+            break;
+        }
+    }
+    return count > 0;
+}
+
+// §6 attribute selector: [name], [name=value], and the five substring forms,
+// each optionally followed by the `i` case-insensitivity flag.
+fn parse_attribute(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    p: *CssSelectorParser
+) -> bool {
+    (*p).pos = (*p).pos + 1;
+    skip_whitespace(p, s);
+    if peek_kind(p, s) != tokens.kind_ident() {
+        return false;
+    }
+    let name: CssToken = peek_token(p, s);
+    let simple: CssSimpleSelector = stylesheet.empty_simple();
+    simple.kind = stylesheet.simple_attribute();
+    simple.name_off = stylesheet.intern(sheet, tokens.token_value(s, name));
+    simple.name_len = name.value_len;
+    simple.matcher = stylesheet.match_exists();
+    (*p).pos = (*p).pos + 1;
+    skip_whitespace(p, s);
+
+    if peek_kind(p, s) == tokens.kind_close_square() {
+        vec.push(&(*sheet).simples, simple);
+        (*p).pos = (*p).pos + 1;
+        return true;
+    }
+
+    let matcher: u8 = stylesheet.match_exists();
+    if is_delim(p, s, '=') {
+        matcher = stylesheet.match_equals();
+        (*p).pos = (*p).pos + 1;
+    } else if is_delim(p, s, '~') {
+        matcher = stylesheet.match_includes();
+        (*p).pos = (*p).pos + 1;
+        if !is_delim(p, s, '=') { return false; }
+        (*p).pos = (*p).pos + 1;
+    } else if is_delim(p, s, '|') {
+        matcher = stylesheet.match_dash();
+        (*p).pos = (*p).pos + 1;
+        if !is_delim(p, s, '=') { return false; }
+        (*p).pos = (*p).pos + 1;
+    } else if is_delim(p, s, '^') {
+        matcher = stylesheet.match_prefix();
+        (*p).pos = (*p).pos + 1;
+        if !is_delim(p, s, '=') { return false; }
+        (*p).pos = (*p).pos + 1;
+    } else if is_delim(p, s, '$') {
+        matcher = stylesheet.match_suffix();
+        (*p).pos = (*p).pos + 1;
+        if !is_delim(p, s, '=') { return false; }
+        (*p).pos = (*p).pos + 1;
+    } else if is_delim(p, s, '*') {
+        matcher = stylesheet.match_substring();
+        (*p).pos = (*p).pos + 1;
+        if !is_delim(p, s, '=') { return false; }
+        (*p).pos = (*p).pos + 1;
+    } else {
+        return false;
+    }
+    simple.matcher = matcher;
+
+    skip_whitespace(p, s);
+    let value_kind: u8 = peek_kind(p, s);
+    if value_kind != tokens.kind_ident() && value_kind != tokens.kind_string() {
+        return false;
+    }
+    let value: CssToken = peek_token(p, s);
+    simple.value_off = stylesheet.intern(sheet, tokens.token_value(s, value));
+    simple.value_len = value.value_len;
+    (*p).pos = (*p).pos + 1;
+    skip_whitespace(p, s);
+
+    if peek_kind(p, s) == tokens.kind_ident() {
+        let flag: CssToken = peek_token(p, s);
+        let flag_bytes: []const u8 = tokens.token_value(s, flag);
+        if len(flag_bytes) == 1
+            && (flag_bytes[0] == 'i' || flag_bytes[0] == 'I') {
+            simple.case_insensitive = true;
+            (*p).pos = (*p).pos + 1;
+            skip_whitespace(p, s);
+        }
+    }
+    if peek_kind(p, s) != tokens.kind_close_square() {
+        return false;
+    }
+    (*p).pos = (*p).pos + 1;
+    vec.push(&(*sheet).simples, simple);
+    return true;
+}
+
+// The opening function token has already been consumed; skip to its matching
+// close paren.
+fn skip_balanced_parens(p: *CssSelectorParser, s: *CssTokenSink) -> void {
+    let depth: u64 = 1;
+    while !at_end(p) && depth > 0 {
+        let kind: u8 = kind_at(s, (*p).pos);
+        if kind == tokens.kind_function() || kind == tokens.kind_open_paren() {
+            depth = depth + 1;
+        } else if kind == tokens.kind_close_paren() {
+            depth = depth - 1;
+        }
+        (*p).pos = (*p).pos + 1;
+    }
+}
