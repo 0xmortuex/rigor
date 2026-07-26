@@ -19,6 +19,9 @@ import std.json;
 import engine.html.preprocess;
 import engine.html.tokenizer;
 import engine.html.tokens;
+import engine.html.treebuilder;
+import engine.dom.node;
+import engine.dom.serialize;
 
 extern fn getchar() -> c_int;
 extern fn putchar(character: c_int) -> c_int;
@@ -301,6 +304,34 @@ fn run_case(doc: *Document, case_index: u64) -> void {
     vec.destroy(&normalized);
 }
 
+// Tree-construction mode: parse the case's input into a DOM and emit the
+// html5lib tree serialization as a single JSON string, so the Python driver
+// can compare it line for line against the .dat file's #document section.
+fn run_tree_case(doc: *Document, case_index: u64) -> void {
+    let source: []const u8 = slice(0 as *const u8, 0);
+    match json.object_get(doc, case_index, "input") {
+        Option<u64>.Some(entry) => { source = json.as_string(doc, entry); },
+        Option<u64>.None => {},
+    }
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let normalized: Vec<u8> =
+        preprocess.normalize(slice_ptr(source), len(source), &sink);
+    let tree: DomDocument = node.new_document();
+    treebuilder.parse(
+        normalized.data as *const u8, normalized.length, &tree, &sink);
+    let text: Vec<u8> = serialize.document(&tree);
+
+    put("{\"tree\":");
+    put_json_string(vec.as_const_slice(&text));
+    put("}");
+    put_byte(10 as u8);
+
+    vec.destroy(&text);
+    node.destroy(&tree);
+    tokens.destroy(&sink);
+    vec.destroy(&normalized);
+}
+
 fn main() -> int {
     let raw: Vec<u8> = read_stdin();
     let doc: Document = json.parse(raw.data as *const u8, raw.length);
@@ -310,6 +341,33 @@ fn main() -> int {
         return 1;
     }
     let root: u64 = json.root(&doc);
+    let tree_mode: bool = false;
+    match json.object_get(&doc, root, "mode") {
+        Option<u64>.Some(entry) => {
+            let mode: []const u8 = json.as_string(&doc, entry);
+            tree_mode = len(mode) > 0 && mode[0] == 't';
+        },
+        Option<u64>.None => {},
+    }
+    if tree_mode {
+        match json.object_get(&doc, root, "cases") {
+            Option<u64>.Some(cases) => {
+                let total: u64 = json.array_len(&doc, cases);
+                for index: u64 in 0..total {
+                    match json.array_get(&doc, cases, index) {
+                        Option<u64>.Some(entry) => { run_tree_case(&doc, entry); },
+                        Option<u64>.None => {},
+                    }
+                }
+            },
+            Option<u64>.None => {
+                put("{\"fatal\":\"job json has no cases array\"}");
+                put_byte(10 as u8);
+                return 1;
+            },
+        }
+        return 0;
+    }
     match json.object_get(&doc, root, "cases") {
         Option<u64>.Some(cases) => {
             let total: u64 = json.array_len(&doc, cases);

@@ -1,0 +1,263 @@
+// Interned HTML tag names.
+//
+// GENERATED FILE — do not edit by hand.
+// Regenerate with: python tools/gen_tags.py
+//
+// Tree construction (§13.2.6) compares tag names on nearly every token and
+// tests membership in long spec lists, so names are interned to small integer
+// ids here. Id 0 is TAG_UNKNOWN — an element the spec never names by hand,
+// which the parser treats as an ordinary element.
+//
+// Lookup mirrors the entity table: names are stored concatenated in sorted
+// order, with a per-first-byte bucket and a binary search inside it.
+module engine.html.tagnames;
+
+const TAG_COUNT: u64 = 136;
+pub fn tag_unknown() -> u32 { return 0 as u32; }
+pub fn longest_tag_name() -> u64 { return 10; }
+
+let TAG_NAMES: *u8 = "aabbraddressappletareaarticleasideaudiobbasebasefontbdibdobgsoundbigblockquotebodybrbuttoncanvascaptioncentercitecodecolcolgroupdatadatalistdddeldetailsdfndialogdirdivdldtemembedfieldsetfigcaptionfigurefontfooterformframeframeseth1h2h3h4h5h6headheaderhgrouphrhtmliiframeimageimginputinskbdkeygenlabellegendlilinklistingmainmapmarkmarqueemathmenumetanavnobrnoembednoframesnoscriptobjectoloptgroupoptionoutputpparampictureplaintextpreprogressqrbrprtrtcrubyssampscriptsearchsectionselectslotsmallsourcespanstrikestrongstylesubsummarysupsvgtabletbodytdtemplatetextareatfootththeadtimetitletrtrackttuulvarvideowbrxmp";
+
+let TAG_OFF: [u32; 136] = [
+    0, 1, 5, 12, 18, 22, 29, 34, 39, 40, 44, 52, 55, 58, 65, 68,
+    78, 82, 84, 90, 96, 103, 109, 113, 117, 120, 128, 132, 140, 142, 145, 152,
+    155, 161, 164, 167, 169, 171, 173, 178, 186, 196, 202, 206, 212, 216, 221, 229,
+    231, 233, 235, 237, 239, 241, 245, 251, 257, 259, 263, 264, 270, 275, 278, 283,
+    286, 289, 295, 300, 306, 308, 312, 319, 323, 326, 330, 337, 341, 345, 349, 352,
+    356, 363, 371, 379, 385, 387, 395, 401, 407, 408, 413, 420, 429, 432, 440, 441,
+    443, 445, 447, 450, 454, 455, 459, 465, 471, 478, 484, 488, 493, 499, 503, 509,
+    515, 520, 523, 530, 533, 536, 541, 546, 548, 556, 564, 569, 571, 576, 580, 585,
+    587, 592, 594, 595, 597, 600, 605, 608
+];
+
+let TAG_LEN: [u8; 136] = [
+    1, 4, 7, 6, 4, 7, 5, 5, 1, 4, 8, 3, 3, 7, 3, 10, 4, 2, 6, 6, 7, 6, 4, 4, 3, 8, 4, 8, 2, 3, 7, 3,
+    6, 3, 3, 2, 2, 2, 5, 8, 10, 6, 4, 6, 4, 5, 8, 2, 2, 2, 2, 2, 2, 4, 6, 6, 2, 4, 1, 6, 5, 3, 5, 3,
+    3, 6, 5, 6, 2, 4, 7, 4, 3, 4, 7, 4, 4, 4, 3, 4, 7, 8, 8, 6, 2, 8, 6, 6, 1, 5, 7, 9, 3, 8, 1, 2,
+    2, 2, 3, 4, 1, 4, 6, 6, 7, 6, 4, 5, 6, 4, 6, 6, 5, 3, 7, 3, 3, 5, 5, 2, 8, 8, 5, 2, 5, 4, 5, 2,
+    5, 2, 1, 2, 3, 5, 3, 3
+];
+
+let TAG_FIRST_LO: [u32; 128] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 8, 19, 26, 37, 39, 0, 47, 58, 0, 64, 66, 71, 78, 83,
+    88, 94, 95, 100, 117, 130, 132, 134, 135, 0, 0, 0, 0, 0, 0, 0
+];
+
+let TAG_FIRST_HI: [u32; 128] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 8, 19, 26, 37, 39, 47, 0, 58, 64, 0, 66, 71, 78, 83, 88,
+    94, 95, 100, 117, 130, 132, 134, 135, 136, 0, 0, 0, 0, 0, 0, 0
+];
+
+pub fn tag_a() -> u32 { return 1 as u32; }
+pub fn tag_abbr() -> u32 { return 2 as u32; }
+pub fn tag_address() -> u32 { return 3 as u32; }
+pub fn tag_applet() -> u32 { return 4 as u32; }
+pub fn tag_area() -> u32 { return 5 as u32; }
+pub fn tag_article() -> u32 { return 6 as u32; }
+pub fn tag_aside() -> u32 { return 7 as u32; }
+pub fn tag_audio() -> u32 { return 8 as u32; }
+pub fn tag_b() -> u32 { return 9 as u32; }
+pub fn tag_base() -> u32 { return 10 as u32; }
+pub fn tag_basefont() -> u32 { return 11 as u32; }
+pub fn tag_bdi() -> u32 { return 12 as u32; }
+pub fn tag_bdo() -> u32 { return 13 as u32; }
+pub fn tag_bgsound() -> u32 { return 14 as u32; }
+pub fn tag_big() -> u32 { return 15 as u32; }
+pub fn tag_blockquote() -> u32 { return 16 as u32; }
+pub fn tag_body() -> u32 { return 17 as u32; }
+pub fn tag_br() -> u32 { return 18 as u32; }
+pub fn tag_button() -> u32 { return 19 as u32; }
+pub fn tag_canvas() -> u32 { return 20 as u32; }
+pub fn tag_caption() -> u32 { return 21 as u32; }
+pub fn tag_center() -> u32 { return 22 as u32; }
+pub fn tag_cite() -> u32 { return 23 as u32; }
+pub fn tag_code() -> u32 { return 24 as u32; }
+pub fn tag_col() -> u32 { return 25 as u32; }
+pub fn tag_colgroup() -> u32 { return 26 as u32; }
+pub fn tag_data() -> u32 { return 27 as u32; }
+pub fn tag_datalist() -> u32 { return 28 as u32; }
+pub fn tag_dd() -> u32 { return 29 as u32; }
+pub fn tag_del() -> u32 { return 30 as u32; }
+pub fn tag_details() -> u32 { return 31 as u32; }
+pub fn tag_dfn() -> u32 { return 32 as u32; }
+pub fn tag_dialog() -> u32 { return 33 as u32; }
+pub fn tag_dir() -> u32 { return 34 as u32; }
+pub fn tag_div() -> u32 { return 35 as u32; }
+pub fn tag_dl() -> u32 { return 36 as u32; }
+pub fn tag_dt() -> u32 { return 37 as u32; }
+pub fn tag_em() -> u32 { return 38 as u32; }
+pub fn tag_embed() -> u32 { return 39 as u32; }
+pub fn tag_fieldset() -> u32 { return 40 as u32; }
+pub fn tag_figcaption() -> u32 { return 41 as u32; }
+pub fn tag_figure() -> u32 { return 42 as u32; }
+pub fn tag_font() -> u32 { return 43 as u32; }
+pub fn tag_footer() -> u32 { return 44 as u32; }
+pub fn tag_form() -> u32 { return 45 as u32; }
+pub fn tag_frame() -> u32 { return 46 as u32; }
+pub fn tag_frameset() -> u32 { return 47 as u32; }
+pub fn tag_h1() -> u32 { return 48 as u32; }
+pub fn tag_h2() -> u32 { return 49 as u32; }
+pub fn tag_h3() -> u32 { return 50 as u32; }
+pub fn tag_h4() -> u32 { return 51 as u32; }
+pub fn tag_h5() -> u32 { return 52 as u32; }
+pub fn tag_h6() -> u32 { return 53 as u32; }
+pub fn tag_head() -> u32 { return 54 as u32; }
+pub fn tag_header() -> u32 { return 55 as u32; }
+pub fn tag_hgroup() -> u32 { return 56 as u32; }
+pub fn tag_hr() -> u32 { return 57 as u32; }
+pub fn tag_html() -> u32 { return 58 as u32; }
+pub fn tag_i() -> u32 { return 59 as u32; }
+pub fn tag_iframe() -> u32 { return 60 as u32; }
+pub fn tag_image() -> u32 { return 61 as u32; }
+pub fn tag_img() -> u32 { return 62 as u32; }
+pub fn tag_input() -> u32 { return 63 as u32; }
+pub fn tag_ins() -> u32 { return 64 as u32; }
+pub fn tag_kbd() -> u32 { return 65 as u32; }
+pub fn tag_keygen() -> u32 { return 66 as u32; }
+pub fn tag_label() -> u32 { return 67 as u32; }
+pub fn tag_legend() -> u32 { return 68 as u32; }
+pub fn tag_li() -> u32 { return 69 as u32; }
+pub fn tag_link() -> u32 { return 70 as u32; }
+pub fn tag_listing() -> u32 { return 71 as u32; }
+pub fn tag_main() -> u32 { return 72 as u32; }
+pub fn tag_map() -> u32 { return 73 as u32; }
+pub fn tag_mark() -> u32 { return 74 as u32; }
+pub fn tag_marquee() -> u32 { return 75 as u32; }
+pub fn tag_math() -> u32 { return 76 as u32; }
+pub fn tag_menu() -> u32 { return 77 as u32; }
+pub fn tag_meta() -> u32 { return 78 as u32; }
+pub fn tag_nav() -> u32 { return 79 as u32; }
+pub fn tag_nobr() -> u32 { return 80 as u32; }
+pub fn tag_noembed() -> u32 { return 81 as u32; }
+pub fn tag_noframes() -> u32 { return 82 as u32; }
+pub fn tag_noscript() -> u32 { return 83 as u32; }
+pub fn tag_object() -> u32 { return 84 as u32; }
+pub fn tag_ol() -> u32 { return 85 as u32; }
+pub fn tag_optgroup() -> u32 { return 86 as u32; }
+pub fn tag_option() -> u32 { return 87 as u32; }
+pub fn tag_output() -> u32 { return 88 as u32; }
+pub fn tag_p() -> u32 { return 89 as u32; }
+pub fn tag_param() -> u32 { return 90 as u32; }
+pub fn tag_picture() -> u32 { return 91 as u32; }
+pub fn tag_plaintext() -> u32 { return 92 as u32; }
+pub fn tag_pre() -> u32 { return 93 as u32; }
+pub fn tag_progress() -> u32 { return 94 as u32; }
+pub fn tag_q() -> u32 { return 95 as u32; }
+pub fn tag_rb() -> u32 { return 96 as u32; }
+pub fn tag_rp() -> u32 { return 97 as u32; }
+pub fn tag_rt() -> u32 { return 98 as u32; }
+pub fn tag_rtc() -> u32 { return 99 as u32; }
+pub fn tag_ruby() -> u32 { return 100 as u32; }
+pub fn tag_s() -> u32 { return 101 as u32; }
+pub fn tag_samp() -> u32 { return 102 as u32; }
+pub fn tag_script() -> u32 { return 103 as u32; }
+pub fn tag_search() -> u32 { return 104 as u32; }
+pub fn tag_section() -> u32 { return 105 as u32; }
+pub fn tag_select() -> u32 { return 106 as u32; }
+pub fn tag_slot() -> u32 { return 107 as u32; }
+pub fn tag_small() -> u32 { return 108 as u32; }
+pub fn tag_source() -> u32 { return 109 as u32; }
+pub fn tag_span() -> u32 { return 110 as u32; }
+pub fn tag_strike() -> u32 { return 111 as u32; }
+pub fn tag_strong() -> u32 { return 112 as u32; }
+pub fn tag_style() -> u32 { return 113 as u32; }
+pub fn tag_sub() -> u32 { return 114 as u32; }
+pub fn tag_summary() -> u32 { return 115 as u32; }
+pub fn tag_sup() -> u32 { return 116 as u32; }
+pub fn tag_svg() -> u32 { return 117 as u32; }
+pub fn tag_table() -> u32 { return 118 as u32; }
+pub fn tag_tbody() -> u32 { return 119 as u32; }
+pub fn tag_td() -> u32 { return 120 as u32; }
+pub fn tag_template() -> u32 { return 121 as u32; }
+pub fn tag_textarea() -> u32 { return 122 as u32; }
+pub fn tag_tfoot() -> u32 { return 123 as u32; }
+pub fn tag_th() -> u32 { return 124 as u32; }
+pub fn tag_thead() -> u32 { return 125 as u32; }
+pub fn tag_time() -> u32 { return 126 as u32; }
+pub fn tag_title() -> u32 { return 127 as u32; }
+pub fn tag_tr() -> u32 { return 128 as u32; }
+pub fn tag_track() -> u32 { return 129 as u32; }
+pub fn tag_tt() -> u32 { return 130 as u32; }
+pub fn tag_u() -> u32 { return 131 as u32; }
+pub fn tag_ul() -> u32 { return 132 as u32; }
+pub fn tag_var() -> u32 { return 133 as u32; }
+pub fn tag_video() -> u32 { return 134 as u32; }
+pub fn tag_wbr() -> u32 { return 135 as u32; }
+pub fn tag_xmp() -> u32 { return 136 as u32; }
+
+fn compare(index: u64, probe: []const u8) -> i64 {
+    let off: u64 = TAG_OFF[index] as u64;
+    let name_len: u64 = TAG_LEN[index] as u64;
+    let shared: u64 = name_len;
+    if len(probe) < shared {
+        shared = len(probe);
+    }
+    for step: u64 in 0..shared {
+        let a: u8 = TAG_NAMES[off + step];
+        let b: u8 = probe[step];
+        if a < b {
+            return -1;
+        }
+        if a > b {
+            return 1;
+        }
+    }
+    if name_len < len(probe) {
+        return -1;
+    }
+    if name_len > len(probe) {
+        return 1;
+    }
+    return 0;
+}
+
+// Intern an already-lowercased tag name. Returns tag_unknown() when the name
+// is not one the spec names.
+pub fn lookup(probe: []const u8) -> u32 {
+    if len(probe) == 0 || len(probe) > 10 {
+        return 0 as u32;
+    }
+    let first: u8 = probe[0];
+    if first >= 128 as u8 {
+        return 0 as u32;
+    }
+    let low: u64 = TAG_FIRST_LO[first as u64] as u64;
+    let high: u64 = TAG_FIRST_HI[first as u64] as u64;
+    while low < high {
+        let mid: u64 = low + (high - low) / 2;
+        let order: i64 = compare(mid, probe);
+        if order == 0 {
+            return (mid + 1) as u32;
+        }
+        if order < 0 {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return 0 as u32;
+}
+
+// The interned name for an id, as a byte view. An unknown id yields an empty
+// view; callers hold the original bytes for those.
+pub fn name_of(id: u32) -> []const u8 {
+    if id == 0 as u32 || (id as u64) > TAG_COUNT {
+        return slice(TAG_NAMES as *const u8, 0);
+    }
+    let index: u64 = (id as u64) - 1;
+    let base: *const u8 = TAG_NAMES as *const u8;
+    return slice((&base[TAG_OFF[index] as u64]) as *const u8,
+        TAG_LEN[index] as u64);
+}

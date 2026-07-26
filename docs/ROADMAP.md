@@ -19,8 +19,15 @@ HTML + CSS in, pixels in a window out. No JavaScript.
 - [x] html5lib-tests tokenizer conformance harness — **6887/6887 tokens and
       1737/1737 parse-error codes**; 145 cases skipped pending script-data
       and CDATA states
-- [ ] Tree construction → DOM (§13.2.6): insertion modes, open-elements stack,
-      active formatting elements; script-data tokenizer states land here
+- [x] Tree construction → DOM (§13.2.6): document-structure modes, "in body",
+      text modes, frameset modes, scopes, implied end tags, active formatting
+      elements, adoption agency — **848/1304 (65%)** of the html5lib
+      tree-construction suites
+- [ ] Table insertion modes (in table / in table text / in caption / in column
+      group / in table body / in row / in cell) with foster parenting — the
+      single biggest remaining conformance win
+- [ ] Foreign content: SVG and MathML integration points, CDATA sections
+- [ ] `select`, `template` contents, fragment parsing (`innerHTML`)
 - [ ] CSS tokenizer + parser (css-syntax-3), selectors (selectors-4 subset)
 - [ ] Style cascade: matching, specificity, inheritance, computed values
 - [ ] Layout: block + inline formatting, box model

@@ -1,0 +1,166 @@
+// Spec-behavior tests for HTML tree construction (WHATWG HTML §13.2.6).
+//
+// Expected trees use the html5lib serialization that engine.dom.serialize
+// emits, so these read the same way the conformance suites do.
+
+import std.vec;
+import std.string;
+import engine.html.preprocess;
+import engine.html.treebuilder;
+import engine.html.tokens;
+import engine.dom.node;
+import engine.dom.serialize;
+
+fn tree_of(source: *u8) -> Vec<u8> {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let normalized: Vec<u8> =
+    preprocess.normalize(source as *const u8, str_len(source), &sink);
+    let doc: DomDocument = node.new_document();
+    treebuilder.parse(
+    normalized.data as *const u8, normalized.length, &doc, &sink);
+    let text: Vec<u8> = serialize.document(&doc);
+    node.destroy(&doc);
+    tokens.destroy(&sink);
+    vec.destroy(&normalized);
+    return move text;
+}
+
+fn tree_is(source: *u8, expected: *u8) -> bool {
+    let text: Vec<u8> = tree_of(source);
+    let want: u64 = str_len(expected);
+    let ok: bool = text.length == want;
+    if ok {
+        for index: u64 in 0..want {
+            if text.data[index] != expected[index] {
+                ok = false;
+            }
+        }
+    }
+    vec.destroy(&text);
+    return ok;
+}
+
+test "implied html, head and body" {
+    assert(tree_is("hello",
+    "| <html>\n|   <head>\n|   <body>\n|     \"hello\"\n"));
+}
+
+test "doctype is a document child and clears quirks" {
+    assert(tree_is("<!DOCTYPE html><p>x",
+    "| <!DOCTYPE html>\n| <html>\n|   <head>\n|   <body>\n|     <p>\n|       \"x\"\n"));
+}
+
+test "missing doctype sets quirks mode" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let source: *u8 = "<p>x";
+    let normalized: Vec<u8> =
+    preprocess.normalize(source as *const u8, str_len(source), &sink);
+    let doc: DomDocument = node.new_document();
+    treebuilder.parse(
+    normalized.data as *const u8, normalized.length, &doc, &sink);
+    assert(node.is_quirks(&doc));
+    node.destroy(&doc);
+    tokens.destroy(&sink);
+    vec.destroy(&normalized);
+}
+
+test "attributes land on the element, sorted when serialized" {
+    assert(tree_is("<p id=a class=b>",
+    "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       class=\"b\"\n|       id=\"a\"\n"));
+}
+
+test "head metadata goes in head, content opens body" {
+    assert(tree_is("<title>T</title><p>x",
+    "| <html>\n|   <head>\n|     <title>\n|       \"T\"\n|   <body>\n|     <p>\n|       \"x\"\n"));
+}
+
+test "an open p is closed by a following block element" {
+    assert(tree_is("<p>one<p>two",
+    "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       \"one\"\n|     <p>\n|       \"two\"\n"));
+}
+
+test "list items close each other" {
+    assert(tree_is("<ul><li>a<li>b</ul>",
+    "| <html>\n|   <head>\n|   <body>\n|     <ul>\n|       <li>\n|         \"a\"\n|       <li>\n|         \"b\"\n"));
+}
+
+test "unclosed elements are closed at end of file" {
+    assert(tree_is("<div><span>x",
+    "| <html>\n|   <head>\n|   <body>\n|     <div>\n|       <span>\n|         \"x\"\n"));
+}
+
+test "stray end tag for an unopened element is ignored" {
+    assert(tree_is("<p>x</div>y",
+    "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       \"xy\"\n"));
+}
+
+test "adoption agency repairs misnested formatting" {
+    // The canonical case: <b> is reopened inside <p> and the trailing text
+    // stays outside it.
+    assert(tree_is("<b>1<p>2</b>3</p>",
+    "| <html>\n|   <head>\n|   <body>\n|     <b>\n|       \"1\"\n|     <p>\n|       <b>\n|         \"2\"\n|       \"3\"\n"));
+}
+
+test "a block nests inside an open formatting element" {
+    // No end tag crosses the block, so no adoption happens and <div> simply
+    // becomes a child of the still-open <b>.
+    assert(tree_is("<b>1<div>2</div>3</b>",
+    "| <html>\n|   <head>\n|   <body>\n|     <b>\n|       \"1\"\n|       <div>\n|         \"2\"\n|       \"3\"\n"));
+}
+
+test "formatting elements are reconstructed after their block closes" {
+    // </p> pops <b> off the stack but leaves it in the active formatting
+    // list, so the following text reopens it.
+    assert(tree_is("<p><b>1</p>2",
+    "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       <b>\n|         \"1\"\n|     <b>\n|       \"2\"\n"));
+}
+
+test "nested anchors are split by the adoption agency" {
+    assert(tree_is("<a><p></a></p>",
+    "| <html>\n|   <head>\n|   <body>\n|     <a>\n|     <p>\n|       <a>\n"));
+}
+
+test "void elements take no children" {
+    assert(tree_is("<p>a<br>b",
+    "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       \"a\"\n|       <br>\n|       \"b\"\n"));
+}
+
+test "comments are nodes in the tree" {
+    assert(tree_is("<p><!--note--></p>",
+    "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       <!-- note -->\n"));
+}
+
+test "a comment before html is a document child" {
+    assert(tree_is("<!--top--><p>x",
+    "| <!-- top -->\n| <html>\n|   <head>\n|   <body>\n|     <p>\n|       \"x\"\n"));
+}
+
+test "rawtext content is text, not markup" {
+    assert(tree_is("<style>p{}</style><p>x",
+    "| <html>\n|   <head>\n|     <style>\n|       \"p{}\"\n|   <body>\n|     <p>\n|       \"x\"\n"));
+}
+
+test "character references are decoded into text nodes" {
+    assert(tree_is("<p>a&amp;b",
+    "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       \"a&b\"\n"));
+}
+
+test "duplicate html and body attributes merge onto the originals" {
+    assert(tree_is("<html lang=en><body id=main><body id=other class=c>x",
+    "| <html>\n|   lang=\"en\"\n|   <head>\n|   <body>\n|     class=\"c\"\n|     id=\"main\"\n|     \"x\"\n"));
+}
+
+test "heading closes an open heading of any level" {
+    assert(tree_is("<h1>a<h2>b",
+    "| <html>\n|   <head>\n|   <body>\n|     <h1>\n|       \"a\"\n|     <h2>\n|       \"b\"\n"));
+}
+
+test "a newline immediately after pre is dropped" {
+    assert(tree_is("<pre>\nx</pre>",
+    "| <html>\n|   <head>\n|   <body>\n|     <pre>\n|       \"x\"\n"));
+}
+
+test "unknown elements are ordinary elements" {
+    assert(tree_is("<my-widget>x</my-widget>",
+    "| <html>\n|   <head>\n|   <body>\n|     <my-widget>\n|       \"x\"\n"));
+}

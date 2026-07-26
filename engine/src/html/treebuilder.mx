@@ -1,0 +1,2127 @@
+// HTML tree construction — WHATWG HTML §13.2.6.
+//
+// The tokenizer produces a flat token stream; this stage turns it into a DOM
+// tree, applying the spec's insertion modes, the stack of open elements, the
+// list of active formatting elements, and the adoption agency algorithm that
+// repairs misnested formatting markup.
+//
+// Implemented: the document-structure modes (initial, before html, before
+// head, in head, in head noscript, after head, after body, after after body),
+// "in body", "text", and the frameset modes, plus the scope algorithms,
+// implied end tags, formatting-element reconstruction and adoption. This is
+// the path every ordinary document takes.
+//
+// Not yet implemented (see docs/ROADMAP.md): the table mode family, select,
+// template, and foreign content (SVG/MathML). Tokens that would enter those
+// modes are handled by "in body" instead, which is wrong for table markup but
+// keeps the parser total; conformance/ reports exactly what that costs.
+module engine.html.treebuilder;
+
+import std.vec;
+import tokens;
+import tokenizer;
+import tagnames;
+import engine.dom.node;
+
+// --- Insertion modes (§13.2.4.1) --------------------------------------------
+
+const MODE_INITIAL: u32 = 1;
+const MODE_BEFORE_HTML: u32 = 2;
+const MODE_BEFORE_HEAD: u32 = 3;
+const MODE_IN_HEAD: u32 = 4;
+const MODE_IN_HEAD_NOSCRIPT: u32 = 5;
+const MODE_AFTER_HEAD: u32 = 6;
+const MODE_IN_BODY: u32 = 7;
+const MODE_TEXT: u32 = 8;
+const MODE_AFTER_BODY: u32 = 9;
+const MODE_IN_FRAMESET: u32 = 10;
+const MODE_AFTER_FRAMESET: u32 = 11;
+const MODE_AFTER_AFTER_BODY: u32 = 12;
+const MODE_AFTER_AFTER_FRAMESET: u32 = 13;
+
+// Tokenizer states the tree builder switches into for text content.
+const TEXT_NONE: u32 = 0;
+const TEXT_RCDATA: u32 = 1;
+const TEXT_RAWTEXT: u32 = 2;
+const TEXT_PLAINTEXT: u32 = 3;
+
+resource struct HtmlTreeBuilder {
+    doc: *DomDocument,
+    open: Vec<u64>,
+    // Active formatting elements; node.none() is a scope marker.
+    formatting: Vec<u64>,
+    mode: u32,
+    original_mode: u32,
+    head: u64,
+    form: u64,
+    frameset_ok: bool,
+    // Set when the tree builder wants the tokenizer switched after this token.
+    pending_text_state: u32,
+    ignore_next_lf: bool,
+    stopped: bool,
+}
+
+pub fn new(doc: *DomDocument) -> HtmlTreeBuilder {
+    return HtmlTreeBuilder {
+        doc: doc,
+        open: vec.new<u64>(),
+        formatting: vec.new<u64>(),
+        mode: MODE_INITIAL,
+        original_mode: MODE_INITIAL,
+        head: node.none(),
+        form: node.none(),
+        frameset_ok: true,
+        pending_text_state: TEXT_NONE,
+        ignore_next_lf: false,
+        stopped: false,
+    };
+}
+
+pub fn destroy(b: *HtmlTreeBuilder) -> void {
+    vec.destroy(&(*b).open);
+    vec.destroy(&(*b).formatting);
+    (*b).doc = 0 as *DomDocument;
+}
+
+// --- Stack of open elements (§13.2.4.2) -------------------------------------
+
+fn depth(b: *HtmlTreeBuilder) -> u64 {
+    return (*b).open.length;
+}
+
+fn at(b: *HtmlTreeBuilder, index: u64) -> u64 {
+    match vec.get(&(*b).open, index) {
+        Option<u64>.Some(value) => { return value; },
+        Option<u64>.None => { return node.none(); },
+    }
+}
+
+fn current(b: *HtmlTreeBuilder) -> u64 {
+    if depth(b) == 0 {
+        return node.none();
+    }
+    return at(b, depth(b) - 1);
+}
+
+fn push_open(b: *HtmlTreeBuilder, element: u64) -> void {
+    vec.push(&(*b).open, element);
+}
+
+fn pop_open(b: *HtmlTreeBuilder) -> u64 {
+    match vec.pop(&(*b).open) {
+        Option<u64>.Some(value) => { return value; },
+        Option<u64>.None => { return node.none(); },
+    }
+}
+
+fn tag_of(b: *HtmlTreeBuilder, element: u64) -> u32 {
+    if element == node.none() {
+        return tagnames.tag_unknown();
+    }
+    let n: DomNode = node.get((*b).doc, element);
+    return n.tag;
+}
+
+fn is_html_element(b: *HtmlTreeBuilder, element: u64, tag: u32) -> bool {
+    if element == node.none() {
+        return false;
+    }
+    let n: DomNode = node.get((*b).doc, element);
+    return n.kind == node.kind_element()
+        && n.namespace == node.ns_html()
+        && n.tag == tag;
+}
+
+// Remove the topmost occurrence of `element` from the stack.
+fn remove_from_open(b: *HtmlTreeBuilder, element: u64) -> void {
+    let found: bool = false;
+    let index: u64 = depth(b);
+    while index > 0 && !found {
+        index = index - 1;
+        if at(b, index) == element {
+            found = true;
+        }
+    }
+    if !found {
+        return;
+    }
+    for step: u64 in index..(depth(b) - 1) {
+        vec.set(&(*b).open, step, at(b, step + 1));
+    }
+    vec.pop(&(*b).open);
+}
+
+fn index_in_open(b: *HtmlTreeBuilder, element: u64) -> u64 {
+    let index: u64 = depth(b);
+    while index > 0 {
+        index = index - 1;
+        if at(b, index) == element {
+            return index;
+        }
+    }
+    return depth(b);
+}
+
+fn pop_until_tag(b: *HtmlTreeBuilder, tag: u32) -> void {
+    loop {
+        let popped: u64 = pop_open(b);
+        if popped == node.none() || is_html_element(b, popped, tag) {
+            break;
+        }
+    }
+}
+
+fn pop_count(b: *HtmlTreeBuilder, count: u64) -> void {
+    for step: u64 in 0..count {
+        pop_open(b);
+    }
+}
+
+// --- Element categories (§13.2.4.2 "special", §13.2.4.3 formatting) ---------
+
+fn is_special(tag: u32) -> bool {
+    return tag == tagnames.tag_address() || tag == tagnames.tag_applet()
+        || tag == tagnames.tag_area() || tag == tagnames.tag_article()
+        || tag == tagnames.tag_aside() || tag == tagnames.tag_base()
+        || tag == tagnames.tag_basefont() || tag == tagnames.tag_bgsound()
+        || tag == tagnames.tag_blockquote() || tag == tagnames.tag_body()
+        || tag == tagnames.tag_br() || tag == tagnames.tag_button()
+        || tag == tagnames.tag_caption() || tag == tagnames.tag_center()
+        || tag == tagnames.tag_col() || tag == tagnames.tag_colgroup()
+        || tag == tagnames.tag_dd() || tag == tagnames.tag_details()
+        || tag == tagnames.tag_dir() || tag == tagnames.tag_div()
+        || tag == tagnames.tag_dl() || tag == tagnames.tag_dt()
+        || tag == tagnames.tag_embed() || tag == tagnames.tag_fieldset()
+        || tag == tagnames.tag_figcaption() || tag == tagnames.tag_figure()
+        || tag == tagnames.tag_footer() || tag == tagnames.tag_form()
+        || tag == tagnames.tag_frame() || tag == tagnames.tag_frameset()
+        || tag == tagnames.tag_h1() || tag == tagnames.tag_h2()
+        || tag == tagnames.tag_h3() || tag == tagnames.tag_h4()
+        || tag == tagnames.tag_h5() || tag == tagnames.tag_h6()
+        || tag == tagnames.tag_head() || tag == tagnames.tag_header()
+        || tag == tagnames.tag_hgroup() || tag == tagnames.tag_hr()
+        || tag == tagnames.tag_html() || tag == tagnames.tag_iframe()
+        || tag == tagnames.tag_img() || tag == tagnames.tag_input()
+        || tag == tagnames.tag_keygen() || tag == tagnames.tag_li()
+        || tag == tagnames.tag_link() || tag == tagnames.tag_listing()
+        || tag == tagnames.tag_main() || tag == tagnames.tag_marquee()
+        || tag == tagnames.tag_menu() || tag == tagnames.tag_meta()
+        || tag == tagnames.tag_nav() || tag == tagnames.tag_noembed()
+        || tag == tagnames.tag_noframes() || tag == tagnames.tag_noscript()
+        || tag == tagnames.tag_object() || tag == tagnames.tag_ol()
+        || tag == tagnames.tag_p() || tag == tagnames.tag_param()
+        || tag == tagnames.tag_plaintext() || tag == tagnames.tag_pre()
+        || tag == tagnames.tag_script() || tag == tagnames.tag_search()
+        || tag == tagnames.tag_section() || tag == tagnames.tag_select()
+        || tag == tagnames.tag_source() || tag == tagnames.tag_style()
+        || tag == tagnames.tag_summary() || tag == tagnames.tag_table()
+        || tag == tagnames.tag_tbody() || tag == tagnames.tag_td()
+        || tag == tagnames.tag_template() || tag == tagnames.tag_textarea()
+        || tag == tagnames.tag_tfoot() || tag == tagnames.tag_th()
+        || tag == tagnames.tag_thead() || tag == tagnames.tag_title()
+        || tag == tagnames.tag_tr() || tag == tagnames.tag_track()
+        || tag == tagnames.tag_ul() || tag == tagnames.tag_wbr()
+        || tag == tagnames.tag_xmp();
+}
+
+fn is_formatting_tag(tag: u32) -> bool {
+    return tag == tagnames.tag_a() || tag == tagnames.tag_b()
+        || tag == tagnames.tag_big() || tag == tagnames.tag_code()
+        || tag == tagnames.tag_em() || tag == tagnames.tag_font()
+        || tag == tagnames.tag_i() || tag == tagnames.tag_nobr()
+        || tag == tagnames.tag_s() || tag == tagnames.tag_small()
+        || tag == tagnames.tag_strike() || tag == tagnames.tag_strong()
+        || tag == tagnames.tag_tt() || tag == tagnames.tag_u();
+}
+
+fn is_heading(tag: u32) -> bool {
+    return tag == tagnames.tag_h1() || tag == tagnames.tag_h2()
+        || tag == tagnames.tag_h3() || tag == tagnames.tag_h4()
+        || tag == tagnames.tag_h5() || tag == tagnames.tag_h6();
+}
+
+// --- Scopes (§13.2.4.2) ------------------------------------------------------
+
+// The base scope list, shared by every scope variant.
+fn is_scope_boundary(tag: u32) -> bool {
+    return tag == tagnames.tag_applet() || tag == tagnames.tag_caption()
+        || tag == tagnames.tag_html() || tag == tagnames.tag_table()
+        || tag == tagnames.tag_td() || tag == tagnames.tag_th()
+        || tag == tagnames.tag_marquee() || tag == tagnames.tag_object()
+        || tag == tagnames.tag_template();
+}
+
+// variant: 0 = scope, 1 = list item scope, 2 = button scope, 3 = table scope.
+fn has_element_in_scope(b: *HtmlTreeBuilder, tag: u32, variant: u32) -> bool {
+    let index: u64 = depth(b);
+    while index > 0 {
+        index = index - 1;
+        let element: u64 = at(b, index);
+        let element_tag: u32 = tag_of(b, element);
+        if is_html_element(b, element, tag) {
+            return true;
+        }
+        if variant == 3 as u32 {
+            if element_tag == tagnames.tag_html()
+                || element_tag == tagnames.tag_table()
+                || element_tag == tagnames.tag_template() {
+                return false;
+            }
+        } else {
+            if is_scope_boundary(element_tag) {
+                return false;
+            }
+            if variant == 1 as u32
+                && (element_tag == tagnames.tag_ol()
+                    || element_tag == tagnames.tag_ul()) {
+                return false;
+            }
+            if variant == 2 as u32 && element_tag == tagnames.tag_button() {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+fn has_heading_in_scope(b: *HtmlTreeBuilder) -> bool {
+    return has_element_in_scope(b, tagnames.tag_h1(), 0 as u32)
+        || has_element_in_scope(b, tagnames.tag_h2(), 0 as u32)
+        || has_element_in_scope(b, tagnames.tag_h3(), 0 as u32)
+        || has_element_in_scope(b, tagnames.tag_h4(), 0 as u32)
+        || has_element_in_scope(b, tagnames.tag_h5(), 0 as u32)
+        || has_element_in_scope(b, tagnames.tag_h6(), 0 as u32);
+}
+
+// --- Implied end tags (§13.2.6.3) -------------------------------------------
+
+fn is_implied_end_tag(tag: u32) -> bool {
+    return tag == tagnames.tag_dd() || tag == tagnames.tag_dt()
+        || tag == tagnames.tag_li() || tag == tagnames.tag_optgroup()
+        || tag == tagnames.tag_option() || tag == tagnames.tag_p()
+        || tag == tagnames.tag_rb() || tag == tagnames.tag_rp()
+        || tag == tagnames.tag_rt() || tag == tagnames.tag_rtc();
+}
+
+fn generate_implied_end_tags(b: *HtmlTreeBuilder, except: u32) -> void {
+    loop {
+        let tag: u32 = tag_of(b, current(b));
+        if !is_implied_end_tag(tag) || tag == except {
+            break;
+        }
+        pop_open(b);
+    }
+}
+
+fn generate_all_implied_end_tags(b: *HtmlTreeBuilder) -> void {
+    loop {
+        let tag: u32 = tag_of(b, current(b));
+        if !(is_implied_end_tag(tag) || tag == tagnames.tag_caption()
+            || tag == tagnames.tag_colgroup() || tag == tagnames.tag_tbody()
+            || tag == tagnames.tag_td() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_th() || tag == tagnames.tag_thead()
+            || tag == tagnames.tag_tr()) {
+            break;
+        }
+        pop_open(b);
+    }
+}
+
+fn close_p_element(b: *HtmlTreeBuilder) -> void {
+    generate_implied_end_tags(b, tagnames.tag_p());
+    pop_until_tag(b, tagnames.tag_p());
+}
+
+// --- Insertion helpers (§13.2.6.1) ------------------------------------------
+
+fn insertion_parent(b: *HtmlTreeBuilder) -> u64 {
+    if depth(b) == 0 {
+        return 0;
+    }
+    return current(b);
+}
+
+fn insert_text(b: *HtmlTreeBuilder, view: []const u8) -> void {
+    if len(view) == 0 {
+        return;
+    }
+    let parent: u64 = insertion_parent(b);
+    let parent_node: DomNode = node.get((*b).doc, parent);
+    let last: u64 = parent_node.last_child;
+    if last != node.none() {
+        let last_node: DomNode = node.get((*b).doc, last);
+        if last_node.kind == node.kind_text() {
+            node.extend_text((*b).doc, last, view);
+            return;
+        }
+    }
+    let text: u64 = node.create_text((*b).doc, view);
+    node.append_child((*b).doc, parent, text);
+}
+
+fn insert_comment_at(b: *HtmlTreeBuilder, parent: u64, view: []const u8) -> void {
+    let comment: u64 = node.create_comment((*b).doc, view);
+    node.append_child((*b).doc, parent, comment);
+}
+
+// Create an element for a start tag token and copy its attributes across.
+fn element_for_token(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken
+) -> u64 {
+    let name: []const u8 = tokens.pool_bytes(s, token.data_off, token.data_len);
+    let element: u64 = node.create_element((*b).doc, name, node.ns_html());
+    for index: u64 in 0..token.attr_count {
+        let attr: HtmlAttr = tokens.get_attr(s, token.attr_first + index);
+        node.add_attr((*b).doc,
+            element,
+            tokens.pool_bytes(s, attr.name_off, attr.name_len),
+            tokens.pool_bytes(s, attr.value_off, attr.value_len));
+    }
+    return element;
+}
+
+fn insert_element(b: *HtmlTreeBuilder, s: *HtmlTokenSink, token: HtmlToken) -> u64 {
+    let element: u64 = element_for_token(b, s, token);
+    node.append_child((*b).doc, insertion_parent(b), element);
+    push_open(b, element);
+    return element;
+}
+
+// A void or self-contained element: inserted, then immediately popped.
+fn insert_void_element(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken
+) -> void {
+    insert_element(b, s, token);
+    pop_open(b);
+}
+
+// §13.2.6.2 "generic raw text element parsing algorithm" and its RCDATA twin.
+fn parse_text_element(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    text_state: u32
+) -> void {
+    insert_element(b, s, token);
+    (*b).pending_text_state = text_state;
+    (*b).original_mode = (*b).mode;
+    (*b).mode = MODE_TEXT;
+}
+
+// --- Active formatting elements (§13.2.4.3) ---------------------------------
+
+fn formatting_len(b: *HtmlTreeBuilder) -> u64 {
+    return (*b).formatting.length;
+}
+
+fn formatting_at(b: *HtmlTreeBuilder, index: u64) -> u64 {
+    match vec.get(&(*b).formatting, index) {
+        Option<u64>.Some(value) => { return value; },
+        Option<u64>.None => { return node.none(); },
+    }
+}
+
+fn push_formatting_marker(b: *HtmlTreeBuilder) -> void {
+    vec.push(&(*b).formatting, node.none());
+}
+
+fn clear_formatting_to_marker(b: *HtmlTreeBuilder) -> void {
+    loop {
+        match vec.pop(&(*b).formatting) {
+            Option<u64>.Some(value) => {
+                if value == node.none() {
+                    break;
+                }
+            },
+            Option<u64>.None => { break; },
+        }
+    }
+}
+
+fn remove_from_formatting(b: *HtmlTreeBuilder, element: u64) -> void {
+    let found: u64 = formatting_len(b);
+    let index: u64 = formatting_len(b);
+    while index > 0 {
+        index = index - 1;
+        if formatting_at(b, index) == element {
+            found = index;
+            index = 0;
+        }
+    }
+    if found == formatting_len(b) {
+        return;
+    }
+    for step: u64 in found..(formatting_len(b) - 1) {
+        vec.set(&(*b).formatting, step, formatting_at(b, step + 1));
+    }
+    vec.pop(&(*b).formatting);
+}
+
+// Do two elements have the same tag name, namespace and attributes? The
+// "Noah's Ark clause" uses this to cap identical formatting entries at three.
+fn same_element(b: *HtmlTreeBuilder, left: u64, right: u64) -> bool {
+    let a: DomNode = node.get((*b).doc, left);
+    let c: DomNode = node.get((*b).doc, right);
+    if a.namespace != c.namespace || a.name_len != c.name_len {
+        return false;
+    }
+    if a.attr_count != c.attr_count {
+        return false;
+    }
+    let a_name: []const u8 = node.bytes((*b).doc, a.name_off, a.name_len);
+    let c_name: []const u8 = node.bytes((*b).doc, c.name_off, c.name_len);
+    for index: u64 in 0..a.name_len {
+        if a_name[index] != c_name[index] {
+            return false;
+        }
+    }
+    // Attribute order may differ, so each of a's attributes must appear in c.
+    for index: u64 in 0..a.attr_count {
+        let attr: DomAttr = node.get_attr((*b).doc, a.attr_first + index);
+        let matched: bool = false;
+        for other: u64 in 0..c.attr_count {
+            let candidate: DomAttr = node.get_attr((*b).doc, c.attr_first + other);
+            if attr.name_len == candidate.name_len
+                && attr.value_len == candidate.value_len {
+                let same: bool = true;
+                let a_bytes: []const u8 =
+                    node.bytes((*b).doc, attr.name_off, attr.name_len);
+                let c_bytes: []const u8 =
+                    node.bytes((*b).doc, candidate.name_off, candidate.name_len);
+                for step: u64 in 0..attr.name_len {
+                    if a_bytes[step] != c_bytes[step] {
+                        same = false;
+                    }
+                }
+                let a_value: []const u8 =
+                    node.bytes((*b).doc, attr.value_off, attr.value_len);
+                let c_value: []const u8 =
+                    node.bytes((*b).doc, candidate.value_off, candidate.value_len);
+                for step: u64 in 0..attr.value_len {
+                    if a_value[step] != c_value[step] {
+                        same = false;
+                    }
+                }
+                if same {
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn push_formatting(b: *HtmlTreeBuilder, element: u64) -> void {
+    // Noah's Ark clause: at most three entries with the same name/attributes
+    // may sit between the element and the nearest marker.
+    let matches: u64 = 0;
+    let earliest: u64 = formatting_len(b);
+    let index: u64 = formatting_len(b);
+    while index > 0 {
+        index = index - 1;
+        let entry: u64 = formatting_at(b, index);
+        if entry == node.none() {
+            index = 0;
+        } else if same_element(b, entry, element) {
+            matches = matches + 1;
+            earliest = index;
+        }
+    }
+    if matches >= 3 {
+        remove_from_formatting(b, formatting_at(b, earliest));
+    }
+    vec.push(&(*b).formatting, element);
+}
+
+// The most recent entry for `tag` after the last marker, or none().
+fn formatting_lookup(b: *HtmlTreeBuilder, tag: u32) -> u64 {
+    let index: u64 = formatting_len(b);
+    while index > 0 {
+        index = index - 1;
+        let entry: u64 = formatting_at(b, index);
+        if entry == node.none() {
+            return node.none();
+        }
+        if is_html_element(b, entry, tag) {
+            return entry;
+        }
+    }
+    return node.none();
+}
+
+// §13.2.4.3 "reconstruct the active formatting elements".
+fn reconstruct_formatting(b: *HtmlTreeBuilder) -> void {
+    if formatting_len(b) == 0 {
+        return;
+    }
+    let last: u64 = formatting_len(b) - 1;
+    let entry: u64 = formatting_at(b, last);
+    if entry == node.none() || index_in_open(b, entry) < depth(b) {
+        return;
+    }
+    let position: u64 = last;
+    let stop: bool = false;
+    while !stop {
+        if position == 0 {
+            stop = true;
+        } else {
+            position = position - 1;
+            let candidate: u64 = formatting_at(b, position);
+            if candidate == node.none() || index_in_open(b, candidate) < depth(b) {
+                position = position + 1;
+                stop = true;
+            }
+        }
+    }
+    while position < formatting_len(b) {
+        let original: u64 = formatting_at(b, position);
+        let clone: u64 = clone_element(b, original);
+        node.append_child((*b).doc, insertion_parent(b), clone);
+        push_open(b, clone);
+        vec.set(&(*b).formatting, position, clone);
+        position = position + 1;
+    }
+}
+
+fn clone_element(b: *HtmlTreeBuilder, element: u64) -> u64 {
+    let source: DomNode = node.get((*b).doc, element);
+    let name: []const u8 = node.bytes((*b).doc, source.name_off, source.name_len);
+    let clone: u64 = node.create_element((*b).doc, name, source.namespace);
+    for index: u64 in 0..source.attr_count {
+        let attr: DomAttr = node.get_attr((*b).doc, source.attr_first + index);
+        node.add_attr((*b).doc, clone,
+            node.bytes((*b).doc, attr.name_off, attr.name_len),
+            node.bytes((*b).doc, attr.value_off, attr.value_len));
+    }
+    return clone;
+}
+
+// --- Adoption agency algorithm (§13.2.6.4.7) --------------------------------
+//
+// The algorithm that makes `<b>1<p>2</b>3</p>` produce what browsers produce.
+// Returns true when the caller should fall back to the "any other end tag"
+// steps instead.
+fn adoption_agency(b: *HtmlTreeBuilder, tag: u32) -> bool {
+    let current_element: u64 = current(b);
+    if is_html_element(b, current_element, tag)
+        && formatting_lookup(b, tag) == node.none() {
+        pop_open(b);
+        return false;
+    }
+    for outer: u64 in 0..8 {
+        let formatting_element: u64 = formatting_lookup(b, tag);
+        if formatting_element == node.none() {
+            return true;
+        }
+        let stack_index: u64 = index_in_open(b, formatting_element);
+        if stack_index >= depth(b) {
+            remove_from_formatting(b, formatting_element);
+            return false;
+        }
+        if !has_element_in_scope(b, tag, 0 as u32) {
+            return false;
+        }
+        // Furthest block: the topmost special element below the formatting
+        // element on the stack.
+        let furthest_block: u64 = node.none();
+        for probe: u64 in (stack_index + 1)..depth(b) {
+            if furthest_block == node.none() && is_special(tag_of(b, at(b, probe))) {
+                furthest_block = at(b, probe);
+            }
+        }
+        if furthest_block == node.none() {
+            // Nothing special below it: just pop through and drop the entry.
+            loop {
+                let popped: u64 = pop_open(b);
+                if popped == formatting_element || popped == node.none() {
+                    break;
+                }
+            }
+            remove_from_formatting(b, formatting_element);
+            return false;
+        }
+        let common_ancestor: u64 = at(b, stack_index - 1);
+        let bookmark: u64 = formatting_index(b, formatting_element);
+
+        // Inner loop (spec step 13). `walker` is the stack index of the node
+        // under consideration; the spec's "element immediately above node" is
+        // the entry one closer to the root, so the walk moves downward. When
+        // an entry is removed from the stack the entries above it shift down,
+        // which leaves the next index to visit unchanged.
+        let last_node: u64 = furthest_block;
+        let walker: u64 = index_in_open(b, furthest_block);
+        let inner: u64 = 0;
+        loop {
+            inner = inner + 1;
+            if walker == 0 {
+                break;
+            }
+            walker = walker - 1;
+            let candidate: u64 = at(b, walker);
+            if candidate == formatting_element {
+                break;
+            }
+            let in_formatting: u64 = formatting_index(b, candidate);
+            if inner > 3 && in_formatting < formatting_len(b) {
+                remove_from_formatting(b, candidate);
+                in_formatting = formatting_len(b);
+            }
+            if in_formatting == formatting_len(b) {
+                remove_from_open(b, candidate);
+            } else {
+                let replacement: u64 = clone_element(b, candidate);
+                vec.set(&(*b).formatting, in_formatting, replacement);
+                vec.set(&(*b).open, walker, replacement);
+                if last_node == furthest_block {
+                    bookmark = in_formatting + 1;
+                }
+                node.remove((*b).doc, last_node);
+                node.append_child((*b).doc, replacement, last_node);
+                last_node = replacement;
+            }
+        }
+        node.remove((*b).doc, last_node);
+        node.append_child((*b).doc, common_ancestor, last_node);
+        let new_element: u64 = clone_element(b, formatting_element);
+        node.move_children((*b).doc, furthest_block, new_element);
+        node.append_child((*b).doc, furthest_block, new_element);
+        remove_from_formatting(b, formatting_element);
+        insert_formatting_at(b, bookmark, new_element);
+        remove_from_open(b, formatting_element);
+        let block_index: u64 = index_in_open(b, furthest_block);
+        insert_open_at(b, block_index + 1, new_element);
+    }
+    return false;
+}
+
+fn formatting_index(b: *HtmlTreeBuilder, element: u64) -> u64 {
+    let index: u64 = formatting_len(b);
+    while index > 0 {
+        index = index - 1;
+        if formatting_at(b, index) == element {
+            return index;
+        }
+    }
+    return formatting_len(b);
+}
+
+fn insert_formatting_at(b: *HtmlTreeBuilder, position: u64, element: u64) -> void {
+    let target: u64 = position;
+    if target > formatting_len(b) {
+        target = formatting_len(b);
+    }
+    vec.push(&(*b).formatting, element);
+    let index: u64 = formatting_len(b) - 1;
+    while index > target {
+        vec.set(&(*b).formatting, index, formatting_at(b, index - 1));
+        index = index - 1;
+    }
+    vec.set(&(*b).formatting, target, element);
+}
+
+fn insert_open_at(b: *HtmlTreeBuilder, position: u64, element: u64) -> void {
+    let target: u64 = position;
+    if target > depth(b) {
+        target = depth(b);
+    }
+    vec.push(&(*b).open, element);
+    let index: u64 = depth(b) - 1;
+    while index > target {
+        vec.set(&(*b).open, index, at(b, index - 1));
+        index = index - 1;
+    }
+    vec.set(&(*b).open, target, element);
+}
+
+// --- Character helpers -------------------------------------------------------
+
+fn is_ws_byte(c: u8) -> bool {
+    return c == 9 as u8 || c == 10 as u8 || c == 12 as u8
+        || c == 13 as u8 || c == 32 as u8;
+}
+
+// Number of leading ASCII whitespace bytes in `view`.
+fn leading_ws(view: []const u8) -> u64 {
+    let count: u64 = 0;
+    while count < len(view) && is_ws_byte(view[count]) {
+        count = count + 1;
+    }
+    return count;
+}
+
+fn subview(view: []const u8, from: u64) -> []const u8 {
+    if from >= len(view) {
+        return slice(0 as *const u8, 0);
+    }
+    return slice((&view[from]) as *const u8, len(view) - from);
+}
+
+fn head_view(view: []const u8, count: u64) -> []const u8 {
+    if count == 0 {
+        return slice(0 as *const u8, 0);
+    }
+    return slice((&view[0]) as *const u8, count);
+}
+
+fn all_whitespace(view: []const u8) -> bool {
+    return leading_ws(view) == len(view);
+}
+
+// --- Quirks mode (§13.2.6.1, "the initial insertion mode") ------------------
+
+fn ascii_lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32 as u8;
+    }
+    return c;
+}
+
+fn view_equals_ci(view: []const u8, text: *u8) -> bool {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if len(view) != length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        if ascii_lower(view[index]) != ascii_lower(text[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn view_starts_with_ci(view: []const u8, text: *u8) -> bool {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if len(view) < length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        if ascii_lower(view[index]) != ascii_lower(text[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The public-identifier prefixes that force quirks mode. This is the spec's
+// list; it is long because it is a catalogue of pre-HTML5 doctypes.
+fn public_id_forces_quirks(public_id: []const u8) -> bool {
+    return view_starts_with_ci(public_id, "+//Silmaril//dtd html Pro v0r11 19970101//")
+        || view_starts_with_ci(public_id, "-//AS//DTD HTML 3.0 asWedit + extensions//")
+        || view_starts_with_ci(public_id, "-//AdvaSoft Ltd//DTD HTML 3.0 asWedit + extensions//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 2.0 Level 1//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 2.0 Level 2//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 2.0 Strict Level 1//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 2.0 Strict Level 2//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 2.0 Strict//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 2.0//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 2.1E//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 3.0//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 3.2 Final//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 3.2//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML 3//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Level 0//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Level 1//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Level 2//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Level 3//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Strict Level 0//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Strict Level 1//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Strict Level 2//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Strict Level 3//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML Strict//")
+        || view_starts_with_ci(public_id, "-//IETF//DTD HTML//")
+        || view_starts_with_ci(public_id, "-//Metrius//DTD Metrius Presentational//")
+        || view_starts_with_ci(public_id, "-//Microsoft//DTD Internet Explorer 2.0 HTML Strict//")
+        || view_starts_with_ci(public_id, "-//Microsoft//DTD Internet Explorer 2.0 HTML//")
+        || view_starts_with_ci(public_id, "-//Microsoft//DTD Internet Explorer 2.0 Tables//")
+        || view_starts_with_ci(public_id, "-//Microsoft//DTD Internet Explorer 3.0 HTML Strict//")
+        || view_starts_with_ci(public_id, "-//Microsoft//DTD Internet Explorer 3.0 HTML//")
+        || view_starts_with_ci(public_id, "-//Microsoft//DTD Internet Explorer 3.0 Tables//")
+        || view_starts_with_ci(public_id, "-//Netscape Comm. Corp.//DTD HTML//")
+        || view_starts_with_ci(public_id, "-//Netscape Comm. Corp.//DTD Strict HTML//")
+        || view_starts_with_ci(public_id, "-//O'Reilly and Associates//DTD HTML 2.0//")
+        || view_starts_with_ci(public_id, "-//O'Reilly and Associates//DTD HTML Extended 1.0//")
+        || view_starts_with_ci(public_id, "-//O'Reilly and Associates//DTD HTML Extended Relaxed 1.0//")
+        || view_starts_with_ci(public_id, "-//SQ//DTD HTML 2.0 HoTMetaL + extensions//")
+        || view_starts_with_ci(public_id, "-//SoftQuad Software//DTD HoTMetaL PRO 6.0::19990601::extensions to HTML 4.0//")
+        || view_starts_with_ci(public_id, "-//SoftQuad//DTD HoTMetaL PRO 4.0::19971010::extensions to HTML 4.0//")
+        || view_starts_with_ci(public_id, "-//Spyglass//DTD HTML 2.0 Extended//")
+        || view_starts_with_ci(public_id, "-//Sun Microsystems Corp.//DTD HotJava HTML//")
+        || view_starts_with_ci(public_id, "-//Sun Microsystems Corp.//DTD HotJava Strict HTML//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML 3 1995-03-24//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML 3.2 Draft//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML 3.2 Final//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML 3.2//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML 3.2S Draft//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML 4.0 Frameset//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML 4.0 Transitional//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML Experimental 19960712//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD HTML Experimental 970421//")
+        || view_starts_with_ci(public_id, "-//W3C//DTD W3 HTML//")
+        || view_starts_with_ci(public_id, "-//W3O//DTD W3 HTML 3.0//")
+        || view_starts_with_ci(public_id, "-//WebTechs//DTD Mozilla HTML 2.0//")
+        || view_starts_with_ci(public_id, "-//WebTechs//DTD Mozilla HTML//");
+}
+
+fn doctype_sets_quirks(
+    s: *HtmlTokenSink,
+    token: HtmlToken
+) -> bool {
+    if token.force_quirks {
+        return true;
+    }
+    let name: []const u8 = tokens.pool_bytes(s, token.data_off, token.data_len);
+    if !token.has_name || !view_equals_ci(name, "html") {
+        return true;
+    }
+    let public_id: []const u8 = slice(0 as *const u8, 0);
+    if token.has_public {
+        public_id = tokens.pool_bytes(s, token.public_off, token.public_len);
+    }
+    let system_id: []const u8 = slice(0 as *const u8, 0);
+    if token.has_system {
+        system_id = tokens.pool_bytes(s, token.system_off, token.system_len);
+    }
+    if view_equals_ci(system_id,
+        "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd") {
+        return true;
+    }
+    if view_equals_ci(public_id, "-//W3O//DTD W3 HTML Strict 3.0//EN//")
+        || view_equals_ci(public_id, "-/W3C/DTD HTML 4.0 Transitional/EN")
+        || view_equals_ci(public_id, "HTML") {
+        return true;
+    }
+    if public_id_forces_quirks(public_id) {
+        return true;
+    }
+    if !token.has_system {
+        if view_starts_with_ci(public_id, "-//W3C//DTD HTML 4.01 Frameset//")
+            || view_starts_with_ci(public_id, "-//W3C//DTD HTML 4.01 Transitional//") {
+            return true;
+        }
+    }
+    return false;
+}
+
+// --- Token dispatch ----------------------------------------------------------
+
+// Process one token in the current insertion mode. `sink` owns the token's
+// bytes; `t` is the tokenizer, which some modes must switch into a text state.
+pub fn process(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    index: u64,
+    t: *HtmlTokenizer
+) -> void {
+    if (*b).stopped {
+        return;
+    }
+    dispatch(b, s, index);
+    if (*b).pending_text_state != TEXT_NONE {
+        if (*b).pending_text_state == TEXT_RCDATA {
+            tokenizer.set_rcdata(t);
+        } else if (*b).pending_text_state == TEXT_RAWTEXT {
+            tokenizer.set_rawtext(t);
+        } else {
+            tokenizer.set_plaintext(t);
+        }
+        (*b).pending_text_state = TEXT_NONE;
+    }
+}
+
+fn dispatch(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let mode: u32 = (*b).mode;
+    if mode == MODE_INITIAL { mode_initial(b, s, index); }
+    else if mode == MODE_BEFORE_HTML { mode_before_html(b, s, index); }
+    else if mode == MODE_BEFORE_HEAD { mode_before_head(b, s, index); }
+    else if mode == MODE_IN_HEAD { mode_in_head(b, s, index); }
+    else if mode == MODE_IN_HEAD_NOSCRIPT { mode_in_head_noscript(b, s, index); }
+    else if mode == MODE_AFTER_HEAD { mode_after_head(b, s, index); }
+    else if mode == MODE_IN_BODY { mode_in_body(b, s, index); }
+    else if mode == MODE_TEXT { mode_text(b, s, index); }
+    else if mode == MODE_AFTER_BODY { mode_after_body(b, s, index); }
+    else if mode == MODE_IN_FRAMESET { mode_in_frameset(b, s, index); }
+    else if mode == MODE_AFTER_FRAMESET { mode_after_frameset(b, s, index); }
+    else if mode == MODE_AFTER_AFTER_BODY { mode_after_after_body(b, s, index); }
+    else { mode_after_after_frameset(b, s, index); }
+}
+
+fn token_tag(b: *HtmlTreeBuilder, s: *HtmlTokenSink, token: HtmlToken) -> u32 {
+    return tagnames.lookup(tokens.pool_bytes(s, token.data_off, token.data_len));
+}
+
+fn token_data(s: *HtmlTokenSink, token: HtmlToken) -> []const u8 {
+    return tokens.pool_bytes(s, token.data_off, token.data_len);
+}
+
+// --- Insertion modes ---------------------------------------------------------
+
+// §13.2.6.4.1
+fn mode_initial(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let ws: u64 = leading_ws(token_data(s, token));
+        if ws == token.data_len {
+            return;
+        }
+        (*b).mode = MODE_BEFORE_HTML;
+        dispatch_chars_rest(b, s, token, ws);
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, 0, token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        let name: []const u8 = slice(0 as *const u8, 0);
+        if token.has_name {
+            name = token_data(s, token);
+        }
+        let public_id: []const u8 = slice(0 as *const u8, 0);
+        if token.has_public {
+            public_id = tokens.pool_bytes(s, token.public_off, token.public_len);
+        }
+        let system_id: []const u8 = slice(0 as *const u8, 0);
+        if token.has_system {
+            system_id = tokens.pool_bytes(s, token.system_off, token.system_len);
+        }
+        let doctype: u64 = node.create_doctype((*b).doc, name,
+            public_id, token.has_public, system_id, token.has_system);
+        node.append_child((*b).doc, 0, doctype);
+        node.set_quirks((*b).doc, doctype_sets_quirks(s, token));
+        (*b).mode = MODE_BEFORE_HTML;
+        return;
+    }
+    node.set_quirks((*b).doc, true);
+    (*b).mode = MODE_BEFORE_HTML;
+    dispatch(b, s, index);
+}
+
+// Re-dispatch the non-whitespace tail of a character token after the leading
+// whitespace has been consumed by a mode that ignores it.
+fn dispatch_chars_rest(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    from: u64
+) -> void {
+    let rest: []const u8 = subview(token_data(s, token), from);
+    if len(rest) == 0 {
+        return;
+    }
+    process_chars(b, s, rest);
+}
+
+// Feed a raw character run into the current mode. Modes that need to split a
+// character token call this with the piece they are forwarding.
+fn process_chars(b: *HtmlTreeBuilder, s: *HtmlTokenSink, view: []const u8) -> void {
+    let mode: u32 = (*b).mode;
+    if mode == MODE_BEFORE_HTML {
+        create_implied_html(b);
+        (*b).mode = MODE_BEFORE_HEAD;
+        process_chars(b, s, view);
+    } else if mode == MODE_BEFORE_HEAD {
+        create_implied_head(b);
+        (*b).mode = MODE_IN_HEAD;
+        process_chars(b, s, view);
+    } else if mode == MODE_IN_HEAD {
+        pop_open(b);
+        (*b).mode = MODE_AFTER_HEAD;
+        process_chars(b, s, view);
+    } else if mode == MODE_IN_HEAD_NOSCRIPT {
+        pop_open(b);
+        (*b).mode = MODE_IN_HEAD;
+        process_chars(b, s, view);
+    } else if mode == MODE_AFTER_HEAD {
+        create_implied_body(b);
+        (*b).mode = MODE_IN_BODY;
+        process_chars(b, s, view);
+    } else if mode == MODE_AFTER_BODY || mode == MODE_AFTER_AFTER_BODY {
+        (*b).mode = MODE_IN_BODY;
+        process_chars(b, s, view);
+    } else if mode == MODE_IN_FRAMESET || mode == MODE_AFTER_FRAMESET
+        || mode == MODE_AFTER_AFTER_FRAMESET {
+        // Only whitespace is allowed in the frameset modes; anything else is
+        // a parse error and is dropped.
+        let ws: u64 = leading_ws(view);
+        insert_text(b, head_view(view, ws));
+    } else {
+        // "in body" and "text".
+        if mode == MODE_IN_BODY {
+            reconstruct_formatting(b);
+            if !all_whitespace(view) {
+                (*b).frameset_ok = false;
+            }
+        }
+        insert_text(b, view);
+    }
+}
+
+fn create_implied_html(b: *HtmlTreeBuilder) -> void {
+    let html: u64 = node.create_element((*b).doc, view_of("html"), node.ns_html());
+    node.append_child((*b).doc, 0, html);
+    push_open(b, html);
+}
+
+fn create_implied_head(b: *HtmlTreeBuilder) -> void {
+    let head: u64 = node.create_element((*b).doc, view_of("head"), node.ns_html());
+    node.append_child((*b).doc, insertion_parent(b), head);
+    push_open(b, head);
+    (*b).head = head;
+}
+
+fn create_implied_body(b: *HtmlTreeBuilder) -> void {
+    let body: u64 = node.create_element((*b).doc, view_of("body"), node.ns_html());
+    node.append_child((*b).doc, insertion_parent(b), body);
+    push_open(b, body);
+}
+
+// A byte view over a NUL-terminated literal.
+fn view_of(text: *u8) -> []const u8 {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    return slice(text as *const u8, length);
+}
+
+// §13.2.6.4.2
+fn mode_before_html(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, 0, token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_chars() {
+        let ws: u64 = leading_ws(token_data(s, token));
+        if ws == token.data_len {
+            return;
+        }
+        dispatch_chars_rest(b, s, token, ws);
+        return;
+    }
+    if token.kind == tokens.kind_start_tag()
+        && token_tag(b, s, token) == tagnames.tag_html() {
+        let html: u64 = element_for_token(b, s, token);
+        node.append_child((*b).doc, 0, html);
+        push_open(b, html);
+        (*b).mode = MODE_BEFORE_HEAD;
+        return;
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag != tagnames.tag_head() && tag != tagnames.tag_body()
+            && tag != tagnames.tag_html() && tag != tagnames.tag_br() {
+            return;
+        }
+    }
+    create_implied_html(b);
+    (*b).mode = MODE_BEFORE_HEAD;
+    dispatch(b, s, index);
+}
+
+// §13.2.6.4.3
+fn mode_before_head(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let ws: u64 = leading_ws(token_data(s, token));
+        if ws == token.data_len {
+            return;
+        }
+        dispatch_chars_rest(b, s, token, ws);
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_head() {
+            let head: u64 = insert_element(b, s, token);
+            (*b).head = head;
+            (*b).mode = MODE_IN_HEAD;
+            return;
+        }
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag != tagnames.tag_head() && tag != tagnames.tag_body()
+            && tag != tagnames.tag_html() && tag != tagnames.tag_br() {
+            return;
+        }
+    }
+    create_implied_head(b);
+    (*b).mode = MODE_IN_HEAD;
+    dispatch(b, s, index);
+}
+
+// §13.2.6.4.4
+fn mode_in_head(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let ws: u64 = leading_ws(token_data(s, token));
+        if ws > 0 {
+            insert_text(b, head_view(token_data(s, token), ws));
+        }
+        if ws == token.data_len {
+            return;
+        }
+        dispatch_chars_rest(b, s, token, ws);
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_base() || tag == tagnames.tag_basefont()
+            || tag == tagnames.tag_bgsound() || tag == tagnames.tag_link()
+            || tag == tagnames.tag_meta() {
+            insert_void_element(b, s, token);
+            return;
+        }
+        if tag == tagnames.tag_title() {
+            parse_text_element(b, s, token, TEXT_RCDATA);
+            return;
+        }
+        if tag == tagnames.tag_noframes() || tag == tagnames.tag_style()
+            || tag == tagnames.tag_noscript() || tag == tagnames.tag_script() {
+            // Without a scripting engine, <noscript> content is parsed as
+            // ordinary markup; the other three are raw text.
+            if tag == tagnames.tag_noscript() {
+                insert_element(b, s, token);
+                (*b).mode = MODE_IN_HEAD_NOSCRIPT;
+                return;
+            }
+            parse_text_element(b, s, token, TEXT_RAWTEXT);
+            return;
+        }
+        if tag == tagnames.tag_head() {
+            return;
+        }
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_head() {
+            pop_open(b);
+            (*b).mode = MODE_AFTER_HEAD;
+            return;
+        }
+        if tag != tagnames.tag_body() && tag != tagnames.tag_html()
+            && tag != tagnames.tag_br() {
+            return;
+        }
+    }
+    pop_open(b);
+    (*b).mode = MODE_AFTER_HEAD;
+    dispatch(b, s, index);
+}
+
+// §13.2.6.4.5
+fn mode_in_head_noscript(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_noscript() {
+            pop_open(b);
+            (*b).mode = MODE_IN_HEAD;
+            return;
+        }
+        if tag != tagnames.tag_br() {
+            return;
+        }
+    }
+    if token.kind == tokens.kind_chars() {
+        let ws: u64 = leading_ws(token_data(s, token));
+        if ws > 0 {
+            insert_text(b, head_view(token_data(s, token), ws));
+        }
+        if ws == token.data_len {
+            return;
+        }
+        dispatch_chars_rest(b, s, token, ws);
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_basefont() || tag == tagnames.tag_bgsound()
+            || tag == tagnames.tag_link() || tag == tagnames.tag_meta()
+            || tag == tagnames.tag_noframes() || tag == tagnames.tag_style() {
+            mode_in_head(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_head() || tag == tagnames.tag_noscript() {
+            return;
+        }
+    }
+    pop_open(b);
+    (*b).mode = MODE_IN_HEAD;
+    dispatch(b, s, index);
+}
+
+// §13.2.6.4.6
+fn mode_after_head(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let ws: u64 = leading_ws(token_data(s, token));
+        if ws > 0 {
+            insert_text(b, head_view(token_data(s, token), ws));
+        }
+        if ws == token.data_len {
+            return;
+        }
+        dispatch_chars_rest(b, s, token, ws);
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_body() {
+            insert_element(b, s, token);
+            (*b).frameset_ok = false;
+            (*b).mode = MODE_IN_BODY;
+            return;
+        }
+        if tag == tagnames.tag_frameset() {
+            insert_element(b, s, token);
+            (*b).mode = MODE_IN_FRAMESET;
+            return;
+        }
+        // Metadata that strayed past </head>: a parse error, recovered by
+        // processing it as though the head were still open. Every tag listed
+        // here must be one "in head" actually handles — otherwise "in head"
+        // would bounce the token straight back and the two modes would
+        // ping-pong forever. <template> is deliberately absent for exactly
+        // that reason; it is not implemented and is handled as an ordinary
+        // element instead.
+        if tag == tagnames.tag_base() || tag == tagnames.tag_basefont()
+            || tag == tagnames.tag_bgsound() || tag == tagnames.tag_link()
+            || tag == tagnames.tag_meta() || tag == tagnames.tag_noframes()
+            || tag == tagnames.tag_script() || tag == tagnames.tag_style()
+            || tag == tagnames.tag_title() {
+            push_open(b, (*b).head);
+            mode_in_head(b, s, index);
+            remove_from_open(b, (*b).head);
+            return;
+        }
+        if tag == tagnames.tag_head() {
+            return;
+        }
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag != tagnames.tag_body() && tag != tagnames.tag_html()
+            && tag != tagnames.tag_br() {
+            return;
+        }
+    }
+    create_implied_body(b);
+    (*b).mode = MODE_IN_BODY;
+    dispatch(b, s, index);
+}
+
+// §13.2.6.4.7 — "in body". The mode nearly all content flows through.
+fn mode_in_body(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let view: []const u8 = token_data(s, token);
+        if (*b).ignore_next_lf {
+            (*b).ignore_next_lf = false;
+            if len(view) > 0 && view[0] == 10 as u8 {
+                view = subview(view, 1);
+            }
+        }
+        if len(view) == 0 {
+            return;
+        }
+        reconstruct_formatting(b);
+        insert_text(b, view);
+        if !all_whitespace(view) {
+            (*b).frameset_ok = false;
+        }
+        return;
+    }
+    (*b).ignore_next_lf = false;
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        (*b).stopped = true;
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        in_body_start_tag(b, s, token, index);
+        return;
+    }
+    in_body_end_tag(b, s, token, index);
+}
+
+fn in_body_start_tag(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    index: u64
+) -> void {
+    let tag: u32 = token_tag(b, s, token);
+
+    if tag == tagnames.tag_html() {
+        // A duplicate <html>: merge any attributes it carries onto the
+        // original rather than opening a second root.
+        merge_attributes(b, s, token, at(b, 0));
+        return;
+    }
+    if tag == tagnames.tag_base() || tag == tagnames.tag_basefont()
+        || tag == tagnames.tag_bgsound() || tag == tagnames.tag_link()
+        || tag == tagnames.tag_meta() || tag == tagnames.tag_noframes()
+        || tag == tagnames.tag_script() || tag == tagnames.tag_style()
+        || tag == tagnames.tag_title() {
+        in_head_start_tag(b, s, token, tag);
+        return;
+    }
+    if tag == tagnames.tag_body() {
+        if depth(b) > 1 && is_html_element(b, at(b, 1), tagnames.tag_body()) {
+            (*b).frameset_ok = false;
+            merge_attributes(b, s, token, at(b, 1));
+        }
+        return;
+    }
+    if tag == tagnames.tag_frameset() {
+        if !(*b).frameset_ok || depth(b) < 2 {
+            return;
+        }
+        // Discard the body that was opened optimistically.
+        node.remove((*b).doc, at(b, 1));
+        while depth(b) > 1 {
+            pop_open(b);
+        }
+        insert_element(b, s, token);
+        (*b).mode = MODE_IN_FRAMESET;
+        return;
+    }
+    if tag == tagnames.tag_address() || tag == tagnames.tag_article()
+        || tag == tagnames.tag_aside() || tag == tagnames.tag_blockquote()
+        || tag == tagnames.tag_center() || tag == tagnames.tag_details()
+        || tag == tagnames.tag_dialog() || tag == tagnames.tag_dir()
+        || tag == tagnames.tag_div() || tag == tagnames.tag_dl()
+        || tag == tagnames.tag_fieldset() || tag == tagnames.tag_figcaption()
+        || tag == tagnames.tag_figure() || tag == tagnames.tag_footer()
+        || tag == tagnames.tag_header() || tag == tagnames.tag_hgroup()
+        || tag == tagnames.tag_main() || tag == tagnames.tag_menu()
+        || tag == tagnames.tag_nav() || tag == tagnames.tag_ol()
+        || tag == tagnames.tag_p() || tag == tagnames.tag_search()
+        || tag == tagnames.tag_section() || tag == tagnames.tag_summary()
+        || tag == tagnames.tag_ul() {
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        insert_element(b, s, token);
+        return;
+    }
+    if is_heading(tag) {
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        if is_heading(tag_of(b, current(b))) {
+            pop_open(b);
+        }
+        insert_element(b, s, token);
+        return;
+    }
+    if tag == tagnames.tag_pre() || tag == tagnames.tag_listing() {
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        insert_element(b, s, token);
+        (*b).ignore_next_lf = true;
+        (*b).frameset_ok = false;
+        return;
+    }
+    if tag == tagnames.tag_form() {
+        if (*b).form != node.none() {
+            return;
+        }
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        (*b).form = insert_element(b, s, token);
+        return;
+    }
+    if tag == tagnames.tag_li() {
+        (*b).frameset_ok = false;
+        close_list_item(b);
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        insert_element(b, s, token);
+        return;
+    }
+    if tag == tagnames.tag_dd() || tag == tagnames.tag_dt() {
+        (*b).frameset_ok = false;
+        close_definition_item(b);
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        insert_element(b, s, token);
+        return;
+    }
+    if tag == tagnames.tag_plaintext() {
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        insert_element(b, s, token);
+        (*b).pending_text_state = TEXT_PLAINTEXT;
+        return;
+    }
+    if tag == tagnames.tag_button() {
+        if has_element_in_scope(b, tagnames.tag_button(), 0 as u32) {
+            generate_implied_end_tags(b, tagnames.tag_unknown());
+            pop_until_tag(b, tagnames.tag_button());
+        }
+        reconstruct_formatting(b);
+        insert_element(b, s, token);
+        (*b).frameset_ok = false;
+        return;
+    }
+    if tag == tagnames.tag_a() {
+        let existing: u64 = formatting_lookup(b, tagnames.tag_a());
+        if existing != node.none() {
+            adoption_agency(b, tagnames.tag_a());
+            remove_from_formatting(b, existing);
+            remove_from_open(b, existing);
+        }
+        reconstruct_formatting(b);
+        push_formatting(b, insert_element(b, s, token));
+        return;
+    }
+    if is_formatting_tag(tag) {
+        if tag == tagnames.tag_nobr()
+            && has_element_in_scope(b, tagnames.tag_nobr(), 0 as u32) {
+            adoption_agency(b, tagnames.tag_nobr());
+            reconstruct_formatting(b);
+        }
+        reconstruct_formatting(b);
+        push_formatting(b, insert_element(b, s, token));
+        return;
+    }
+    if tag == tagnames.tag_applet() || tag == tagnames.tag_marquee()
+        || tag == tagnames.tag_object() {
+        reconstruct_formatting(b);
+        insert_element(b, s, token);
+        push_formatting_marker(b);
+        (*b).frameset_ok = false;
+        return;
+    }
+    if tag == tagnames.tag_br() || tag == tagnames.tag_embed()
+        || tag == tagnames.tag_img() || tag == tagnames.tag_keygen()
+        || tag == tagnames.tag_wbr() || tag == tagnames.tag_area() {
+        reconstruct_formatting(b);
+        insert_void_element(b, s, token);
+        (*b).frameset_ok = false;
+        return;
+    }
+    if tag == tagnames.tag_input() {
+        reconstruct_formatting(b);
+        insert_void_element(b, s, token);
+        // A hidden input leaves frameset-ok alone; every other type clears it.
+        if !attr_value_is(b, s, token, "type", "hidden") {
+            (*b).frameset_ok = false;
+        }
+        return;
+    }
+    if tag == tagnames.tag_param() || tag == tagnames.tag_source()
+        || tag == tagnames.tag_track() {
+        insert_void_element(b, s, token);
+        return;
+    }
+    if tag == tagnames.tag_hr() {
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        insert_void_element(b, s, token);
+        (*b).frameset_ok = false;
+        return;
+    }
+    if tag == tagnames.tag_textarea() {
+        insert_element(b, s, token);
+        (*b).ignore_next_lf = true;
+        (*b).frameset_ok = false;
+        (*b).pending_text_state = TEXT_RCDATA;
+        (*b).original_mode = (*b).mode;
+        (*b).mode = MODE_TEXT;
+        return;
+    }
+    if tag == tagnames.tag_xmp() {
+        if has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        reconstruct_formatting(b);
+        (*b).frameset_ok = false;
+        parse_text_element(b, s, token, TEXT_RAWTEXT);
+        return;
+    }
+    if tag == tagnames.tag_iframe() {
+        (*b).frameset_ok = false;
+        parse_text_element(b, s, token, TEXT_RAWTEXT);
+        return;
+    }
+    if tag == tagnames.tag_noembed() {
+        parse_text_element(b, s, token, TEXT_RAWTEXT);
+        return;
+    }
+    if tag == tagnames.tag_image() {
+        // The spec's one deliberate typo fix: <image> is treated as <img>.
+        reconstruct_formatting(b);
+        let element: u64 =
+            node.create_element((*b).doc, view_of("img"), node.ns_html());
+        copy_attributes(b, s, token, element);
+        node.append_child((*b).doc, insertion_parent(b), element);
+        (*b).frameset_ok = false;
+        return;
+    }
+    if tag == tagnames.tag_rb() || tag == tagnames.tag_rtc() {
+        if has_element_in_scope(b, tagnames.tag_ruby(), 0 as u32) {
+            generate_implied_end_tags(b, tagnames.tag_unknown());
+        }
+        insert_element(b, s, token);
+        return;
+    }
+    if tag == tagnames.tag_rp() || tag == tagnames.tag_rt() {
+        if has_element_in_scope(b, tagnames.tag_ruby(), 0 as u32) {
+            generate_implied_end_tags(b, tagnames.tag_rtc());
+        }
+        insert_element(b, s, token);
+        return;
+    }
+    if tag == tagnames.tag_caption() || tag == tagnames.tag_col()
+        || tag == tagnames.tag_colgroup() || tag == tagnames.tag_frame()
+        || tag == tagnames.tag_head() || tag == tagnames.tag_tbody()
+        || tag == tagnames.tag_td() || tag == tagnames.tag_tfoot()
+        || tag == tagnames.tag_th() || tag == tagnames.tag_thead()
+        || tag == tagnames.tag_tr() {
+        // Parse error in "in body": the token is ignored.
+        return;
+    }
+    reconstruct_formatting(b);
+    insert_element(b, s, token);
+}
+
+// The metadata start tags "in head" handles, shared with "in body".
+fn in_head_start_tag(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    tag: u32
+) -> void {
+    if tag == tagnames.tag_title() {
+        parse_text_element(b, s, token, TEXT_RCDATA);
+        return;
+    }
+    if tag == tagnames.tag_noframes() || tag == tagnames.tag_style()
+        || tag == tagnames.tag_script() {
+        parse_text_element(b, s, token, TEXT_RAWTEXT);
+        return;
+    }
+    insert_void_element(b, s, token);
+}
+
+fn in_body_end_tag(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    index: u64
+) -> void {
+    let tag: u32 = token_tag(b, s, token);
+
+    if tag == tagnames.tag_body() || tag == tagnames.tag_html() {
+        if !has_element_in_scope(b, tagnames.tag_body(), 0 as u32) {
+            return;
+        }
+        (*b).mode = MODE_AFTER_BODY;
+        if tag == tagnames.tag_html() {
+            mode_after_body(b, s, index);
+        }
+        return;
+    }
+    if tag == tagnames.tag_address() || tag == tagnames.tag_article()
+        || tag == tagnames.tag_aside() || tag == tagnames.tag_blockquote()
+        || tag == tagnames.tag_button() || tag == tagnames.tag_center()
+        || tag == tagnames.tag_details() || tag == tagnames.tag_dialog()
+        || tag == tagnames.tag_dir() || tag == tagnames.tag_div()
+        || tag == tagnames.tag_dl() || tag == tagnames.tag_fieldset()
+        || tag == tagnames.tag_figcaption() || tag == tagnames.tag_figure()
+        || tag == tagnames.tag_footer() || tag == tagnames.tag_header()
+        || tag == tagnames.tag_hgroup() || tag == tagnames.tag_listing()
+        || tag == tagnames.tag_main() || tag == tagnames.tag_menu()
+        || tag == tagnames.tag_nav() || tag == tagnames.tag_ol()
+        || tag == tagnames.tag_pre() || tag == tagnames.tag_search()
+        || tag == tagnames.tag_section() || tag == tagnames.tag_summary()
+        || tag == tagnames.tag_ul() {
+        if !has_element_in_scope(b, tag, 0 as u32) {
+            return;
+        }
+        generate_implied_end_tags(b, tagnames.tag_unknown());
+        pop_until_tag(b, tag);
+        return;
+    }
+    if tag == tagnames.tag_form() {
+        let form: u64 = (*b).form;
+        (*b).form = node.none();
+        if form == node.none() || index_in_open(b, form) >= depth(b) {
+            return;
+        }
+        generate_implied_end_tags(b, tagnames.tag_unknown());
+        remove_from_open(b, form);
+        return;
+    }
+    if tag == tagnames.tag_p() {
+        if !has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            // Recover by opening an empty <p> first, per the spec.
+            let element: u64 =
+                node.create_element((*b).doc, view_of("p"), node.ns_html());
+            node.append_child((*b).doc, insertion_parent(b), element);
+            push_open(b, element);
+        }
+        close_p_element(b);
+        return;
+    }
+    if tag == tagnames.tag_li() {
+        if !has_element_in_scope(b, tagnames.tag_li(), 1 as u32) {
+            return;
+        }
+        generate_implied_end_tags(b, tagnames.tag_li());
+        pop_until_tag(b, tagnames.tag_li());
+        return;
+    }
+    if tag == tagnames.tag_dd() || tag == tagnames.tag_dt() {
+        if !has_element_in_scope(b, tag, 0 as u32) {
+            return;
+        }
+        generate_implied_end_tags(b, tag);
+        pop_until_tag(b, tag);
+        return;
+    }
+    if is_heading(tag) {
+        if !has_heading_in_scope(b) {
+            return;
+        }
+        generate_implied_end_tags(b, tagnames.tag_unknown());
+        loop {
+            let popped: u64 = pop_open(b);
+            if popped == node.none() || is_heading(tag_of(b, popped)) {
+                break;
+            }
+        }
+        return;
+    }
+    if is_formatting_tag(tag) {
+        if adoption_agency(b, tag) {
+            any_other_end_tag(b, tag);
+        }
+        return;
+    }
+    if tag == tagnames.tag_applet() || tag == tagnames.tag_marquee()
+        || tag == tagnames.tag_object() {
+        if !has_element_in_scope(b, tag, 0 as u32) {
+            return;
+        }
+        generate_implied_end_tags(b, tagnames.tag_unknown());
+        pop_until_tag(b, tag);
+        clear_formatting_to_marker(b);
+        return;
+    }
+    if tag == tagnames.tag_br() {
+        // A </br> is treated as if it were <br>.
+        reconstruct_formatting(b);
+        let element: u64 =
+            node.create_element((*b).doc, view_of("br"), node.ns_html());
+        node.append_child((*b).doc, insertion_parent(b), element);
+        (*b).frameset_ok = false;
+        return;
+    }
+    any_other_end_tag(b, tag);
+}
+
+// §13.2.6.4.7 "any other end tag".
+fn any_other_end_tag(b: *HtmlTreeBuilder, tag: u32) -> void {
+    let index: u64 = depth(b);
+    while index > 0 {
+        index = index - 1;
+        let element: u64 = at(b, index);
+        if is_html_element(b, element, tag) {
+            generate_implied_end_tags(b, tag);
+            while depth(b) > index {
+                pop_open(b);
+            }
+            return;
+        }
+        if is_special(tag_of(b, element)) {
+            return;
+        }
+    }
+}
+
+// The <li> start tag's "close any open list item" step.
+fn close_list_item(b: *HtmlTreeBuilder) -> void {
+    let index: u64 = depth(b);
+    while index > 0 {
+        index = index - 1;
+        let element_tag: u32 = tag_of(b, at(b, index));
+        if element_tag == tagnames.tag_li() {
+            generate_implied_end_tags(b, tagnames.tag_li());
+            pop_until_tag(b, tagnames.tag_li());
+            return;
+        }
+        if is_special(element_tag) && element_tag != tagnames.tag_address()
+            && element_tag != tagnames.tag_div()
+            && element_tag != tagnames.tag_p() {
+            return;
+        }
+    }
+}
+
+fn close_definition_item(b: *HtmlTreeBuilder) -> void {
+    let index: u64 = depth(b);
+    while index > 0 {
+        index = index - 1;
+        let element_tag: u32 = tag_of(b, at(b, index));
+        if element_tag == tagnames.tag_dd() || element_tag == tagnames.tag_dt() {
+            generate_implied_end_tags(b, element_tag);
+            pop_until_tag(b, element_tag);
+            return;
+        }
+        if is_special(element_tag) && element_tag != tagnames.tag_address()
+            && element_tag != tagnames.tag_div()
+            && element_tag != tagnames.tag_p() {
+            return;
+        }
+    }
+}
+
+fn merge_attributes(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    target: u64
+) -> void {
+    if target == node.none() {
+        return;
+    }
+    for index: u64 in 0..token.attr_count {
+        let attr: HtmlAttr = tokens.get_attr(s, token.attr_first + index);
+        let name: []const u8 = tokens.pool_bytes(s, attr.name_off, attr.name_len);
+        if !node.has_attr((*b).doc, target, name) {
+            node.add_attr((*b).doc, target, name,
+                tokens.pool_bytes(s, attr.value_off, attr.value_len));
+        }
+    }
+}
+
+fn copy_attributes(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    target: u64
+) -> void {
+    for index: u64 in 0..token.attr_count {
+        let attr: HtmlAttr = tokens.get_attr(s, token.attr_first + index);
+        node.add_attr((*b).doc, target,
+            tokens.pool_bytes(s, attr.name_off, attr.name_len),
+            tokens.pool_bytes(s, attr.value_off, attr.value_len));
+    }
+}
+
+fn attr_value_is(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    name: *u8,
+    value: *u8
+) -> bool {
+    for index: u64 in 0..token.attr_count {
+        let attr: HtmlAttr = tokens.get_attr(s, token.attr_first + index);
+        if view_equals_ci(tokens.pool_bytes(s, attr.name_off, attr.name_len), name) {
+            return view_equals_ci(
+                tokens.pool_bytes(s, attr.value_off, attr.value_len), value);
+        }
+    }
+    return false;
+}
+
+// §13.2.6.4.8
+fn mode_text(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let view: []const u8 = token_data(s, token);
+        if (*b).ignore_next_lf {
+            (*b).ignore_next_lf = false;
+            if len(view) > 0 && view[0] == 10 as u8 {
+                view = subview(view, 1);
+            }
+        }
+        insert_text(b, view);
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        pop_open(b);
+        (*b).mode = (*b).original_mode;
+        (*b).stopped = true;
+        return;
+    }
+    if token.kind == tokens.kind_end_tag() {
+        pop_open(b);
+        (*b).mode = (*b).original_mode;
+    }
+}
+
+// §13.2.6.4.19
+fn mode_after_body(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        if all_whitespace(token_data(s, token)) {
+            mode_in_body(b, s, index);
+            return;
+        }
+        (*b).mode = MODE_IN_BODY;
+        mode_in_body(b, s, index);
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, at(b, 0), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        (*b).stopped = true;
+        return;
+    }
+    if token.kind == tokens.kind_start_tag()
+        && token_tag(b, s, token) == tagnames.tag_html() {
+        mode_in_body(b, s, index);
+        return;
+    }
+    if token.kind == tokens.kind_end_tag()
+        && token_tag(b, s, token) == tagnames.tag_html() {
+        (*b).mode = MODE_AFTER_AFTER_BODY;
+        return;
+    }
+    (*b).mode = MODE_IN_BODY;
+    dispatch(b, s, index);
+}
+
+// §13.2.6.4.21
+fn mode_in_frameset(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let view: []const u8 = token_data(s, token);
+        insert_text(b, head_view(view, leading_ws(view)));
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        (*b).stopped = true;
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+        } else if tag == tagnames.tag_frameset() {
+            insert_element(b, s, token);
+        } else if tag == tagnames.tag_frame() {
+            insert_void_element(b, s, token);
+        } else if tag == tagnames.tag_noframes() {
+            parse_text_element(b, s, token, TEXT_RAWTEXT);
+        }
+        return;
+    }
+    if token.kind == tokens.kind_end_tag()
+        && token_tag(b, s, token) == tagnames.tag_frameset() {
+        if !is_html_element(b, current(b), tagnames.tag_html()) {
+            pop_open(b);
+        }
+        if !is_html_element(b, current(b), tagnames.tag_frameset()) {
+            (*b).mode = MODE_AFTER_FRAMESET;
+        }
+    }
+}
+
+// §13.2.6.4.22
+fn mode_after_frameset(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let view: []const u8 = token_data(s, token);
+        insert_text(b, head_view(view, leading_ws(view)));
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        (*b).stopped = true;
+        return;
+    }
+    if token.kind == tokens.kind_end_tag()
+        && token_tag(b, s, token) == tagnames.tag_html() {
+        (*b).mode = MODE_AFTER_AFTER_FRAMESET;
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+        } else if tag == tagnames.tag_noframes() {
+            parse_text_element(b, s, token, TEXT_RAWTEXT);
+        }
+    }
+}
+
+// §13.2.6.4.20
+fn mode_after_after_body(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    index: u64
+) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, 0, token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        (*b).stopped = true;
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        mode_in_body(b, s, index);
+        return;
+    }
+    if token.kind == tokens.kind_chars() && all_whitespace(token_data(s, token)) {
+        mode_in_body(b, s, index);
+        return;
+    }
+    if token.kind == tokens.kind_start_tag()
+        && token_tag(b, s, token) == tagnames.tag_html() {
+        mode_in_body(b, s, index);
+        return;
+    }
+    (*b).mode = MODE_IN_BODY;
+    dispatch(b, s, index);
+}
+
+// §13.2.6.4.23
+fn mode_after_after_frameset(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    index: u64
+) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, 0, token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        (*b).stopped = true;
+        return;
+    }
+    if token.kind == tokens.kind_chars() && all_whitespace(token_data(s, token)) {
+        mode_in_body(b, s, index);
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+        } else if tag == tagnames.tag_noframes() {
+            parse_text_element(b, s, token, TEXT_RAWTEXT);
+        }
+    }
+}
+
+// --- Driver ------------------------------------------------------------------
+
+// Parse a preprocessed character stream into `doc`. Tokens and parse errors
+// accumulate in `sink`, which the caller owns; the tokenizer is driven one
+// token at a time so the tree builder can switch it into a text state before
+// the next character is read.
+pub fn parse(
+    source: *const u8,
+    length: u64,
+    doc: *DomDocument,
+    s: *HtmlTokenSink
+) -> void {
+    let t: HtmlTokenizer = tokenizer.new(source, length);
+    let b: HtmlTreeBuilder = new(doc);
+    let next: u64 = 0;
+    loop {
+        while next < tokens.token_count(s) {
+            process(&b, s, next, &t);
+            next = next + 1;
+        }
+        if tokenizer.done(&t) {
+            break;
+        }
+        tokenizer.pump(&t, s);
+    }
+    destroy(&b);
+}

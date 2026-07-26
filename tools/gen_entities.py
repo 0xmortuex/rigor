@@ -9,12 +9,12 @@ with --download, then re-run to regenerate.
 The emitted Mort module stores the table as parallel scalar globals, because
 Mort allows global arrays of scalars but not of structs:
 
-    NAMES     one string literal holding every entity name, concatenated,
+    ENTITY_NAMES     one string literal holding every entity name, concatenated,
               in lexicographic order (names include their trailing ';' when
               they have one; the leading '&' is not stored)
-    OFF/LEN   where each name sits in NAMES
-    CP1/CP2   the code points it expands to (CP2 == 0 when there is only one)
-    FIRST_LO/FIRST_HI/FIRST_MAXLEN
+    ENTITY_OFF/ENTITY_LEN   where each name sits in ENTITY_NAMES
+    ENTITY_CP1/ENTITY_CP2   the code points it expands to (ENTITY_CP2 == 0 when there is only one)
+    ENTITY_FIRST_LO/ENTITY_FIRST_HI/ENTITY_FIRST_MAXLEN
               per first byte: the index range of names starting with that
               byte, and the longest such name
 
@@ -114,7 +114,7 @@ def emit(entries):
 // {two_cp} of which expand to two code points).
 //
 // The table is parallel scalar globals rather than an array of structs,
-// because Mort permits global arrays of scalars only. NAMES holds every name
+// because Mort permits global arrays of scalars only. ENTITY_NAMES holds every name
 // concatenated in lexicographic order, without the leading '&' and with the
 // trailing ';' where the name has one.
 module engine.html.entities;
@@ -133,35 +133,35 @@ struct HtmlEntityMatch {{
 const ENTITY_COUNT: u64 = {count};
 const ENTITY_LONGEST: u64 = {longest};
 
-let NAMES: *u8 = "{blob}";
+let ENTITY_NAMES: *u8 = "{blob}";
 
-let OFF: [u32; {count}] = [
+let ENTITY_OFF: [u32; {count}] = [
 {rows(offsets, 16)}
 ];
 
-let LEN: [u8; {count}] = [
+let ENTITY_LEN: [u8; {count}] = [
 {rows([len(name) for name, _ in entries], 32)}
 ];
 
-let CP1: [u32; {count}] = [
+let ENTITY_CP1: [u32; {count}] = [
 {rows([points[0] for _, points in entries], 12, hex4)}
 ];
 
-let CP2: [u32; {count}] = [
+let ENTITY_CP2: [u32; {count}] = [
 {rows([points[1] if len(points) == 2 else 0 for _, points in entries], 12, hex4)}
 ];
 
 // Index range of names beginning with each ASCII byte, and the longest such
 // name — lookup only ever searches one first-byte bucket.
-let FIRST_LO: [u32; 128] = [
+let ENTITY_FIRST_LO: [u32; 128] = [
 {rows(first_lo, 16)}
 ];
 
-let FIRST_HI: [u32; 128] = [
+let ENTITY_FIRST_HI: [u32; 128] = [
 {rows(first_hi, 16)}
 ];
 
-let FIRST_MAXLEN: [u8; 128] = [
+let ENTITY_FIRST_MAXLEN: [u8; 128] = [
 {rows(first_maxlen, 32)}
 ];
 
@@ -169,14 +169,14 @@ let FIRST_MAXLEN: [u8; 128] = [
 // negative when the entry sorts first, positive when it sorts after, zero on
 // an exact match.
 fn compare(index: u64, input: *const u8, pos: u64, length: u64) -> i64 {{
-    let off: u64 = OFF[index] as u64;
-    let name_len: u64 = LEN[index] as u64;
+    let off: u64 = ENTITY_OFF[index] as u64;
+    let name_len: u64 = ENTITY_LEN[index] as u64;
     let shared: u64 = name_len;
     if length < shared {{
         shared = length;
     }}
     for step: u64 in 0..shared {{
-        let a: u8 = NAMES[off + step];
+        let a: u8 = ENTITY_NAMES[off + step];
         let b: u8 = input[pos + step];
         if a < b {{
             return -1;
@@ -232,13 +232,13 @@ pub fn lookup(input: *const u8, length: u64, pos: u64) -> HtmlEntityMatch {{
     if first >= 128 as u8 {{
         return miss;
     }}
-    let lo: u64 = FIRST_LO[first as u64] as u64;
-    let hi: u64 = FIRST_HI[first as u64] as u64;
+    let lo: u64 = ENTITY_FIRST_LO[first as u64] as u64;
+    let hi: u64 = ENTITY_FIRST_HI[first as u64] as u64;
     if lo >= hi {{
         return miss;
     }}
     let available: u64 = length - pos;
-    let longest: u64 = FIRST_MAXLEN[first as u64] as u64;
+    let longest: u64 = ENTITY_FIRST_MAXLEN[first as u64] as u64;
     if available < longest {{
         longest = available;
     }}
@@ -248,9 +248,9 @@ pub fn lookup(input: *const u8, length: u64, pos: u64) -> HtmlEntityMatch {{
         if found < ENTITY_COUNT {{
             return HtmlEntityMatch {{
                 len: size,
-                cp1: CP1[found],
-                cp2: CP2[found],
-                semicolon: NAMES[(OFF[found] as u64) + size - 1] == ';',
+                cp1: ENTITY_CP1[found],
+                cp2: ENTITY_CP2[found],
+                semicolon: ENTITY_NAMES[(ENTITY_OFF[found] as u64) + size - 1] == ';',
             }};
         }}
         size = size - 1;

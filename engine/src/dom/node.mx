@@ -1,0 +1,365 @@
+// The DOM tree, as a flat arena.
+//
+// Nodes are plain-data records in one Vec<DomNode>, attributes in one
+// Vec<DomAttr>, and every string (tag names, text, comment data, doctype
+// identifiers, attribute names and values) lives in a shared byte pool
+// addressed by (offset, length). Parents, children and siblings are node
+// indices, not pointers, so the arena can grow during parsing without
+// invalidating anything, and the whole tree moves and destroys as one value
+// inside Mort's ownership model.
+//
+// Index 0 is always the Document node, which is never anyone's child or
+// sibling. That makes 0 a natural "no node" sentinel for parent, sibling and
+// child links — see none().
+module engine.dom.node;
+
+import std.vec;
+import engine.html.tagnames;
+
+// Node kinds, following the DOM standard's nodeType numbering.
+pub fn kind_element() -> u8 { return 1 as u8; }
+pub fn kind_text() -> u8 { return 3 as u8; }
+pub fn kind_comment() -> u8 { return 8 as u8; }
+pub fn kind_document() -> u8 { return 9 as u8; }
+pub fn kind_doctype() -> u8 { return 10 as u8; }
+
+// Element namespaces (§13.2.6 foreign content).
+pub fn ns_html() -> u8 { return 0 as u8; }
+pub fn ns_svg() -> u8 { return 1 as u8; }
+pub fn ns_mathml() -> u8 { return 2 as u8; }
+
+// The "no node" index. Index 0 is the Document, which can never appear as a
+// child, sibling or parent, so 0 is unambiguous.
+pub fn none() -> u64 { return 0; }
+
+struct DomAttr {
+    name_off: u64,
+    name_len: u64,
+    value_off: u64,
+    value_len: u64,
+}
+
+struct DomNode {
+    kind: u8,
+    namespace: u8,
+    // Elements: interned tag id (tagnames.tag_unknown() when the name is not
+    // one the spec names). Other kinds: unused.
+    tag: u32,
+    // Elements and doctypes: the name. Other kinds: unused.
+    name_off: u64,
+    name_len: u64,
+    // Text and comments: the data. Doctypes: the public identifier.
+    data_off: u64,
+    data_len: u64,
+    // Doctypes: the system identifier.
+    extra_off: u64,
+    extra_len: u64,
+    has_public: bool,
+    has_system: bool,
+    parent: u64,
+    first_child: u64,
+    last_child: u64,
+    prev_sibling: u64,
+    next_sibling: u64,
+    attr_first: u64,
+    attr_count: u64,
+}
+
+resource struct DomDocument {
+    nodes: Vec<DomNode>,
+    attrs: Vec<DomAttr>,
+    pool: Vec<u8>,
+    quirks: bool,
+}
+
+fn empty_node(kind: u8) -> DomNode {
+    return DomNode {
+        kind: kind,
+        namespace: 0 as u8,
+        tag: 0 as u32,
+        name_off: 0, name_len: 0,
+        data_off: 0, data_len: 0,
+        extra_off: 0, extra_len: 0,
+        has_public: false, has_system: false,
+        parent: 0, first_child: 0, last_child: 0,
+        prev_sibling: 0, next_sibling: 0,
+        attr_first: 0, attr_count: 0,
+    };
+}
+
+// A fresh document: node 0 is the Document itself.
+pub fn new_document() -> DomDocument {
+    let doc: DomDocument = DomDocument {
+        nodes: vec.new<DomNode>(),
+        attrs: vec.new<DomAttr>(),
+        pool: vec.new<u8>(),
+        quirks: false,
+    };
+    vec.push(&doc.nodes, empty_node(kind_document()));
+    return move doc;
+}
+
+pub fn destroy(doc: *DomDocument) -> void {
+    vec.destroy(&(*doc).nodes);
+    vec.destroy(&(*doc).attrs);
+    vec.destroy(&(*doc).pool);
+    (*doc).quirks = false;
+}
+
+pub fn node_count(doc: *DomDocument) -> u64 {
+    return (*doc).nodes.length;
+}
+
+pub fn get(doc: *DomDocument, index: u64) -> DomNode {
+    match vec.get(&(*doc).nodes, index) {
+        Option<DomNode>.Some(node) => { return node; },
+        Option<DomNode>.None => { return empty_node(0 as u8); },
+    }
+}
+
+pub fn set(doc: *DomDocument, index: u64, node: DomNode) -> void {
+    vec.set(&(*doc).nodes, index, node);
+}
+
+pub fn get_attr(doc: *DomDocument, index: u64) -> DomAttr {
+    match vec.get(&(*doc).attrs, index) {
+        Option<DomAttr>.Some(attr) => { return attr; },
+        Option<DomAttr>.None => {
+            return DomAttr { name_off: 0, name_len: 0, value_off: 0, value_len: 0 };
+        },
+    }
+}
+
+pub fn bytes(doc: *DomDocument, offset: u64, length: u64) -> []const u8 {
+    let base: *const u8 = (*doc).pool.data as *const u8;
+    return slice((&base[offset]) as *const u8, length);
+}
+
+// Copy `view` into the pool and return its offset. Callers pair this with
+// len(view) to form a (offset, length) span.
+pub fn intern(doc: *DomDocument, view: []const u8) -> u64 {
+    let offset: u64 = (*doc).pool.length;
+    for index: u64 in 0..len(view) {
+        vec.push(&(*doc).pool, view[index]);
+    }
+    return offset;
+}
+
+pub fn set_quirks(doc: *DomDocument, quirks: bool) -> void {
+    (*doc).quirks = quirks;
+}
+
+pub fn is_quirks(doc: *DomDocument) -> bool {
+    return (*doc).quirks;
+}
+
+// --- Construction -----------------------------------------------------------
+
+pub fn create_element(doc: *DomDocument, name: []const u8, namespace: u8) -> u64 {
+    let node: DomNode = empty_node(kind_element());
+    node.namespace = namespace;
+    node.name_off = intern(doc, name);
+    node.name_len = len(name);
+    node.tag = tagnames.lookup(bytes(doc, node.name_off, node.name_len));
+    let index: u64 = (*doc).nodes.length;
+    vec.push(&(*doc).nodes, node);
+    return index;
+}
+
+pub fn create_text(doc: *DomDocument, data: []const u8) -> u64 {
+    let node: DomNode = empty_node(kind_text());
+    node.data_off = intern(doc, data);
+    node.data_len = len(data);
+    let index: u64 = (*doc).nodes.length;
+    vec.push(&(*doc).nodes, node);
+    return index;
+}
+
+pub fn create_comment(doc: *DomDocument, data: []const u8) -> u64 {
+    let node: DomNode = empty_node(kind_comment());
+    node.data_off = intern(doc, data);
+    node.data_len = len(data);
+    let index: u64 = (*doc).nodes.length;
+    vec.push(&(*doc).nodes, node);
+    return index;
+}
+
+pub fn create_doctype(
+    doc: *DomDocument,
+    name: []const u8,
+    public_id: []const u8,
+    has_public: bool,
+    system_id: []const u8,
+    has_system: bool
+) -> u64 {
+    let node: DomNode = empty_node(kind_doctype());
+    node.name_off = intern(doc, name);
+    node.name_len = len(name);
+    node.data_off = intern(doc, public_id);
+    node.data_len = len(public_id);
+    node.has_public = has_public;
+    node.extra_off = intern(doc, system_id);
+    node.extra_len = len(system_id);
+    node.has_system = has_system;
+    let index: u64 = (*doc).nodes.length;
+    vec.push(&(*doc).nodes, node);
+    return index;
+}
+
+// Attributes are appended to an element immediately after it is created, so
+// each element's attributes stay contiguous in the attribute arena.
+pub fn add_attr(
+    doc: *DomDocument,
+    element: u64,
+    name: []const u8,
+    value: []const u8
+) -> void {
+    let node: DomNode = get(doc, element);
+    if node.attr_count == 0 {
+        node.attr_first = (*doc).attrs.length;
+    }
+    let name_off: u64 = intern(doc, name);
+    let value_off: u64 = intern(doc, value);
+    vec.push(&(*doc).attrs, DomAttr {
+        name_off: name_off, name_len: len(name),
+        value_off: value_off, value_len: len(value),
+    });
+    node.attr_count = node.attr_count + 1;
+    set(doc, element, node);
+}
+
+// Does `element` already carry an attribute named `name`? Used by the tree
+// builder when merging attributes onto an existing <html> or <body>.
+pub fn has_attr(doc: *DomDocument, element: u64, name: []const u8) -> bool {
+    let node: DomNode = get(doc, element);
+    for index: u64 in 0..node.attr_count {
+        let attr: DomAttr = get_attr(doc, node.attr_first + index);
+        if attr.name_len == len(name) {
+            let existing: []const u8 = bytes(doc, attr.name_off, attr.name_len);
+            let same: bool = true;
+            for step: u64 in 0..attr.name_len {
+                if existing[step] != name[step] {
+                    same = false;
+                }
+            }
+            if same {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// --- Tree mutation ----------------------------------------------------------
+
+pub fn append_child(doc: *DomDocument, parent: u64, child: u64) -> void {
+    let child_node: DomNode = get(doc, child);
+    child_node.parent = parent;
+    child_node.next_sibling = none();
+    let parent_node: DomNode = get(doc, parent);
+    if parent_node.last_child == none() {
+        child_node.prev_sibling = none();
+        parent_node.first_child = child;
+    } else {
+        child_node.prev_sibling = parent_node.last_child;
+        let previous: DomNode = get(doc, parent_node.last_child);
+        previous.next_sibling = child;
+        set(doc, parent_node.last_child, previous);
+    }
+    parent_node.last_child = child;
+    set(doc, child, child_node);
+    set(doc, parent, parent_node);
+}
+
+// Insert `child` immediately before `sibling` in sibling's parent.
+pub fn insert_before(doc: *DomDocument, sibling: u64, child: u64) -> void {
+    let sibling_node: DomNode = get(doc, sibling);
+    let parent: u64 = sibling_node.parent;
+    if parent == none() {
+        return;
+    }
+    let child_node: DomNode = get(doc, child);
+    child_node.parent = parent;
+    child_node.next_sibling = sibling;
+    child_node.prev_sibling = sibling_node.prev_sibling;
+    if sibling_node.prev_sibling == none() {
+        let parent_node: DomNode = get(doc, parent);
+        parent_node.first_child = child;
+        set(doc, parent, parent_node);
+    } else {
+        let previous: DomNode = get(doc, sibling_node.prev_sibling);
+        previous.next_sibling = child;
+        set(doc, sibling_node.prev_sibling, previous);
+    }
+    sibling_node.prev_sibling = child;
+    set(doc, sibling, sibling_node);
+    set(doc, child, child_node);
+}
+
+// Detach `child` from its parent, leaving it parentless but intact.
+pub fn remove(doc: *DomDocument, child: u64) -> void {
+    let child_node: DomNode = get(doc, child);
+    let parent: u64 = child_node.parent;
+    if parent == none() {
+        return;
+    }
+    let parent_node: DomNode = get(doc, parent);
+    if child_node.prev_sibling == none() {
+        parent_node.first_child = child_node.next_sibling;
+    } else {
+        let previous: DomNode = get(doc, child_node.prev_sibling);
+        previous.next_sibling = child_node.next_sibling;
+        set(doc, child_node.prev_sibling, previous);
+    }
+    if child_node.next_sibling == none() {
+        parent_node.last_child = child_node.prev_sibling;
+    } else {
+        let following: DomNode = get(doc, child_node.next_sibling);
+        following.prev_sibling = child_node.prev_sibling;
+        set(doc, child_node.next_sibling, following);
+    }
+    set(doc, parent, parent_node);
+    child_node.parent = none();
+    child_node.prev_sibling = none();
+    child_node.next_sibling = none();
+    set(doc, child, child_node);
+}
+
+// Move every child of `from` onto the end of `to`, preserving order. Used by
+// the adoption agency algorithm (§13.2.6.4.7).
+pub fn move_children(doc: *DomDocument, from: u64, to: u64) -> void {
+    loop {
+        let source: DomNode = get(doc, from);
+        if source.first_child == none() {
+            break;
+        }
+        let child: u64 = source.first_child;
+        remove(doc, child);
+        append_child(doc, to, child);
+    }
+}
+
+// Append `data` to a text node's contents, keeping adjacent character data in
+// a single text node as the DOM requires.
+//
+// The fast path is the common one: the node's data is still the most recent
+// thing in the pool, so the new bytes simply extend it. Otherwise the node's
+// data is re-interned at the pool's end with the new bytes appended — the old
+// copy is left behind as dead space, which is the price of an append-only
+// pool and is bounded by how often text is interrupted mid-node.
+pub fn extend_text(doc: *DomDocument, text: u64, data: []const u8) -> void {
+    let node: DomNode = get(doc, text);
+    if node.data_off + node.data_len != (*doc).pool.length {
+        let moved: u64 = (*doc).pool.length;
+        for index: u64 in 0..node.data_len {
+            let byte: u8 = (*doc).pool.data[node.data_off + index];
+            vec.push(&(*doc).pool, byte);
+        }
+        node.data_off = moved;
+    }
+    for index: u64 in 0..len(data) {
+        vec.push(&(*doc).pool, data[index]);
+    }
+    node.data_len = node.data_len + len(data);
+    set(doc, text, node);
+}

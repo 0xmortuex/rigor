@@ -31,7 +31,11 @@ from Mort's own `std.json` and it is load-bearing twice over:
    growing an arena never invalidates a reference.
 
 The tokenizer's output (`HtmlTokenSink`) is the first instance: tokens,
-attributes, parse errors, and one byte pool. The DOM will be the second.
+attributes, parse errors, and one byte pool. The DOM (`DomDocument`) is the
+second: nodes, attributes, and a byte pool, with parents, children and
+siblings as node indices. Index 0 is always the Document, which is never
+anyone's child or sibling — so 0 doubles as the "no node" sentinel and no
+separate null value is needed.
 
 String pieces accumulate **append-only at the pool's end**, so a maximal text
 run stays one contiguous span even when character references are decoded into
@@ -50,13 +54,31 @@ reach the pool.
   input is assumed UTF-8 (charset sniffing is a future stage); script-data
   and CDATA states await tree construction.
 
+## Interned tag names
+
+`engine/src/html/tagnames.mx` (generated) gives every tag name the spec
+mentions a small integer id. Tree construction compares tag names on nearly
+every token and tests membership in long spec lists — "if the tag name is one
+of: address, article, aside, …" — and doing that with byte comparisons would
+be both slow and unreadable. Names the spec never mentions intern to
+`tag_unknown()`, which is correct: an unknown element is just an ordinary
+element to the parser.
+
 ## Mort-specific conventions
 
 - **Type names are globally scoped in Mort** (only functions live in module
   namespaces), so every engine type carries a domain prefix: `HtmlToken`,
-  `HtmlAttr`, `HtmlTokenizer`, later `DomNode`, `CssToken`, …
-- **Globals are file-scope.** Cross-module constants are exposed as functions
-  (`tokens.kind_start_tag()`, `tokens.err_eof_in_tag()`).
+  `HtmlAttr`, `HtmlTokenizer`, `DomNode`, `DomDocument`, later `CssToken`, …
+- **Globals share one namespace too**, which is why the generated tables use
+  `ENTITY_NAMES` / `TAG_NAMES` rather than a bare `NAMES` each.
+- **Globals may not be arrays of structs**, only of scalars, so generated
+  tables are parallel scalar arrays.
+- **Cross-module constants are exposed as functions**
+  (`tokens.kind_start_tag()`, `tagnames.tag_p()`), since globals are
+  file-scope for reads.
+- **Imports resolve relative to the importing file** with no `..`, so a module
+  in `src/dom/` reaches one in `src/html/` through the package alias
+  (`import engine.html.tagnames;`).
 - The engine is a Mort **path dependency** (`engine = "engine"` in the root
   manifest); the CLI and the tests import it as `engine.html.…` exactly the
   way any embedder would.
