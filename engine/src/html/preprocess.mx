@@ -1,0 +1,43 @@
+// Input stream preprocessing — WHATWG HTML §13.2.3.5.
+//
+// Before tokenization, U+000D U+000A (CRLF) pairs and any remaining lone
+// U+000D (CR) are normalized to a single U+000A (LF). The tokenizer then
+// never sees a raw CR, exactly as the specification requires.
+//
+// Byte-encoding note: rigor tokenizes UTF-8 bytes directly. Every character
+// the state machine dispatches on is ASCII, so multi-byte sequences flow
+// through text, names, and attribute values untouched. Charset sniffing and
+// decoding of non-UTF-8 documents (§13.2.3) is a later, separate stage.
+module engine.html.preprocess;
+
+import std.vec;
+
+// Copy `length` bytes from `input` into a fresh owned buffer with newlines
+// normalized. The caller owns the returned Vec.
+pub fn normalize(input: *const u8, length: u64) -> Vec<u8> {
+    let out: Vec<u8> = vec.with_capacity<u8>(length + 1);
+    let pos: u64 = 0;
+    // A leading UTF-8 byte order mark belongs to the byte stream decoder
+    // (§13.2.3.5); the tokenizer must never see it.
+    if length >= 3
+        && input[0] == 0xEF as u8
+        && input[1] == 0xBB as u8
+        && input[2] == 0xBF as u8 {
+        pos = 3;
+    }
+    while pos < length {
+        let c: u8 = input[pos];
+        if c == 13 as u8 {
+            vec.push(&out, 10 as u8);
+            if pos + 1 < length && input[pos + 1] == 10 as u8 {
+                pos = pos + 2;
+            } else {
+                pos = pos + 1;
+            }
+        } else {
+            vec.push(&out, c);
+            pos = pos + 1;
+        }
+    }
+    return move out;
+}

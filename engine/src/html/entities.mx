@@ -1,0 +1,124 @@
+// Named character references — WHATWG HTML §13.2.5.73 and the named character
+// references table (https://html.spec.whatwg.org/entities.json).
+//
+// This file currently carries a hand-written core subset: the five XML
+// predefined entities, the legacy no-semicolon Latin-1 forms, and the
+// punctuation names common in real pages. The full 2231-entry table is
+// mechanically generated from entities.json by tools/gen_entities.py and will
+// replace the body of lookup() while keeping this exact interface.
+module engine.html.entities;
+
+// A table match. len == 0 means no entity name matched. `semicolon` reports
+// whether the matched name is terminated by ';' (the legacy names are not).
+// cp2 is 0 when the entity maps to a single code point; no code point 0 ever
+// appears in the table, so 0 is a safe sentinel.
+struct HtmlEntityMatch {
+    len: u64,
+    cp1: u32,
+    cp2: u32,
+    semicolon: bool,
+}
+
+fn no_match() -> HtmlEntityMatch {
+    return HtmlEntityMatch { len: 0, cp1: 0 as u32, cp2: 0 as u32, semicolon: false };
+}
+
+fn cstr_len(text: *u8) -> u64 {
+    let n: u64 = 0;
+    while text[n] != 0 as u8 {
+        n = n + 1;
+    }
+    return n;
+}
+
+// Does `name` (a NUL-terminated entity name, ';' included when present) match
+// the input exactly at `pos`?
+fn matches(input: *const u8, length: u64, pos: u64, name: *u8) -> u64 {
+    let n: u64 = cstr_len(name);
+    if pos + n > length {
+        return 0;
+    }
+    for index: u64 in 0..n {
+        if input[pos + index] != name[index] {
+            return 0;
+        }
+    }
+    return n;
+}
+
+// Longest match of any table name against the input at `pos` (which sits just
+// after the '&'). Entity names are matched case-sensitively, per spec.
+pub fn lookup(input: *const u8, length: u64, pos: u64) -> HtmlEntityMatch {
+    let best: HtmlEntityMatch = no_match();
+    try_one(input, length, pos, "amp;", 0x26 as u32, &best);
+    try_one(input, length, pos, "amp", 0x26 as u32, &best);
+    try_one(input, length, pos, "lt;", 0x3C as u32, &best);
+    try_one(input, length, pos, "lt", 0x3C as u32, &best);
+    try_one(input, length, pos, "gt;", 0x3E as u32, &best);
+    try_one(input, length, pos, "gt", 0x3E as u32, &best);
+    try_one(input, length, pos, "quot;", 0x22 as u32, &best);
+    try_one(input, length, pos, "quot", 0x22 as u32, &best);
+    try_one(input, length, pos, "apos;", 0x27 as u32, &best);
+    try_one(input, length, pos, "nbsp;", 0xA0 as u32, &best);
+    try_one(input, length, pos, "nbsp", 0xA0 as u32, &best);
+    try_one(input, length, pos, "copy;", 0xA9 as u32, &best);
+    try_one(input, length, pos, "copy", 0xA9 as u32, &best);
+    try_one(input, length, pos, "reg;", 0xAE as u32, &best);
+    try_one(input, length, pos, "reg", 0xAE as u32, &best);
+    try_one(input, length, pos, "trade;", 0x2122 as u32, &best);
+    try_one(input, length, pos, "hellip;", 0x2026 as u32, &best);
+    try_one(input, length, pos, "mdash;", 0x2014 as u32, &best);
+    try_one(input, length, pos, "ndash;", 0x2013 as u32, &best);
+    try_one(input, length, pos, "lsquo;", 0x2018 as u32, &best);
+    try_one(input, length, pos, "rsquo;", 0x2019 as u32, &best);
+    try_one(input, length, pos, "ldquo;", 0x201C as u32, &best);
+    try_one(input, length, pos, "rdquo;", 0x201D as u32, &best);
+    try_one(input, length, pos, "bull;", 0x2022 as u32, &best);
+    try_one(input, length, pos, "middot;", 0xB7 as u32, &best);
+    try_one(input, length, pos, "sect;", 0xA7 as u32, &best);
+    try_one(input, length, pos, "para;", 0xB6 as u32, &best);
+    try_one(input, length, pos, "laquo;", 0xAB as u32, &best);
+    try_one(input, length, pos, "laquo", 0xAB as u32, &best);
+    try_one(input, length, pos, "raquo;", 0xBB as u32, &best);
+    try_one(input, length, pos, "raquo", 0xBB as u32, &best);
+    try_one(input, length, pos, "times;", 0xD7 as u32, &best);
+    try_one(input, length, pos, "times", 0xD7 as u32, &best);
+    try_one(input, length, pos, "divide;", 0xF7 as u32, &best);
+    try_one(input, length, pos, "divide", 0xF7 as u32, &best);
+    try_one(input, length, pos, "plusmn;", 0xB1 as u32, &best);
+    try_one(input, length, pos, "plusmn", 0xB1 as u32, &best);
+    try_one(input, length, pos, "deg;", 0xB0 as u32, &best);
+    try_one(input, length, pos, "deg", 0xB0 as u32, &best);
+    try_one(input, length, pos, "micro;", 0xB5 as u32, &best);
+    try_one(input, length, pos, "micro", 0xB5 as u32, &best);
+    try_one(input, length, pos, "shy;", 0xAD as u32, &best);
+    try_one(input, length, pos, "shy", 0xAD as u32, &best);
+    try_one(input, length, pos, "eacute;", 0xE9 as u32, &best);
+    try_one(input, length, pos, "eacute", 0xE9 as u32, &best);
+    try_one(input, length, pos, "egrave;", 0xE8 as u32, &best);
+    try_one(input, length, pos, "egrave", 0xE8 as u32, &best);
+    try_one(input, length, pos, "uuml;", 0xFC as u32, &best);
+    try_one(input, length, pos, "uuml", 0xFC as u32, &best);
+    try_one(input, length, pos, "ouml;", 0xF6 as u32, &best);
+    try_one(input, length, pos, "ouml", 0xF6 as u32, &best);
+    try_one(input, length, pos, "ccedil;", 0xE7 as u32, &best);
+    try_one(input, length, pos, "ccedil", 0xE7 as u32, &best);
+    return best;
+}
+
+fn try_one(
+    input: *const u8,
+    length: u64,
+    pos: u64,
+    name: *u8,
+    cp: u32,
+    best: *HtmlEntityMatch
+) -> void {
+    let n: u64 = matches(input, length, pos, name);
+    if n > (*best).len {
+        (*best).len = n;
+        (*best).cp1 = cp;
+        (*best).cp2 = 0 as u32;
+        (*best).semicolon = name[n - 1] == ';';
+    }
+}

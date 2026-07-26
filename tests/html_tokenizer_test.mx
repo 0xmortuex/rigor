@@ -1,0 +1,389 @@
+// Spec-behavior tests for the HTML tokenizer (WHATWG HTML §13.2.5).
+// Each test names the behavior it pins down; error expectations use the
+// spec's own parse error identifiers via tokens.err_*().
+
+import std.vec;
+import std.string;
+import engine.html.preprocess;
+import engine.html.tokenizer;
+import engine.html.tokens;
+
+fn tokenize_into(text: *u8, sink: *HtmlTokenSink) -> void {
+    let normalized: Vec<u8> = preprocess.normalize(text as *const u8, str_len(text));
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.run(&t, sink);
+}
+
+fn nth_kind(sink: *HtmlTokenSink, index: u64) -> u8 {
+    let token: HtmlToken = tokens.get_token(sink, index);
+    return token.kind;
+}
+
+fn data_is(sink: *HtmlTokenSink, index: u64, expected: *u8) -> bool {
+    let token: HtmlToken = tokens.get_token(sink, index);
+    let want: u64 = str_len(expected);
+    if token.data_len != want {
+        return false;
+    }
+    let got: []const u8 = tokens.pool_bytes(sink, token.data_off, token.data_len);
+    for i: u64 in 0..want {
+        if got[i] != expected[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn attr_is(
+sink: *HtmlTokenSink,
+token_index: u64,
+attr_index: u64,
+name: *u8,
+value: *u8
+) -> bool {
+    let token: HtmlToken = tokens.get_token(sink, token_index);
+    if attr_index >= token.attr_count {
+        return false;
+    }
+    let attr: HtmlAttr = tokens.get_attr(sink, token.attr_first + attr_index);
+    if attr.name_len != str_len(name) || attr.value_len != str_len(value) {
+        return false;
+    }
+    let got_name: []const u8 = tokens.pool_bytes(sink, attr.name_off, attr.name_len);
+    for i: u64 in 0..attr.name_len {
+        if got_name[i] != name[i] {
+            return false;
+        }
+    }
+    let got_value: []const u8 = tokens.pool_bytes(sink, attr.value_off, attr.value_len);
+    for j: u64 in 0..attr.value_len {
+        if got_value[j] != value[j] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn has_error(sink: *HtmlTokenSink, code: u32) -> bool {
+    for index: u64 in 0..tokens.error_count(sink) {
+        let e: HtmlParseError = tokens.get_error(sink, index);
+        if e.code == code {
+            return true;
+        }
+    }
+    return false;
+}
+
+test "plain text" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("hello", &sink);
+    assert(tokens.token_count(&sink) == 2);
+    assert(nth_kind(&sink, 0) == tokens.kind_chars());
+    assert(data_is(&sink, 0, "hello"));
+    assert(nth_kind(&sink, 1) == tokens.kind_eof());
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "simple element" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<p>x</p>", &sink);
+    assert(tokens.token_count(&sink) == 4);
+    assert(nth_kind(&sink, 0) == tokens.kind_start_tag());
+    assert(data_is(&sink, 0, "p"));
+    assert(nth_kind(&sink, 1) == tokens.kind_chars());
+    assert(data_is(&sink, 1, "x"));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    assert(data_is(&sink, 2, "p"));
+    assert(nth_kind(&sink, 3) == tokens.kind_eof());
+}
+
+test "attributes in all quoting styles" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<a href=\"/x\" title='t' data-k=v disabled>", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.kind == tokens.kind_start_tag());
+    assert(token.attr_count == 4);
+    assert(attr_is(&sink, 0, 0, "href", "/x"));
+    assert(attr_is(&sink, 0, 1, "title", "t"));
+    assert(attr_is(&sink, 0, 2, "data-k", "v"));
+    assert(attr_is(&sink, 0, 3, "disabled", ""));
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "tag and attribute names are lowercased" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<DiV ID=3>", &sink);
+    assert(data_is(&sink, 0, "div"));
+    assert(attr_is(&sink, 0, 0, "id", "3"));
+}
+
+test "self-closing flag" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<br/>", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.kind == tokens.kind_start_tag());
+    assert(data_is(&sink, 0, "br"));
+    assert(token.self_closing);
+}
+
+test "duplicate attribute is dropped with a parse error" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<p id=a id=b>", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.attr_count == 1);
+    assert(attr_is(&sink, 0, 0, "id", "a"));
+    assert(has_error(&sink, tokens.err_duplicate_attribute()));
+}
+
+test "comment" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<!-- hi -->", &sink);
+    assert(nth_kind(&sink, 0) == tokens.kind_comment());
+    assert(data_is(&sink, 0, " hi "));
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "abrupt closing of empty comment" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<!-->", &sink);
+    assert(nth_kind(&sink, 0) == tokens.kind_comment());
+    assert(data_is(&sink, 0, ""));
+    assert(has_error(&sink, tokens.err_abrupt_closing_of_empty_comment()));
+}
+
+test "processing instruction becomes bogus comment" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<?php x?>", &sink);
+    assert(nth_kind(&sink, 0) == tokens.kind_comment());
+    assert(data_is(&sink, 0, "?php x?"));
+    assert(has_error(&sink,
+    tokens.err_unexpected_question_mark_instead_of_tag_name()));
+}
+
+test "html5 doctype" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<!DOCTYPE html>", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.kind == tokens.kind_doctype());
+    assert(token.has_name);
+    assert(data_is(&sink, 0, "html"));
+    assert(!token.force_quirks);
+    assert(!token.has_public);
+    assert(!token.has_system);
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "legacy doctype with public and system identifiers" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into(
+    "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">",
+    &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.kind == tokens.kind_doctype());
+    assert(token.has_public);
+    assert(token.has_system);
+    assert(!token.force_quirks);
+    let public: []const u8 =
+    tokens.pool_bytes(&sink, token.public_off, token.public_len);
+    assert(len(public) == 25);
+    assert(public[0] == '-');
+    let system: []const u8 =
+    tokens.pool_bytes(&sink, token.system_off, token.system_len);
+    assert(len(system) == 37);
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "doctype without a name forces quirks" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<!DOCTYPE>", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.kind == tokens.kind_doctype());
+    assert(!token.has_name);
+    assert(token.force_quirks);
+    assert(has_error(&sink, tokens.err_missing_doctype_name()));
+}
+
+test "named character reference" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("a&amp;b", &sink);
+    assert(data_is(&sink, 0, "a&b"));
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "named reference without semicolon" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("a&amp b", &sink);
+    assert(data_is(&sink, 0, "a& b"));
+    assert(has_error(&sink,
+    tokens.err_missing_semicolon_after_character_reference()));
+}
+
+test "numeric character references" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("&#65;&#x42;", &sink);
+    assert(data_is(&sink, 0, "AB"));
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "null numeric reference becomes U+FFFD" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("&#0;", &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 3);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[0] == 0xEF as u8);
+    assert(got[1] == 0xBF as u8);
+    assert(got[2] == 0xBD as u8);
+    assert(has_error(&sink, tokens.err_null_character_reference()));
+}
+
+test "unknown named reference stays literal" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("&nosuch;", &sink);
+    assert(data_is(&sink, 0, "&nosuch;"));
+    assert(has_error(&sink, tokens.err_unknown_named_character_reference()));
+}
+
+test "character reference inside attribute value" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<a href=\"?a=1&amp;b=2\">", &sink);
+    assert(attr_is(&sink, 0, 0, "href", "?a=1&b=2"));
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "legacy no-semicolon reference in attribute stays literal before alnum" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<a b=\"&ampx\">", &sink);
+    assert(attr_is(&sink, 0, 0, "b", "&ampx"));
+    assert(tokens.error_count(&sink) == 0);
+}
+
+test "rcdata flushes non-matching end tags as text" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let source: *u8 = "<title>a</tix</title>";
+    let normalized: Vec<u8> =
+    preprocess.normalize(source as *const u8, str_len(source));
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    // Pump until the <title> start tag is out, then switch the tokenizer to
+    // RCDATA exactly as tree construction will.
+    assert(tokenizer.pump(&t, &sink));
+    assert(nth_kind(&sink, 0) == tokens.kind_start_tag());
+    assert(data_is(&sink, 0, "title"));
+    tokenizer.set_rcdata(&t);
+    tokenizer.run(&t, &sink);
+    assert(nth_kind(&sink, 1) == tokens.kind_chars());
+    assert(data_is(&sink, 1, "a</tix"));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    assert(data_is(&sink, 2, "title"));
+}
+
+test "rawtext ignores markup until its end tag" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let source: *u8 = "<style>p<b{}</style>";
+    let normalized: Vec<u8> =
+    preprocess.normalize(source as *const u8, str_len(source));
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    assert(tokenizer.pump(&t, &sink));
+    tokenizer.set_rawtext(&t);
+    tokenizer.run(&t, &sink);
+    assert(data_is(&sink, 1, "p<b{}"));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    assert(data_is(&sink, 2, "style"));
+}
+
+test "newlines are normalized before tokenizing" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let raw: Vec<u8> = vec.new<u8>();
+    vec.push(&raw, 'a');
+    vec.push(&raw, 13 as u8);
+    vec.push(&raw, 10 as u8);
+    vec.push(&raw, 'b');
+    vec.push(&raw, 13 as u8);
+    vec.push(&raw, 'c');
+    let normalized: Vec<u8> =
+    preprocess.normalize(raw.data as *const u8, raw.length);
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.run(&t, &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 5);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[0] == 'a');
+    assert(got[1] == 10 as u8);
+    assert(got[2] == 'b');
+    assert(got[3] == 10 as u8);
+    assert(got[4] == 'c');
+}
+
+test "leading utf-8 byte order mark is stripped" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let raw: Vec<u8> = vec.new<u8>();
+    vec.push(&raw, 0xEF as u8);
+    vec.push(&raw, 0xBB as u8);
+    vec.push(&raw, 0xBF as u8);
+    vec.push(&raw, 'h');
+    vec.push(&raw, 'i');
+    let normalized: Vec<u8> =
+    preprocess.normalize(raw.data as *const u8, raw.length);
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.run(&t, &sink);
+    assert(data_is(&sink, 0, "hi"));
+}
+
+test "null byte in data is a parse error but passes through" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let raw: Vec<u8> = vec.new<u8>();
+    vec.push(&raw, 'a');
+    vec.push(&raw, 0 as u8);
+    vec.push(&raw, 'b');
+    let t: HtmlTokenizer = tokenizer.new(raw.data as *const u8, raw.length);
+    tokenizer.run(&t, &sink);
+    let token: HtmlToken = tokens.get_token(&sink, 0);
+    assert(token.data_len == 3);
+    let got: []const u8 = tokens.pool_bytes(&sink, token.data_off, token.data_len);
+    assert(got[1] == 0 as u8);
+    assert(has_error(&sink, tokens.err_unexpected_null_character()));
+}
+
+test "eof inside a tag discards the tag" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<a href", &sink);
+    assert(tokens.token_count(&sink) == 1);
+    assert(nth_kind(&sink, 0) == tokens.kind_eof());
+    assert(has_error(&sink, tokens.err_eof_in_tag()));
+}
+
+test "end tag with attributes is an error but still emitted" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("</p x=1>", &sink);
+    assert(nth_kind(&sink, 0) == tokens.kind_end_tag());
+    assert(data_is(&sink, 0, "p"));
+    assert(has_error(&sink, tokens.err_end_tag_with_attributes()));
+}
+
+test "empty end tag emits nothing" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("</>", &sink);
+    assert(tokens.token_count(&sink) == 1);
+    assert(nth_kind(&sink, 0) == tokens.kind_eof());
+    assert(has_error(&sink, tokens.err_missing_end_tag_name()));
+}
+
+test "invalid first character of tag becomes text" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<3>", &sink);
+    assert(data_is(&sink, 0, "<3>"));
+    assert(has_error(&sink, tokens.err_invalid_first_character_of_tag_name()));
+}
+
+test "cdata in html content becomes a bogus comment" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    tokenize_into("<![CDATA[x]]>", &sink);
+    assert(nth_kind(&sink, 0) == tokens.kind_comment());
+    assert(data_is(&sink, 0, "[CDATA[x]]"));
+    assert(has_error(&sink, tokens.err_cdata_in_html_content()));
+}

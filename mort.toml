@@ -1,0 +1,13 @@
+[package]
+name = "rigor"
+version = "0.1.0"
+
+[build]
+sources = ["src/**/*.mx"]
+std = []
+
+[test]
+sources = ["tests/**/*.mx"]
+
+[dependencies]
+engine = "engine"

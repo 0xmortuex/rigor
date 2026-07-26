@@ -1,0 +1,2028 @@
+// The HTML tokenizer — WHATWG HTML §13.2.5 (https://html.spec.whatwg.org/).
+//
+// This is the specification's state machine implemented state-for-state; each
+// state function cites its section number. Error recovery is therefore not
+// best-effort guessing: every malformed input takes exactly the recovery path
+// the spec defines, and every parse error is recorded under its spec name.
+//
+// Implemented: data, RCDATA, RAWTEXT, PLAINTEXT, tag/attribute states,
+// comments, the complete DOCTYPE family, bogus comment, and character
+// references (numeric fully; named via engine.html.entities).
+// Not yet implemented (tracked in docs/ROADMAP.md): the script-data states
+// (§13.2.5.15–31, wired up with tree construction, which owns the state
+// switch) and the CDATA-section states (§13.2.5.69–71, reachable only in
+// foreign content). `<![CDATA[` in HTML content takes the spec's
+// cdata-in-html-content bogus-comment path, which is correct until SVG/MathML.
+//
+// The tokenizer is plain data over a normalized input buffer (the caller runs
+// engine.html.preprocess first); all output accumulates in an HtmlTokenSink.
+// String pieces build up append-only in the sink's byte pool, so a maximal
+// text run stays one contiguous (offset, length) span even across character
+// references.
+module engine.html.tokenizer;
+
+import std.vec;
+import tokens;
+import entities;
+
+// --- States (§13.2.5.N as noted) --------------------------------------------
+
+const ST_DATA: u32 = 1;                    // §13.2.5.1
+const ST_RCDATA: u32 = 2;                  // §13.2.5.2
+const ST_RAWTEXT: u32 = 3;                 // §13.2.5.3
+const ST_PLAINTEXT: u32 = 5;               // §13.2.5.5
+const ST_TAG_OPEN: u32 = 6;                // §13.2.5.6
+const ST_END_TAG_OPEN: u32 = 7;            // §13.2.5.7
+const ST_TAG_NAME: u32 = 8;                // §13.2.5.8
+const ST_RCDATA_LT: u32 = 9;               // §13.2.5.9
+const ST_RCDATA_END_TAG_OPEN: u32 = 10;    // §13.2.5.10
+const ST_RCDATA_END_TAG_NAME: u32 = 11;    // §13.2.5.11
+const ST_RAWTEXT_LT: u32 = 12;             // §13.2.5.12
+const ST_RAWTEXT_END_TAG_OPEN: u32 = 13;   // §13.2.5.13
+const ST_RAWTEXT_END_TAG_NAME: u32 = 14;   // §13.2.5.14
+const ST_BEFORE_ATTR_NAME: u32 = 32;       // §13.2.5.32
+const ST_ATTR_NAME: u32 = 33;              // §13.2.5.33
+const ST_AFTER_ATTR_NAME: u32 = 34;        // §13.2.5.34
+const ST_BEFORE_ATTR_VALUE: u32 = 35;      // §13.2.5.35
+const ST_ATTR_VALUE_DQ: u32 = 36;          // §13.2.5.36
+const ST_ATTR_VALUE_SQ: u32 = 37;          // §13.2.5.37
+const ST_ATTR_VALUE_UNQ: u32 = 38;         // §13.2.5.38
+const ST_AFTER_ATTR_VALUE_Q: u32 = 39;     // §13.2.5.39
+const ST_SELF_CLOSING: u32 = 40;           // §13.2.5.40
+const ST_BOGUS_COMMENT: u32 = 41;          // §13.2.5.41
+const ST_MARKUP_DECL: u32 = 42;            // §13.2.5.42
+const ST_COMMENT_START: u32 = 43;          // §13.2.5.43
+const ST_COMMENT_START_DASH: u32 = 44;     // §13.2.5.44
+const ST_COMMENT: u32 = 45;                // §13.2.5.45
+const ST_COMMENT_LT: u32 = 46;             // §13.2.5.46
+const ST_COMMENT_LT_BANG: u32 = 47;        // §13.2.5.47
+const ST_COMMENT_LT_BANG_DASH: u32 = 48;   // §13.2.5.48
+const ST_COMMENT_LT_BANG_DASH_DASH: u32 = 49; // §13.2.5.49
+const ST_COMMENT_END_DASH: u32 = 50;       // §13.2.5.50
+const ST_COMMENT_END: u32 = 51;            // §13.2.5.51
+const ST_COMMENT_END_BANG: u32 = 52;       // §13.2.5.52
+const ST_DOCTYPE: u32 = 53;                // §13.2.5.53
+const ST_BEFORE_DOCTYPE_NAME: u32 = 54;    // §13.2.5.54
+const ST_DOCTYPE_NAME: u32 = 55;           // §13.2.5.55
+const ST_AFTER_DOCTYPE_NAME: u32 = 56;     // §13.2.5.56
+const ST_AFTER_DOCTYPE_PUBLIC_KW: u32 = 57;    // §13.2.5.57
+const ST_BEFORE_DOCTYPE_PUBLIC_ID: u32 = 58;   // §13.2.5.58
+const ST_DOCTYPE_PUBLIC_ID_DQ: u32 = 59;   // §13.2.5.59
+const ST_DOCTYPE_PUBLIC_ID_SQ: u32 = 60;   // §13.2.5.60
+const ST_AFTER_DOCTYPE_PUBLIC_ID: u32 = 61;    // §13.2.5.61
+const ST_BETWEEN_PUBLIC_SYSTEM: u32 = 62;  // §13.2.5.62
+const ST_AFTER_DOCTYPE_SYSTEM_KW: u32 = 63;    // §13.2.5.63
+const ST_BEFORE_DOCTYPE_SYSTEM_ID: u32 = 64;   // §13.2.5.64
+const ST_DOCTYPE_SYSTEM_ID_DQ: u32 = 65;   // §13.2.5.65
+const ST_DOCTYPE_SYSTEM_ID_SQ: u32 = 66;   // §13.2.5.66
+const ST_AFTER_DOCTYPE_SYSTEM_ID: u32 = 67;    // §13.2.5.67
+const ST_BOGUS_DOCTYPE: u32 = 68;          // §13.2.5.68
+const ST_CHAR_REF: u32 = 72;               // §13.2.5.72
+const ST_NAMED_CHAR_REF: u32 = 73;         // §13.2.5.73
+const ST_AMBIGUOUS_AMPERSAND: u32 = 74;    // §13.2.5.74
+const ST_NUMERIC_CHAR_REF: u32 = 75;       // §13.2.5.75
+const ST_HEX_CHAR_REF_START: u32 = 76;     // §13.2.5.76
+const ST_DEC_CHAR_REF_START: u32 = 77;     // §13.2.5.77
+const ST_HEX_CHAR_REF: u32 = 78;           // §13.2.5.78
+const ST_DEC_CHAR_REF: u32 = 79;           // §13.2.5.79
+
+const KIND_START: u8 = 1;
+const KIND_END: u8 = 2;
+
+struct HtmlTokenizer {
+    input: *const u8,
+    length: u64,
+    pos: u64,
+    state: u32,
+    return_state: u32,
+    eof_done: bool,
+
+    // Current text run (coalesced character tokens).
+    text_off: u64,
+    text_len: u64,
+    text_open: bool,
+
+    // Current tag token.
+    cur_kind: u8,
+    tag_name_off: u64,
+    tag_name_len: u64,
+    cur_self_closing: bool,
+    cur_attr_first: u64,
+    cur_attr_count: u64,
+
+    // Attribute being accumulated.
+    attr_open: bool,
+    attr_dup: bool,
+    attr_name_off: u64,
+    attr_name_len: u64,
+    attr_value_off: u64,
+    attr_value_len: u64,
+
+    // Current comment token.
+    comment_off: u64,
+    comment_len: u64,
+
+    // Current doctype token.
+    doctype_has_name: bool,
+    doctype_force_quirks: bool,
+    doctype_has_public: bool,
+    doctype_has_system: bool,
+    doctype_public_off: u64,
+    doctype_public_len: u64,
+    doctype_system_off: u64,
+    doctype_system_len: u64,
+
+    // Name of the last emitted start tag (for "appropriate end tag").
+    has_last_start: bool,
+    last_start_off: u64,
+    last_start_len: u64,
+
+    // Character reference bookkeeping.
+    ref_start: u64,
+    char_ref_code: u32,
+}
+
+// `input` must already be newline-normalized (engine.html.preprocess); the
+// buffer must outlive the tokenizer.
+pub fn new(input: *const u8, length: u64) -> HtmlTokenizer {
+    return HtmlTokenizer {
+        input: input, length: length, pos: 0,
+        state: ST_DATA, return_state: ST_DATA, eof_done: false,
+        text_off: 0, text_len: 0, text_open: false,
+        cur_kind: 0 as u8, tag_name_off: 0, tag_name_len: 0,
+        cur_self_closing: false, cur_attr_first: 0, cur_attr_count: 0,
+        attr_open: false, attr_dup: false,
+        attr_name_off: 0, attr_name_len: 0,
+        attr_value_off: 0, attr_value_len: 0,
+        comment_off: 0, comment_len: 0,
+        doctype_has_name: false, doctype_force_quirks: false,
+        doctype_has_public: false, doctype_has_system: false,
+        doctype_public_off: 0, doctype_public_len: 0,
+        doctype_system_off: 0, doctype_system_len: 0,
+        has_last_start: false, last_start_off: 0, last_start_len: 0,
+        ref_start: 0, char_ref_code: 0 as u32,
+    };
+}
+
+// Tree-construction hooks: the tree builder switches the tokenizer into these
+// states after seeing <title>/<textarea> (RCDATA), <style>/<xmp>/<iframe>/
+// <noembed>/<noframes> (RAWTEXT), and <plaintext>.
+pub fn set_rcdata(t: *HtmlTokenizer) -> void { (*t).state = ST_RCDATA; }
+pub fn set_rawtext(t: *HtmlTokenizer) -> void { (*t).state = ST_RAWTEXT; }
+pub fn set_plaintext(t: *HtmlTokenizer) -> void { (*t).state = ST_PLAINTEXT; }
+pub fn set_data(t: *HtmlTokenizer) -> void { (*t).state = ST_DATA; }
+
+pub fn done(t: *HtmlTokenizer) -> bool {
+    return (*t).eof_done;
+}
+
+// Advance until at least one new token lands in the sink (or EOF has been
+// emitted). Returns true when the sink grew.
+pub fn pump(t: *HtmlTokenizer, s: *HtmlTokenSink) -> bool {
+    let before: u64 = tokens.token_count(s);
+    while tokens.token_count(s) == before && !(*t).eof_done {
+        step(t, s);
+    }
+    return tokens.token_count(s) > before;
+}
+
+// Tokenize the whole input.
+pub fn run(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    while !(*t).eof_done {
+        step(t, s);
+    }
+}
+
+// --- Character classes -------------------------------------------------------
+
+fn is_ws(c: u8) -> bool {
+    return c == 9 as u8 || c == 10 as u8 || c == 12 as u8 || c == 32 as u8;
+}
+
+fn is_upper(c: u8) -> bool { return c >= 'A' && c <= 'Z'; }
+fn is_lower(c: u8) -> bool { return c >= 'a' && c <= 'z'; }
+fn is_alpha(c: u8) -> bool { return is_upper(c) || is_lower(c); }
+fn is_digit(c: u8) -> bool { return c >= '0' && c <= '9'; }
+fn is_alnum(c: u8) -> bool { return is_alpha(c) || is_digit(c); }
+
+fn is_hex(c: u8) -> bool {
+    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+fn to_lower(c: u8) -> u8 {
+    if is_upper(c) {
+        return c + 32 as u8;
+    }
+    return c;
+}
+
+// --- Input primitives --------------------------------------------------------
+
+fn at_eof(t: *HtmlTokenizer) -> bool {
+    return (*t).pos >= (*t).length;
+}
+
+fn take(t: *HtmlTokenizer) -> u8 {
+    let c: u8 = (*t).input[(*t).pos];
+    (*t).pos = (*t).pos + 1;
+    return c;
+}
+
+fn reconsume(t: *HtmlTokenizer, state: u32) -> void {
+    (*t).pos = (*t).pos - 1;
+    (*t).state = state;
+}
+
+// Case-insensitive match of `text` (NUL-terminated, lowercase) at the current
+// position; consumes it when it matches.
+fn take_ci(t: *HtmlTokenizer, text: *u8) -> bool {
+    let n: u64 = 0;
+    while text[n] != 0 as u8 {
+        n = n + 1;
+    }
+    if (*t).pos + n > (*t).length {
+        return false;
+    }
+    for index: u64 in 0..n {
+        if to_lower((*t).input[(*t).pos + index]) != text[index] {
+            return false;
+        }
+    }
+    (*t).pos = (*t).pos + n;
+    return true;
+}
+
+fn error(t: *HtmlTokenizer, s: *HtmlTokenSink, code: u32) -> void {
+    vec.push(&(*s).errors, HtmlParseError { code: code, pos: (*t).pos });
+}
+
+// --- Pool accumulation -------------------------------------------------------
+
+fn pool_push(s: *HtmlTokenSink, b: u8) -> void {
+    vec.push(&(*s).pool, b);
+}
+
+// UTF-8-encode a code point into the pool; returns the byte count.
+fn pool_push_cp(s: *HtmlTokenSink, cp: u32) -> u64 {
+    if cp < 0x80 as u32 {
+        pool_push(s, cp as u8);
+        return 1;
+    }
+    if cp < 0x800 as u32 {
+        pool_push(s, ((0xC0 as u32) | (cp >> 6)) as u8);
+        pool_push(s, ((0x80 as u32) | (cp & (0x3F as u32))) as u8);
+        return 2;
+    }
+    if cp < 0x10000 as u32 {
+        pool_push(s, ((0xE0 as u32) | (cp >> 12)) as u8);
+        pool_push(s, ((0x80 as u32) | ((cp >> 6) & (0x3F as u32))) as u8);
+        pool_push(s, ((0x80 as u32) | (cp & (0x3F as u32))) as u8);
+        return 3;
+    }
+    pool_push(s, ((0xF0 as u32) | (cp >> 18)) as u8);
+    pool_push(s, ((0x80 as u32) | ((cp >> 12) & (0x3F as u32))) as u8);
+    pool_push(s, ((0x80 as u32) | ((cp >> 6) & (0x3F as u32))) as u8);
+    pool_push(s, ((0x80 as u32) | (cp & (0x3F as u32))) as u8);
+    return 4;
+}
+
+fn text_push(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    if !(*t).text_open {
+        (*t).text_off = (*s).pool.length;
+        (*t).text_len = 0;
+        (*t).text_open = true;
+    }
+    pool_push(s, b);
+    (*t).text_len = (*t).text_len + 1;
+}
+
+fn text_push_repl(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    text_push(t, s, 0xEF as u8);
+    text_push(t, s, 0xBF as u8);
+    text_push(t, s, 0xBD as u8);
+}
+
+fn tag_name_push(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    pool_push(s, b);
+    (*t).tag_name_len = (*t).tag_name_len + 1;
+}
+
+fn attr_name_push(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    pool_push(s, b);
+    (*t).attr_name_len = (*t).attr_name_len + 1;
+}
+
+fn value_push(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    pool_push(s, b);
+    (*t).attr_value_len = (*t).attr_value_len + 1;
+}
+
+fn comment_push(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    pool_push(s, b);
+    (*t).comment_len = (*t).comment_len + 1;
+}
+
+fn repl_via(t: *HtmlTokenizer, s: *HtmlTokenSink, which: u32) -> void {
+    // which: 0 tag name, 1 attr name, 2 attr value, 3 comment.
+    if which == 0 as u32 {
+        tag_name_push(t, s, 0xEF as u8);
+        tag_name_push(t, s, 0xBF as u8);
+        tag_name_push(t, s, 0xBD as u8);
+    } else if which == 1 as u32 {
+        attr_name_push(t, s, 0xEF as u8);
+        attr_name_push(t, s, 0xBF as u8);
+        attr_name_push(t, s, 0xBD as u8);
+    } else if which == 2 as u32 {
+        value_push(t, s, 0xEF as u8);
+        value_push(t, s, 0xBF as u8);
+        value_push(t, s, 0xBD as u8);
+    } else {
+        comment_push(t, s, 0xEF as u8);
+        comment_push(t, s, 0xBF as u8);
+        comment_push(t, s, 0xBD as u8);
+    }
+}
+
+// --- Scratch (the spec's "temporary buffer") ---------------------------------
+
+fn scratch_clear(s: *HtmlTokenSink) -> void {
+    vec.clear(&(*s).scratch);
+}
+
+fn scratch_push(s: *HtmlTokenSink, b: u8) -> void {
+    vec.push(&(*s).scratch, b);
+}
+
+// --- Token emission ----------------------------------------------------------
+
+fn flush_text(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if (*t).text_open && (*t).text_len > 0 {
+        let token: HtmlToken = tokens.empty_token();
+        token.kind = tokens.kind_chars();
+        token.data_off = (*t).text_off;
+        token.data_len = (*t).text_len;
+        vec.push(&(*s).tokens, token);
+    }
+    (*t).text_open = false;
+    (*t).text_len = 0;
+}
+
+fn emit_eof(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    flush_text(t, s);
+    let token: HtmlToken = tokens.empty_token();
+    token.kind = tokens.kind_eof();
+    vec.push(&(*s).tokens, token);
+    (*t).eof_done = true;
+}
+
+fn tag_begin(t: *HtmlTokenizer, s: *HtmlTokenSink, kind: u8) -> void {
+    (*t).cur_kind = kind;
+    (*t).tag_name_off = (*s).pool.length;
+    (*t).tag_name_len = 0;
+    (*t).cur_self_closing = false;
+    (*t).cur_attr_first = (*s).attrs.length;
+    (*t).cur_attr_count = 0;
+    (*t).attr_open = false;
+    (*t).attr_dup = false;
+}
+
+fn attr_begin(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    finish_attr(t, s);
+    (*t).attr_open = true;
+    (*t).attr_dup = false;
+    (*t).attr_name_off = (*s).pool.length;
+    (*t).attr_name_len = 0;
+    (*t).attr_value_off = (*s).pool.length;
+    (*t).attr_value_len = 0;
+}
+
+fn finish_attr(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !(*t).attr_open {
+        return;
+    }
+    if !(*t).attr_dup {
+        vec.push(&(*s).attrs, HtmlAttr {
+            name_off: (*t).attr_name_off,
+            name_len: (*t).attr_name_len,
+            value_off: (*t).attr_value_off,
+            value_len: (*t).attr_value_len,
+        });
+        (*t).cur_attr_count = (*t).cur_attr_count + 1;
+    }
+    (*t).attr_open = false;
+}
+
+// Leaving the attribute name state: if the name repeats an earlier attribute
+// of this tag, it is a duplicate-attribute parse error and the attribute
+// (with its value) will be dropped on completion. §13.2.5.33.
+fn check_dup_attr(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    let name: []const u8 =
+        tokens.pool_bytes(s, (*t).attr_name_off, (*t).attr_name_len);
+    for index: u64 in 0..(*t).cur_attr_count {
+        let earlier: HtmlAttr = tokens.get_attr(s, (*t).cur_attr_first + index);
+        let other: []const u8 = tokens.pool_bytes(s, earlier.name_off, earlier.name_len);
+        if bytes_equal(name, other) {
+            error(t, s, tokens.err_duplicate_attribute());
+            (*t).attr_dup = true;
+            return;
+        }
+    }
+}
+
+fn bytes_equal(left: []const u8, right: []const u8) -> bool {
+    if len(left) != len(right) {
+        return false;
+    }
+    for index: u64 in 0..len(left) {
+        if left[index] != right[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn emit_tag(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    finish_attr(t, s);
+    flush_text(t, s);
+    let token: HtmlToken = tokens.empty_token();
+    token.kind = (*t).cur_kind;
+    token.data_off = (*t).tag_name_off;
+    token.data_len = (*t).tag_name_len;
+    token.attr_first = (*t).cur_attr_first;
+    token.attr_count = (*t).cur_attr_count;
+    token.self_closing = (*t).cur_self_closing;
+    if (*t).cur_kind == KIND_END {
+        // §13.2.5 preamble: end tags carrying attributes or the self-closing
+        // flag are parse errors (the token is still emitted; the tree stage
+        // ignores the offending pieces).
+        if (*t).cur_attr_count > 0 {
+            error(t, s, tokens.err_end_tag_with_attributes());
+        }
+        if (*t).cur_self_closing {
+            error(t, s, tokens.err_end_tag_with_trailing_solidus());
+        }
+    } else {
+        (*t).has_last_start = true;
+        (*t).last_start_off = (*t).tag_name_off;
+        (*t).last_start_len = (*t).tag_name_len;
+    }
+    vec.push(&(*s).tokens, token);
+}
+
+fn comment_begin(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    (*t).comment_off = (*s).pool.length;
+    (*t).comment_len = 0;
+}
+
+fn emit_comment(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    flush_text(t, s);
+    let token: HtmlToken = tokens.empty_token();
+    token.kind = tokens.kind_comment();
+    token.data_off = (*t).comment_off;
+    token.data_len = (*t).comment_len;
+    vec.push(&(*s).tokens, token);
+}
+
+fn doctype_begin(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    (*t).doctype_has_name = false;
+    (*t).doctype_force_quirks = false;
+    (*t).doctype_has_public = false;
+    (*t).doctype_has_system = false;
+    (*t).tag_name_off = (*s).pool.length;
+    (*t).tag_name_len = 0;
+    (*t).doctype_public_off = 0;
+    (*t).doctype_public_len = 0;
+    (*t).doctype_system_off = 0;
+    (*t).doctype_system_len = 0;
+}
+
+fn doctype_name_push(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    pool_push(s, b);
+    (*t).tag_name_len = (*t).tag_name_len + 1;
+}
+
+fn public_push(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    pool_push(s, b);
+    (*t).doctype_public_len = (*t).doctype_public_len + 1;
+}
+
+fn system_push(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    pool_push(s, b);
+    (*t).doctype_system_len = (*t).doctype_system_len + 1;
+}
+
+fn emit_doctype(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    flush_text(t, s);
+    let token: HtmlToken = tokens.empty_token();
+    token.kind = tokens.kind_doctype();
+    token.has_name = (*t).doctype_has_name;
+    token.data_off = (*t).tag_name_off;
+    token.data_len = (*t).tag_name_len;
+    token.force_quirks = (*t).doctype_force_quirks;
+    token.has_public = (*t).doctype_has_public;
+    token.public_off = (*t).doctype_public_off;
+    token.public_len = (*t).doctype_public_len;
+    token.has_system = (*t).doctype_has_system;
+    token.system_off = (*t).doctype_system_off;
+    token.system_len = (*t).doctype_system_len;
+    vec.push(&(*s).tokens, token);
+}
+
+// --- Character reference output ----------------------------------------------
+// Decoded (or flushed-verbatim) characters continue whatever piece the
+// reference interrupted: an attribute value when the return state is one of
+// the attribute value states, a text run otherwise. §13.2.5.72 "flush code
+// points consumed as a character reference".
+
+fn ref_in_attr(t: *HtmlTokenizer) -> bool {
+    return (*t).return_state == ST_ATTR_VALUE_DQ
+        || (*t).return_state == ST_ATTR_VALUE_SQ
+        || (*t).return_state == ST_ATTR_VALUE_UNQ;
+}
+
+fn ref_emit_byte(t: *HtmlTokenizer, s: *HtmlTokenSink, b: u8) -> void {
+    if ref_in_attr(t) {
+        value_push(t, s, b);
+    } else {
+        text_push(t, s, b);
+    }
+}
+
+fn ref_emit_cp(t: *HtmlTokenizer, s: *HtmlTokenSink, cp: u32) -> void {
+    if ref_in_attr(t) {
+        let n: u64 = pool_push_cp(s, cp);
+        (*t).attr_value_len = (*t).attr_value_len + n;
+    } else {
+        if !(*t).text_open {
+            (*t).text_off = (*s).pool.length;
+            (*t).text_len = 0;
+            (*t).text_open = true;
+        }
+        let n: u64 = pool_push_cp(s, cp);
+        (*t).text_len = (*t).text_len + n;
+    }
+}
+
+// Emit the raw input bytes consumed by the reference so far, verbatim.
+fn ref_flush_raw(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    for index: u64 in (*t).ref_start..(*t).pos {
+        ref_emit_byte(t, s, (*t).input[index]);
+    }
+}
+
+// --- The dispatch loop -------------------------------------------------------
+
+fn step(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    let st: u32 = (*t).state;
+    if st == ST_DATA { data_state(t, s); }
+    else if st == ST_RCDATA { rcdata_state(t, s); }
+    else if st == ST_RAWTEXT { rawtext_state(t, s); }
+    else if st == ST_PLAINTEXT { plaintext_state(t, s); }
+    else if st == ST_TAG_OPEN { tag_open_state(t, s); }
+    else if st == ST_END_TAG_OPEN { end_tag_open_state(t, s); }
+    else if st == ST_TAG_NAME { tag_name_state(t, s); }
+    else if st == ST_RCDATA_LT { rcdata_lt_state(t, s); }
+    else if st == ST_RCDATA_END_TAG_OPEN { rcdata_end_tag_open_state(t, s); }
+    else if st == ST_RCDATA_END_TAG_NAME { rcdata_end_tag_name_state(t, s); }
+    else if st == ST_RAWTEXT_LT { rawtext_lt_state(t, s); }
+    else if st == ST_RAWTEXT_END_TAG_OPEN { rawtext_end_tag_open_state(t, s); }
+    else if st == ST_RAWTEXT_END_TAG_NAME { rawtext_end_tag_name_state(t, s); }
+    else if st == ST_BEFORE_ATTR_NAME { before_attr_name_state(t, s); }
+    else if st == ST_ATTR_NAME { attr_name_state(t, s); }
+    else if st == ST_AFTER_ATTR_NAME { after_attr_name_state(t, s); }
+    else if st == ST_BEFORE_ATTR_VALUE { before_attr_value_state(t, s); }
+    else if st == ST_ATTR_VALUE_DQ { attr_value_dq_state(t, s); }
+    else if st == ST_ATTR_VALUE_SQ { attr_value_sq_state(t, s); }
+    else if st == ST_ATTR_VALUE_UNQ { attr_value_unq_state(t, s); }
+    else if st == ST_AFTER_ATTR_VALUE_Q { after_attr_value_q_state(t, s); }
+    else if st == ST_SELF_CLOSING { self_closing_state(t, s); }
+    else if st == ST_BOGUS_COMMENT { bogus_comment_state(t, s); }
+    else if st == ST_MARKUP_DECL { markup_decl_state(t, s); }
+    else if st == ST_COMMENT_START { comment_start_state(t, s); }
+    else if st == ST_COMMENT_START_DASH { comment_start_dash_state(t, s); }
+    else if st == ST_COMMENT { comment_state(t, s); }
+    else if st == ST_COMMENT_LT { comment_lt_state(t, s); }
+    else if st == ST_COMMENT_LT_BANG { comment_lt_bang_state(t, s); }
+    else if st == ST_COMMENT_LT_BANG_DASH { comment_lt_bang_dash_state(t, s); }
+    else if st == ST_COMMENT_LT_BANG_DASH_DASH { comment_lt_bang_dash_dash_state(t, s); }
+    else if st == ST_COMMENT_END_DASH { comment_end_dash_state(t, s); }
+    else if st == ST_COMMENT_END { comment_end_state(t, s); }
+    else if st == ST_COMMENT_END_BANG { comment_end_bang_state(t, s); }
+    else if st == ST_DOCTYPE { doctype_state(t, s); }
+    else if st == ST_BEFORE_DOCTYPE_NAME { before_doctype_name_state(t, s); }
+    else if st == ST_DOCTYPE_NAME { doctype_name_state(t, s); }
+    else if st == ST_AFTER_DOCTYPE_NAME { after_doctype_name_state(t, s); }
+    else if st == ST_AFTER_DOCTYPE_PUBLIC_KW { after_doctype_public_kw_state(t, s); }
+    else if st == ST_BEFORE_DOCTYPE_PUBLIC_ID { before_doctype_public_id_state(t, s); }
+    else if st == ST_DOCTYPE_PUBLIC_ID_DQ { doctype_public_id_state(t, s, '"'); }
+    else if st == ST_DOCTYPE_PUBLIC_ID_SQ { doctype_public_id_state(t, s, 39 as u8); }
+    else if st == ST_AFTER_DOCTYPE_PUBLIC_ID { after_doctype_public_id_state(t, s); }
+    else if st == ST_BETWEEN_PUBLIC_SYSTEM { between_public_system_state(t, s); }
+    else if st == ST_AFTER_DOCTYPE_SYSTEM_KW { after_doctype_system_kw_state(t, s); }
+    else if st == ST_BEFORE_DOCTYPE_SYSTEM_ID { before_doctype_system_id_state(t, s); }
+    else if st == ST_DOCTYPE_SYSTEM_ID_DQ { doctype_system_id_state(t, s, '"'); }
+    else if st == ST_DOCTYPE_SYSTEM_ID_SQ { doctype_system_id_state(t, s, 39 as u8); }
+    else if st == ST_AFTER_DOCTYPE_SYSTEM_ID { after_doctype_system_id_state(t, s); }
+    else if st == ST_BOGUS_DOCTYPE { bogus_doctype_state(t, s); }
+    else if st == ST_CHAR_REF { char_ref_state(t, s); }
+    else if st == ST_NAMED_CHAR_REF { named_char_ref_state(t, s); }
+    else if st == ST_AMBIGUOUS_AMPERSAND { ambiguous_ampersand_state(t, s); }
+    else if st == ST_NUMERIC_CHAR_REF { numeric_char_ref_state(t, s); }
+    else if st == ST_HEX_CHAR_REF_START { hex_char_ref_start_state(t, s); }
+    else if st == ST_DEC_CHAR_REF_START { dec_char_ref_start_state(t, s); }
+    else if st == ST_HEX_CHAR_REF { hex_char_ref_state(t, s); }
+    else if st == ST_DEC_CHAR_REF { dec_char_ref_state(t, s); }
+    else { emit_eof(t, s); }
+}
+
+// --- Data, RCDATA, RAWTEXT, PLAINTEXT ---------------------------------------
+
+// §13.2.5.1
+fn data_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) { emit_eof(t, s); return; }
+    let c: u8 = take(t);
+    if c == '&' {
+        (*t).return_state = ST_DATA;
+        (*t).ref_start = (*t).pos - 1;
+        (*t).state = ST_CHAR_REF;
+    } else if c == '<' {
+        (*t).state = ST_TAG_OPEN;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push(t, s, c);
+    } else {
+        text_push(t, s, c);
+    }
+}
+
+// §13.2.5.2
+fn rcdata_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) { emit_eof(t, s); return; }
+    let c: u8 = take(t);
+    if c == '&' {
+        (*t).return_state = ST_RCDATA;
+        (*t).ref_start = (*t).pos - 1;
+        (*t).state = ST_CHAR_REF;
+    } else if c == '<' {
+        (*t).state = ST_RCDATA_LT;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+    } else {
+        text_push(t, s, c);
+    }
+}
+
+// §13.2.5.3
+fn rawtext_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) { emit_eof(t, s); return; }
+    let c: u8 = take(t);
+    if c == '<' {
+        (*t).state = ST_RAWTEXT_LT;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+    } else {
+        text_push(t, s, c);
+    }
+}
+
+// §13.2.5.5
+fn plaintext_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) { emit_eof(t, s); return; }
+    let c: u8 = take(t);
+    if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+    } else {
+        text_push(t, s, c);
+    }
+}
+
+// --- Tag open ----------------------------------------------------------------
+
+// §13.2.5.6
+fn tag_open_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_before_tag_name());
+        text_push(t, s, '<');
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '!' {
+        (*t).state = ST_MARKUP_DECL;
+    } else if c == '/' {
+        (*t).state = ST_END_TAG_OPEN;
+    } else if is_alpha(c) {
+        tag_begin(t, s, KIND_START);
+        reconsume(t, ST_TAG_NAME);
+    } else if c == '?' {
+        error(t, s, tokens.err_unexpected_question_mark_instead_of_tag_name());
+        comment_begin(t, s);
+        reconsume(t, ST_BOGUS_COMMENT);
+    } else {
+        error(t, s, tokens.err_invalid_first_character_of_tag_name());
+        text_push(t, s, '<');
+        reconsume(t, ST_DATA);
+    }
+}
+
+// §13.2.5.7
+fn end_tag_open_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_before_tag_name());
+        text_push(t, s, '<');
+        text_push(t, s, '/');
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_alpha(c) {
+        tag_begin(t, s, KIND_END);
+        reconsume(t, ST_TAG_NAME);
+    } else if c == '>' {
+        error(t, s, tokens.err_missing_end_tag_name());
+        (*t).state = ST_DATA;
+    } else {
+        error(t, s, tokens.err_invalid_first_character_of_tag_name());
+        comment_begin(t, s);
+        reconsume(t, ST_BOGUS_COMMENT);
+    }
+}
+
+// §13.2.5.8
+fn tag_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_tag());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        (*t).state = ST_BEFORE_ATTR_NAME;
+    } else if c == '/' {
+        (*t).state = ST_SELF_CLOSING;
+    } else if c == '>' {
+        emit_tag(t, s);
+        (*t).state = ST_DATA;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        repl_via(t, s, 0 as u32);
+    } else {
+        tag_name_push(t, s, to_lower(c));
+    }
+}
+
+// --- RCDATA / RAWTEXT end-tag matching ---------------------------------------
+
+// §13.2.5.9
+fn rcdata_lt_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if c == '/' {
+            scratch_clear(s);
+            (*t).state = ST_RCDATA_END_TAG_OPEN;
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    text_push(t, s, '<');
+    (*t).state = ST_RCDATA;
+}
+
+// §13.2.5.10
+fn rcdata_end_tag_open_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if is_alpha(c) {
+            reconsume(t, ST_RCDATA_END_TAG_NAME);
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    text_push(t, s, '<');
+    text_push(t, s, '/');
+    (*t).state = ST_RCDATA;
+}
+
+// Shared by §13.2.5.11 / §13.2.5.14. The scratch buffer holds the candidate
+// end tag name in original case; it either becomes a real end tag (when it is
+// the appropriate one) or is flushed back as text.
+fn raw_end_tag_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink, back: u32) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if is_alpha(c) {
+            scratch_push(s, c);
+            return;
+        }
+        if is_appropriate(t, s) {
+            if is_ws(c) {
+                end_tag_from_scratch(t, s);
+                (*t).state = ST_BEFORE_ATTR_NAME;
+                return;
+            }
+            if c == '/' {
+                end_tag_from_scratch(t, s);
+                (*t).state = ST_SELF_CLOSING;
+                return;
+            }
+            if c == '>' {
+                end_tag_from_scratch(t, s);
+                emit_tag(t, s);
+                (*t).state = ST_DATA;
+                return;
+            }
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    text_push(t, s, '<');
+    text_push(t, s, '/');
+    for index: u64 in 0..(*s).scratch.length {
+        text_push(t, s, (*s).scratch.data[index]);
+    }
+    (*t).state = back;
+}
+
+// §13.2.5.11
+fn rcdata_end_tag_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    raw_end_tag_name_state(t, s, ST_RCDATA);
+}
+
+// §13.2.5.12
+fn rawtext_lt_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if c == '/' {
+            scratch_clear(s);
+            (*t).state = ST_RAWTEXT_END_TAG_OPEN;
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    text_push(t, s, '<');
+    (*t).state = ST_RAWTEXT;
+}
+
+// §13.2.5.13
+fn rawtext_end_tag_open_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if is_alpha(c) {
+            reconsume(t, ST_RAWTEXT_END_TAG_NAME);
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    text_push(t, s, '<');
+    text_push(t, s, '/');
+    (*t).state = ST_RAWTEXT;
+}
+
+// §13.2.5.14
+fn rawtext_end_tag_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    raw_end_tag_name_state(t, s, ST_RAWTEXT);
+}
+
+// "Appropriate end tag token": its name matches the most recent start tag.
+fn is_appropriate(t: *HtmlTokenizer, s: *HtmlTokenSink) -> bool {
+    if !(*t).has_last_start {
+        return false;
+    }
+    if (*s).scratch.length != (*t).last_start_len {
+        return false;
+    }
+    for index: u64 in 0..(*s).scratch.length {
+        let a: u8 = to_lower((*s).scratch.data[index]);
+        let b: u8 = (*s).pool.data[(*t).last_start_off + index];
+        if a != b {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn end_tag_from_scratch(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    tag_begin(t, s, KIND_END);
+    for index: u64 in 0..(*s).scratch.length {
+        tag_name_push(t, s, to_lower((*s).scratch.data[index]));
+    }
+}
+
+// --- Attributes --------------------------------------------------------------
+
+// §13.2.5.32
+fn before_attr_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        reconsume_eof_as(t, ST_AFTER_ATTR_NAME);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '/' || c == '>' {
+        reconsume(t, ST_AFTER_ATTR_NAME);
+        return;
+    }
+    if c == '=' {
+        error(t, s, tokens.err_unexpected_equals_sign_before_attribute_name());
+        attr_begin(t, s);
+        attr_name_push(t, s, c);
+        (*t).state = ST_ATTR_NAME;
+        return;
+    }
+    attr_begin(t, s);
+    reconsume(t, ST_ATTR_NAME);
+}
+
+fn reconsume_eof_as(t: *HtmlTokenizer, state: u32) -> void {
+    // EOF "reconsume": no position to rewind, just switch states.
+    (*t).state = state;
+}
+
+// §13.2.5.33
+fn attr_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        check_dup_attr(t, s);
+        reconsume_eof_as(t, ST_AFTER_ATTR_NAME);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) || c == '/' || c == '>' {
+        check_dup_attr(t, s);
+        reconsume(t, ST_AFTER_ATTR_NAME);
+        return;
+    }
+    if c == '=' {
+        check_dup_attr(t, s);
+        (*t).state = ST_BEFORE_ATTR_VALUE;
+        return;
+    }
+    if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        repl_via(t, s, 1 as u32);
+        return;
+    }
+    if c == '"' || c == 39 as u8 || c == '<' {
+        error(t, s, tokens.err_unexpected_character_in_attribute_name());
+        attr_name_push(t, s, c);
+        return;
+    }
+    attr_name_push(t, s, to_lower(c));
+}
+
+// §13.2.5.34
+fn after_attr_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_tag());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '/' {
+        (*t).state = ST_SELF_CLOSING;
+    } else if c == '=' {
+        (*t).state = ST_BEFORE_ATTR_VALUE;
+    } else if c == '>' {
+        emit_tag(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        attr_begin(t, s);
+        reconsume(t, ST_ATTR_NAME);
+    }
+}
+
+// §13.2.5.35
+fn before_attr_value_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        reconsume_eof_as(t, ST_ATTR_VALUE_UNQ);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '"' {
+        (*t).attr_value_off = (*s).pool.length;
+        (*t).state = ST_ATTR_VALUE_DQ;
+    } else if c == 39 as u8 {
+        (*t).attr_value_off = (*s).pool.length;
+        (*t).state = ST_ATTR_VALUE_SQ;
+    } else if c == '>' {
+        error(t, s, tokens.err_missing_attribute_value());
+        emit_tag(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        (*t).attr_value_off = (*s).pool.length;
+        reconsume(t, ST_ATTR_VALUE_UNQ);
+    }
+}
+
+// §13.2.5.36 and §13.2.5.37 (parameterized on the quote character)
+fn attr_value_quoted_state(
+    t: *HtmlTokenizer,
+    s: *HtmlTokenSink,
+    quote: u8,
+    self_state: u32
+) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_tag());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == quote {
+        (*t).state = ST_AFTER_ATTR_VALUE_Q;
+    } else if c == '&' {
+        (*t).return_state = self_state;
+        (*t).ref_start = (*t).pos - 1;
+        (*t).state = ST_CHAR_REF;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        repl_via(t, s, 2 as u32);
+    } else {
+        value_push(t, s, c);
+    }
+}
+
+fn attr_value_dq_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    attr_value_quoted_state(t, s, '"', ST_ATTR_VALUE_DQ);
+}
+
+fn attr_value_sq_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    attr_value_quoted_state(t, s, 39 as u8, ST_ATTR_VALUE_SQ);
+}
+
+// §13.2.5.38
+fn attr_value_unq_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_tag());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        (*t).state = ST_BEFORE_ATTR_NAME;
+    } else if c == '&' {
+        (*t).return_state = ST_ATTR_VALUE_UNQ;
+        (*t).ref_start = (*t).pos - 1;
+        (*t).state = ST_CHAR_REF;
+    } else if c == '>' {
+        emit_tag(t, s);
+        (*t).state = ST_DATA;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        repl_via(t, s, 2 as u32);
+    } else {
+        if c == '"' || c == 39 as u8 || c == '<' || c == '=' || c == 96 as u8 {
+            error(t, s, tokens.err_unexpected_character_in_unquoted_attribute_value());
+        }
+        value_push(t, s, c);
+    }
+}
+
+// §13.2.5.39
+fn after_attr_value_q_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_tag());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        (*t).state = ST_BEFORE_ATTR_NAME;
+    } else if c == '/' {
+        (*t).state = ST_SELF_CLOSING;
+    } else if c == '>' {
+        emit_tag(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        error(t, s, tokens.err_missing_whitespace_between_attributes());
+        reconsume(t, ST_BEFORE_ATTR_NAME);
+    }
+}
+
+// §13.2.5.40
+fn self_closing_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_tag());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '>' {
+        (*t).cur_self_closing = true;
+        emit_tag(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        error(t, s, tokens.err_unexpected_solidus_in_tag());
+        reconsume(t, ST_BEFORE_ATTR_NAME);
+    }
+}
+
+// --- Comments ----------------------------------------------------------------
+
+// §13.2.5.41
+fn bogus_comment_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        emit_comment(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '>' {
+        emit_comment(t, s);
+        (*t).state = ST_DATA;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        repl_via(t, s, 3 as u32);
+    } else {
+        comment_push(t, s, c);
+    }
+}
+
+// §13.2.5.42
+fn markup_decl_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = (*t).input[(*t).pos];
+        if c == '-' && (*t).pos + 1 < (*t).length
+            && (*t).input[(*t).pos + 1] == '-' {
+            (*t).pos = (*t).pos + 2;
+            comment_begin(t, s);
+            (*t).state = ST_COMMENT_START;
+            return;
+        }
+    }
+    if take_ci(t, "doctype") {
+        (*t).state = ST_DOCTYPE;
+        return;
+    }
+    if matches_here(t, "[CDATA[") {
+        // No tree construction yet, so there is never an adjusted current
+        // node in a non-HTML namespace: always the HTML-content error path.
+        (*t).pos = (*t).pos + 7;
+        error(t, s, tokens.err_cdata_in_html_content());
+        comment_begin(t, s);
+        comment_push(t, s, '[');
+        comment_push(t, s, 'C');
+        comment_push(t, s, 'D');
+        comment_push(t, s, 'A');
+        comment_push(t, s, 'T');
+        comment_push(t, s, 'A');
+        comment_push(t, s, '[');
+        (*t).state = ST_BOGUS_COMMENT;
+        return;
+    }
+    error(t, s, tokens.err_incorrectly_opened_comment());
+    comment_begin(t, s);
+    (*t).state = ST_BOGUS_COMMENT;
+}
+
+fn matches_here(t: *HtmlTokenizer, text: *u8) -> bool {
+    let n: u64 = 0;
+    while text[n] != 0 as u8 {
+        n = n + 1;
+    }
+    if (*t).pos + n > (*t).length {
+        return false;
+    }
+    for index: u64 in 0..n {
+        if (*t).input[(*t).pos + index] != text[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// §13.2.5.43
+fn comment_start_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        reconsume_eof_as(t, ST_COMMENT);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        (*t).state = ST_COMMENT_START_DASH;
+    } else if c == '>' {
+        error(t, s, tokens.err_abrupt_closing_of_empty_comment());
+        emit_comment(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        reconsume(t, ST_COMMENT);
+    }
+}
+
+// §13.2.5.44
+fn comment_start_dash_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_comment());
+        emit_comment(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        (*t).state = ST_COMMENT_END;
+    } else if c == '>' {
+        error(t, s, tokens.err_abrupt_closing_of_empty_comment());
+        emit_comment(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        comment_push(t, s, '-');
+        reconsume(t, ST_COMMENT);
+    }
+}
+
+// §13.2.5.45
+fn comment_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_comment());
+        emit_comment(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '<' {
+        comment_push(t, s, c);
+        (*t).state = ST_COMMENT_LT;
+    } else if c == '-' {
+        (*t).state = ST_COMMENT_END_DASH;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        repl_via(t, s, 3 as u32);
+    } else {
+        comment_push(t, s, c);
+    }
+}
+
+// §13.2.5.46
+fn comment_lt_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        reconsume_eof_as(t, ST_COMMENT);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '!' {
+        comment_push(t, s, c);
+        (*t).state = ST_COMMENT_LT_BANG;
+    } else if c == '<' {
+        comment_push(t, s, c);
+    } else {
+        reconsume(t, ST_COMMENT);
+    }
+}
+
+// §13.2.5.47
+fn comment_lt_bang_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        reconsume_eof_as(t, ST_COMMENT);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        (*t).state = ST_COMMENT_LT_BANG_DASH;
+    } else {
+        reconsume(t, ST_COMMENT);
+    }
+}
+
+// §13.2.5.48
+fn comment_lt_bang_dash_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        reconsume_eof_as(t, ST_COMMENT_END_DASH);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        (*t).state = ST_COMMENT_LT_BANG_DASH_DASH;
+    } else {
+        reconsume(t, ST_COMMENT_END_DASH);
+    }
+}
+
+// §13.2.5.49
+fn comment_lt_bang_dash_dash_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        reconsume_eof_as(t, ST_COMMENT_END);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '>' {
+        reconsume(t, ST_COMMENT_END);
+    } else {
+        error(t, s, tokens.err_nested_comment());
+        reconsume(t, ST_COMMENT_END);
+    }
+}
+
+// §13.2.5.50
+fn comment_end_dash_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_comment());
+        emit_comment(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        (*t).state = ST_COMMENT_END;
+    } else {
+        comment_push(t, s, '-');
+        reconsume(t, ST_COMMENT);
+    }
+}
+
+// §13.2.5.51
+fn comment_end_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_comment());
+        emit_comment(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '>' {
+        emit_comment(t, s);
+        (*t).state = ST_DATA;
+    } else if c == '!' {
+        (*t).state = ST_COMMENT_END_BANG;
+    } else if c == '-' {
+        comment_push(t, s, '-');
+    } else {
+        comment_push(t, s, '-');
+        comment_push(t, s, '-');
+        reconsume(t, ST_COMMENT);
+    }
+}
+
+// §13.2.5.52
+fn comment_end_bang_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_comment());
+        emit_comment(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        comment_push(t, s, '-');
+        comment_push(t, s, '-');
+        comment_push(t, s, '!');
+        (*t).state = ST_COMMENT_END_DASH;
+    } else if c == '>' {
+        error(t, s, tokens.err_incorrectly_closed_comment());
+        emit_comment(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        comment_push(t, s, '-');
+        comment_push(t, s, '-');
+        comment_push(t, s, '!');
+        reconsume(t, ST_COMMENT);
+    }
+}
+
+// --- DOCTYPE -----------------------------------------------------------------
+
+// §13.2.5.53
+fn doctype_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        doctype_begin(t, s);
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        (*t).state = ST_BEFORE_DOCTYPE_NAME;
+    } else if c == '>' {
+        reconsume(t, ST_BEFORE_DOCTYPE_NAME);
+    } else {
+        error(t, s, tokens.err_missing_whitespace_before_doctype_name());
+        reconsume(t, ST_BEFORE_DOCTYPE_NAME);
+    }
+}
+
+// §13.2.5.54
+fn before_doctype_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        doctype_begin(t, s);
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '>' {
+        error(t, s, tokens.err_missing_doctype_name());
+        doctype_begin(t, s);
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+        return;
+    }
+    doctype_begin(t, s);
+    (*t).doctype_has_name = true;
+    if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        doctype_name_push(t, s, 0xEF as u8);
+        doctype_name_push(t, s, 0xBF as u8);
+        doctype_name_push(t, s, 0xBD as u8);
+    } else {
+        doctype_name_push(t, s, to_lower(c));
+    }
+    (*t).state = ST_DOCTYPE_NAME;
+}
+
+// §13.2.5.55
+fn doctype_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        (*t).state = ST_AFTER_DOCTYPE_NAME;
+    } else if c == '>' {
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        doctype_name_push(t, s, 0xEF as u8);
+        doctype_name_push(t, s, 0xBF as u8);
+        doctype_name_push(t, s, 0xBD as u8);
+    } else {
+        doctype_name_push(t, s, to_lower(c));
+    }
+}
+
+// §13.2.5.56
+fn after_doctype_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '>' {
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+        return;
+    }
+    (*t).pos = (*t).pos - 1;
+    if take_ci(t, "public") {
+        (*t).state = ST_AFTER_DOCTYPE_PUBLIC_KW;
+        return;
+    }
+    if take_ci(t, "system") {
+        (*t).state = ST_AFTER_DOCTYPE_SYSTEM_KW;
+        return;
+    }
+    error(t, s, tokens.err_invalid_character_sequence_after_doctype_name());
+    (*t).doctype_force_quirks = true;
+    (*t).state = ST_BOGUS_DOCTYPE;
+}
+
+// §13.2.5.57
+fn after_doctype_public_kw_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        (*t).state = ST_BEFORE_DOCTYPE_PUBLIC_ID;
+    } else if c == '"' {
+        error(t, s, tokens.err_missing_whitespace_after_doctype_public_keyword());
+        (*t).doctype_has_public = true;
+        (*t).doctype_public_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_PUBLIC_ID_DQ;
+    } else if c == 39 as u8 {
+        error(t, s, tokens.err_missing_whitespace_after_doctype_public_keyword());
+        (*t).doctype_has_public = true;
+        (*t).doctype_public_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_PUBLIC_ID_SQ;
+    } else if c == '>' {
+        error(t, s, tokens.err_missing_doctype_public_identifier());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        error(t, s, tokens.err_missing_quote_before_doctype_public_identifier());
+        (*t).doctype_force_quirks = true;
+        reconsume(t, ST_BOGUS_DOCTYPE);
+    }
+}
+
+// §13.2.5.58
+fn before_doctype_public_id_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '"' {
+        (*t).doctype_has_public = true;
+        (*t).doctype_public_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_PUBLIC_ID_DQ;
+    } else if c == 39 as u8 {
+        (*t).doctype_has_public = true;
+        (*t).doctype_public_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_PUBLIC_ID_SQ;
+    } else if c == '>' {
+        error(t, s, tokens.err_missing_doctype_public_identifier());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        error(t, s, tokens.err_missing_quote_before_doctype_public_identifier());
+        (*t).doctype_force_quirks = true;
+        reconsume(t, ST_BOGUS_DOCTYPE);
+    }
+}
+
+// §13.2.5.59 / §13.2.5.60
+fn doctype_public_id_state(t: *HtmlTokenizer, s: *HtmlTokenSink, quote: u8) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == quote {
+        (*t).state = ST_AFTER_DOCTYPE_PUBLIC_ID;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        public_push(t, s, 0xEF as u8);
+        public_push(t, s, 0xBF as u8);
+        public_push(t, s, 0xBD as u8);
+    } else if c == '>' {
+        error(t, s, tokens.err_abrupt_doctype_public_identifier());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        public_push(t, s, c);
+    }
+}
+
+// §13.2.5.61
+fn after_doctype_public_id_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        (*t).state = ST_BETWEEN_PUBLIC_SYSTEM;
+    } else if c == '>' {
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else if c == '"' {
+        error(t, s,
+            tokens.err_missing_whitespace_between_doctype_public_and_system_identifiers());
+        (*t).doctype_has_system = true;
+        (*t).doctype_system_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_SYSTEM_ID_DQ;
+    } else if c == 39 as u8 {
+        error(t, s,
+            tokens.err_missing_whitespace_between_doctype_public_and_system_identifiers());
+        (*t).doctype_has_system = true;
+        (*t).doctype_system_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_SYSTEM_ID_SQ;
+    } else {
+        error(t, s, tokens.err_missing_quote_before_doctype_system_identifier());
+        (*t).doctype_force_quirks = true;
+        reconsume(t, ST_BOGUS_DOCTYPE);
+    }
+}
+
+// §13.2.5.62
+fn between_public_system_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '>' {
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else if c == '"' {
+        (*t).doctype_has_system = true;
+        (*t).doctype_system_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_SYSTEM_ID_DQ;
+    } else if c == 39 as u8 {
+        (*t).doctype_has_system = true;
+        (*t).doctype_system_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_SYSTEM_ID_SQ;
+    } else {
+        error(t, s, tokens.err_missing_quote_before_doctype_system_identifier());
+        (*t).doctype_force_quirks = true;
+        reconsume(t, ST_BOGUS_DOCTYPE);
+    }
+}
+
+// §13.2.5.63
+fn after_doctype_system_kw_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        (*t).state = ST_BEFORE_DOCTYPE_SYSTEM_ID;
+    } else if c == '"' {
+        error(t, s, tokens.err_missing_whitespace_after_doctype_system_keyword());
+        (*t).doctype_has_system = true;
+        (*t).doctype_system_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_SYSTEM_ID_DQ;
+    } else if c == 39 as u8 {
+        error(t, s, tokens.err_missing_whitespace_after_doctype_system_keyword());
+        (*t).doctype_has_system = true;
+        (*t).doctype_system_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_SYSTEM_ID_SQ;
+    } else if c == '>' {
+        error(t, s, tokens.err_missing_doctype_system_identifier());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        error(t, s, tokens.err_missing_quote_before_doctype_system_identifier());
+        (*t).doctype_force_quirks = true;
+        reconsume(t, ST_BOGUS_DOCTYPE);
+    }
+}
+
+// §13.2.5.64
+fn before_doctype_system_id_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '"' {
+        (*t).doctype_has_system = true;
+        (*t).doctype_system_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_SYSTEM_ID_DQ;
+    } else if c == 39 as u8 {
+        (*t).doctype_has_system = true;
+        (*t).doctype_system_off = (*s).pool.length;
+        (*t).state = ST_DOCTYPE_SYSTEM_ID_SQ;
+    } else if c == '>' {
+        error(t, s, tokens.err_missing_doctype_system_identifier());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        error(t, s, tokens.err_missing_quote_before_doctype_system_identifier());
+        (*t).doctype_force_quirks = true;
+        reconsume(t, ST_BOGUS_DOCTYPE);
+    }
+}
+
+// §13.2.5.65 / §13.2.5.66
+fn doctype_system_id_state(t: *HtmlTokenizer, s: *HtmlTokenSink, quote: u8) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == quote {
+        (*t).state = ST_AFTER_DOCTYPE_SYSTEM_ID;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        system_push(t, s, 0xEF as u8);
+        system_push(t, s, 0xBF as u8);
+        system_push(t, s, 0xBD as u8);
+    } else if c == '>' {
+        error(t, s, tokens.err_abrupt_doctype_system_identifier());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        system_push(t, s, c);
+    }
+}
+
+// §13.2.5.67
+fn after_doctype_system_id_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_doctype());
+        (*t).doctype_force_quirks = true;
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if is_ws(c) {
+        return;
+    }
+    if c == '>' {
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else {
+        error(t, s, tokens.err_unexpected_character_after_doctype_system_identifier());
+        reconsume(t, ST_BOGUS_DOCTYPE);
+    }
+}
+
+// §13.2.5.68
+fn bogus_doctype_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        emit_doctype(t, s);
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '>' {
+        emit_doctype(t, s);
+        (*t).state = ST_DATA;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+    }
+}
+
+// --- Character references ----------------------------------------------------
+
+// §13.2.5.72
+fn char_ref_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if is_alnum(c) {
+            reconsume(t, ST_NAMED_CHAR_REF);
+            return;
+        }
+        if c == '#' {
+            (*t).char_ref_code = 0 as u32;
+            (*t).state = ST_NUMERIC_CHAR_REF;
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    ref_flush_raw(t, s);
+    (*t).state = (*t).return_state;
+}
+
+// §13.2.5.73
+fn named_char_ref_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    let m: HtmlEntityMatch =
+        entities.lookup((*t).input, (*t).length, (*t).pos);
+    if m.len == 0 {
+        // Nothing in the table matches: flush the '&' and let the ambiguous
+        // ampersand state walk the alphanumerics.
+        ref_flush_raw(t, s);
+        (*t).state = ST_AMBIGUOUS_AMPERSAND;
+        return;
+    }
+    (*t).pos = (*t).pos + m.len;
+    if !m.semicolon && ref_in_attr(t) && !at_eof(t) {
+        let next: u8 = (*t).input[(*t).pos];
+        if next == '=' || is_alnum(next) {
+            // Historical quirk: "&notin" in an attribute value stays literal.
+            ref_flush_raw(t, s);
+            (*t).state = (*t).return_state;
+            return;
+        }
+    }
+    if !m.semicolon {
+        error(t, s, tokens.err_missing_semicolon_after_character_reference());
+    }
+    ref_emit_cp(t, s, m.cp1);
+    if m.cp2 != 0 as u32 {
+        ref_emit_cp(t, s, m.cp2);
+    }
+    (*t).state = (*t).return_state;
+}
+
+// §13.2.5.74
+fn ambiguous_ampersand_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if is_alnum(c) {
+            ref_emit_byte(t, s, c);
+            return;
+        }
+        if c == ';' {
+            error(t, s, tokens.err_unknown_named_character_reference());
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    (*t).state = (*t).return_state;
+}
+
+// §13.2.5.75
+fn numeric_char_ref_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if c == 'x' || c == 'X' {
+            (*t).state = ST_HEX_CHAR_REF_START;
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    (*t).state = ST_DEC_CHAR_REF_START;
+}
+
+// §13.2.5.76
+fn hex_char_ref_start_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = (*t).input[(*t).pos];
+        if is_hex(c) {
+            (*t).state = ST_HEX_CHAR_REF;
+            return;
+        }
+    }
+    error(t, s, tokens.err_absence_of_digits_in_numeric_character_reference());
+    ref_flush_raw(t, s);
+    (*t).state = (*t).return_state;
+}
+
+// §13.2.5.77
+fn dec_char_ref_start_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = (*t).input[(*t).pos];
+        if is_digit(c) {
+            (*t).state = ST_DEC_CHAR_REF;
+            return;
+        }
+    }
+    error(t, s, tokens.err_absence_of_digits_in_numeric_character_reference());
+    ref_flush_raw(t, s);
+    (*t).state = (*t).return_state;
+}
+
+fn accumulate_ref(t: *HtmlTokenizer, base: u32, digit: u32) -> void {
+    // Saturate above the Unicode range; the end state maps it to U+FFFD.
+    if (*t).char_ref_code < 0x00200000 as u32 {
+        (*t).char_ref_code = (*t).char_ref_code * base + digit;
+    }
+}
+
+// §13.2.5.78
+fn hex_char_ref_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if is_digit(c) {
+            accumulate_ref(t, 16 as u32, (c - '0') as u32);
+            return;
+        }
+        if c >= 'a' && c <= 'f' {
+            accumulate_ref(t, 16 as u32, (c - 'a') as u32 + 10 as u32);
+            return;
+        }
+        if c >= 'A' && c <= 'F' {
+            accumulate_ref(t, 16 as u32, (c - 'A') as u32 + 10 as u32);
+            return;
+        }
+        if c == ';' {
+            numeric_ref_end(t, s);
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    error(t, s, tokens.err_missing_semicolon_after_character_reference());
+    numeric_ref_end(t, s);
+}
+
+// §13.2.5.79
+fn dec_char_ref_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if is_digit(c) {
+            accumulate_ref(t, 10 as u32, (c - '0') as u32);
+            return;
+        }
+        if c == ';' {
+            numeric_ref_end(t, s);
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    error(t, s, tokens.err_missing_semicolon_after_character_reference());
+    numeric_ref_end(t, s);
+}
+
+// §13.2.5.80 — numeric character reference end state. Operates on the
+// accumulated code without consuming input, then returns to the return state.
+fn numeric_ref_end(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    let code: u32 = (*t).char_ref_code;
+    if code == 0 as u32 {
+        error(t, s, tokens.err_null_character_reference());
+        code = 0xFFFD as u32;
+    } else if code > 0x10FFFF as u32 {
+        error(t, s, tokens.err_character_reference_outside_unicode_range());
+        code = 0xFFFD as u32;
+    } else if code >= 0xD800 as u32 && code <= 0xDFFF as u32 {
+        error(t, s, tokens.err_surrogate_character_reference());
+        code = 0xFFFD as u32;
+    } else if is_noncharacter(code) {
+        error(t, s, tokens.err_noncharacter_character_reference());
+    } else if code == 0x0D as u32
+        || (is_control_cp(code) && !is_ws_cp(code)) {
+        error(t, s, tokens.err_control_character_reference());
+        code = map_c1(code);
+    }
+    ref_emit_cp(t, s, code);
+    (*t).state = (*t).return_state;
+}
+
+fn is_noncharacter(code: u32) -> bool {
+    if code >= 0xFDD0 as u32 && code <= 0xFDEF as u32 {
+        return true;
+    }
+    let low: u32 = code & (0xFFFF as u32);
+    return low == 0xFFFE as u32 || low == 0xFFFF as u32;
+}
+
+fn is_control_cp(code: u32) -> bool {
+    return code <= 0x1F as u32
+        || (code >= 0x7F as u32 && code <= 0x9F as u32);
+}
+
+fn is_ws_cp(code: u32) -> bool {
+    return code == 0x09 as u32 || code == 0x0A as u32
+        || code == 0x0C as u32 || code == 0x0D as u32
+        || code == 0x20 as u32;
+}
+
+// The spec's C1-controls mapping table (§13.2.5.80). Codes not listed map to
+// themselves.
+fn map_c1(code: u32) -> u32 {
+    if code == 0x80 as u32 { return 0x20AC as u32; }
+    if code == 0x82 as u32 { return 0x201A as u32; }
+    if code == 0x83 as u32 { return 0x0192 as u32; }
+    if code == 0x84 as u32 { return 0x201E as u32; }
+    if code == 0x85 as u32 { return 0x2026 as u32; }
+    if code == 0x86 as u32 { return 0x2020 as u32; }
+    if code == 0x87 as u32 { return 0x2021 as u32; }
+    if code == 0x88 as u32 { return 0x02C6 as u32; }
+    if code == 0x89 as u32 { return 0x2030 as u32; }
+    if code == 0x8A as u32 { return 0x0160 as u32; }
+    if code == 0x8B as u32 { return 0x2039 as u32; }
+    if code == 0x8C as u32 { return 0x0152 as u32; }
+    if code == 0x8E as u32 { return 0x017D as u32; }
+    if code == 0x91 as u32 { return 0x2018 as u32; }
+    if code == 0x92 as u32 { return 0x2019 as u32; }
+    if code == 0x93 as u32 { return 0x201C as u32; }
+    if code == 0x94 as u32 { return 0x201D as u32; }
+    if code == 0x95 as u32 { return 0x2022 as u32; }
+    if code == 0x96 as u32 { return 0x2013 as u32; }
+    if code == 0x97 as u32 { return 0x2014 as u32; }
+    if code == 0x98 as u32 { return 0x02DC as u32; }
+    if code == 0x99 as u32 { return 0x2122 as u32; }
+    if code == 0x9A as u32 { return 0x0161 as u32; }
+    if code == 0x9B as u32 { return 0x203A as u32; }
+    if code == 0x9C as u32 { return 0x0153 as u32; }
+    if code == 0x9E as u32 { return 0x017E as u32; }
+    if code == 0x9F as u32 { return 0x0178 as u32; }
+    return code;
+}

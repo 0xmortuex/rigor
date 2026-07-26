@@ -1,0 +1,249 @@
+// Token output of the HTML tokenizer — WHATWG HTML §13.2.5.
+//
+// The sink is a flat arena, following the layout std.json proved out: every
+// token is plain data in one Vec<HtmlToken>, attributes live contiguously in
+// one Vec<HtmlAttr>, and all string bytes (tag names, attribute names and
+// values, text runs, comment data, doctype identifiers) live in a single
+// shared byte pool addressed by (offset, length). Nothing nested owns a
+// resource, so the whole structure stays inside Mort's ownership model, and
+// growing an arena never invalidates a reference.
+//
+// Character tokens are coalesced: one KIND_CHARS token covers a maximal run
+// of text, rather than one token per code point as the spec narrates. The
+// observable token stream is equivalent, and every real engine batches runs.
+module engine.html.tokens;
+
+import std.vec;
+
+// --- Token kinds (HtmlToken.kind) -------------------------------------------
+// 0 chars, 1 start tag, 2 end tag, 3 comment, 4 doctype, 5 end-of-file.
+// Cross-module code reads these through the kind_*() functions below, because
+// Mort globals are file-scope.
+
+pub fn kind_chars() -> u8 { return 0 as u8; }
+pub fn kind_start_tag() -> u8 { return 1 as u8; }
+pub fn kind_end_tag() -> u8 { return 2 as u8; }
+pub fn kind_comment() -> u8 { return 3 as u8; }
+pub fn kind_doctype() -> u8 { return 4 as u8; }
+pub fn kind_eof() -> u8 { return 5 as u8; }
+
+// One attribute of a start (or, per spec error recovery, end) tag.
+struct HtmlAttr {
+    name_off: u64,
+    name_len: u64,
+    value_off: u64,
+    value_len: u64,
+}
+
+// One token. Which fields are meaningful depends on `kind`:
+//   chars    — data_off/data_len (the text run)
+//   start    — data_off/data_len (tag name), attr_first/attr_count,
+//              self_closing
+//   end      — data_off/data_len (tag name)
+//   comment  — data_off/data_len (comment data)
+//   doctype  — data_off/data_len (name; has_name false when absent),
+//              public/system identifiers, force_quirks
+struct HtmlToken {
+    kind: u8,
+    self_closing: bool,
+    force_quirks: bool,
+    has_name: bool,
+    has_public: bool,
+    has_system: bool,
+    data_off: u64,
+    data_len: u64,
+    attr_first: u64,
+    attr_count: u64,
+    public_off: u64,
+    public_len: u64,
+    system_off: u64,
+    system_len: u64,
+}
+
+// A parse error, identified by spec error code (see error codes below) and
+// the byte offset in the normalized input where it was noticed.
+struct HtmlParseError {
+    code: u32,
+    pos: u64,
+}
+
+resource struct HtmlTokenSink {
+    tokens: Vec<HtmlToken>,
+    attrs: Vec<HtmlAttr>,
+    pool: Vec<u8>,
+    errors: Vec<HtmlParseError>,
+    // Scratch used by the tokenizer for the spec's "temporary buffer"
+    // (RCDATA/RAWTEXT end-tag matching, character-reference lookahead).
+    scratch: Vec<u8>,
+}
+
+pub fn new_sink() -> HtmlTokenSink {
+    return HtmlTokenSink {
+        tokens: vec.new<HtmlToken>(),
+        attrs: vec.new<HtmlAttr>(),
+        pool: vec.new<u8>(),
+        errors: vec.new<HtmlParseError>(),
+        scratch: vec.new<u8>(),
+    };
+}
+
+pub fn destroy(sink: *HtmlTokenSink) -> void {
+    vec.destroy(&(*sink).tokens);
+    vec.destroy(&(*sink).attrs);
+    vec.destroy(&(*sink).pool);
+    vec.destroy(&(*sink).errors);
+    vec.destroy(&(*sink).scratch);
+}
+
+pub fn empty_token() -> HtmlToken {
+    return HtmlToken {
+        kind: 0 as u8,
+        self_closing: false,
+        force_quirks: false,
+        has_name: false,
+        has_public: false,
+        has_system: false,
+        data_off: 0,
+        data_len: 0,
+        attr_first: 0,
+        attr_count: 0,
+        public_off: 0,
+        public_len: 0,
+        system_off: 0,
+        system_len: 0,
+    };
+}
+
+pub fn token_count(sink: *HtmlTokenSink) -> u64 {
+    return (*sink).tokens.length;
+}
+
+pub fn get_token(sink: *HtmlTokenSink, index: u64) -> HtmlToken {
+    match vec.get(&(*sink).tokens, index) {
+        Option<HtmlToken>.Some(token) => { return token; },
+        Option<HtmlToken>.None => { return empty_token(); },
+    }
+}
+
+pub fn get_attr(sink: *HtmlTokenSink, index: u64) -> HtmlAttr {
+    match vec.get(&(*sink).attrs, index) {
+        Option<HtmlAttr>.Some(attr) => { return attr; },
+        Option<HtmlAttr>.None => {
+            return HtmlAttr { name_off: 0, name_len: 0, value_off: 0, value_len: 0 };
+        },
+    }
+}
+
+// View `length` pool bytes starting at `offset`.
+pub fn pool_bytes(sink: *HtmlTokenSink, offset: u64, length: u64) -> []const u8 {
+    let base: *const u8 = (*sink).pool.data as *const u8;
+    return slice((&base[offset]) as *const u8, length);
+}
+
+pub fn error_count(sink: *HtmlTokenSink) -> u64 {
+    return (*sink).errors.length;
+}
+
+pub fn get_error(sink: *HtmlTokenSink, index: u64) -> HtmlParseError {
+    match vec.get(&(*sink).errors, index) {
+        Option<HtmlParseError>.Some(error) => { return error; },
+        Option<HtmlParseError>.None => {
+            return HtmlParseError { code: 0 as u32, pos: 0 };
+        },
+    }
+}
+
+// --- Parse error codes -------------------------------------------------------
+// Names are the specification's own error identifiers (§13.2 "parse errors").
+// Codes are stable u32s; error_name maps a code back to the spec name.
+
+pub fn err_unexpected_null_character() -> u32 { return 1 as u32; }
+pub fn err_unexpected_question_mark_instead_of_tag_name() -> u32 { return 2 as u32; }
+pub fn err_invalid_first_character_of_tag_name() -> u32 { return 3 as u32; }
+pub fn err_missing_end_tag_name() -> u32 { return 4 as u32; }
+pub fn err_eof_before_tag_name() -> u32 { return 5 as u32; }
+pub fn err_eof_in_tag() -> u32 { return 6 as u32; }
+pub fn err_unexpected_equals_sign_before_attribute_name() -> u32 { return 7 as u32; }
+pub fn err_unexpected_character_in_attribute_name() -> u32 { return 8 as u32; }
+pub fn err_duplicate_attribute() -> u32 { return 9 as u32; }
+pub fn err_missing_attribute_value() -> u32 { return 10 as u32; }
+pub fn err_unexpected_character_in_unquoted_attribute_value() -> u32 { return 11 as u32; }
+pub fn err_missing_whitespace_between_attributes() -> u32 { return 12 as u32; }
+pub fn err_unexpected_solidus_in_tag() -> u32 { return 13 as u32; }
+pub fn err_incorrectly_opened_comment() -> u32 { return 14 as u32; }
+pub fn err_abrupt_closing_of_empty_comment() -> u32 { return 15 as u32; }
+pub fn err_eof_in_comment() -> u32 { return 16 as u32; }
+pub fn err_nested_comment() -> u32 { return 17 as u32; }
+pub fn err_incorrectly_closed_comment() -> u32 { return 18 as u32; }
+pub fn err_eof_in_doctype() -> u32 { return 19 as u32; }
+pub fn err_missing_whitespace_before_doctype_name() -> u32 { return 20 as u32; }
+pub fn err_missing_doctype_name() -> u32 { return 21 as u32; }
+pub fn err_invalid_character_sequence_after_doctype_name() -> u32 { return 22 as u32; }
+pub fn err_missing_whitespace_after_doctype_public_keyword() -> u32 { return 23 as u32; }
+pub fn err_missing_doctype_public_identifier() -> u32 { return 24 as u32; }
+pub fn err_missing_quote_before_doctype_public_identifier() -> u32 { return 25 as u32; }
+pub fn err_abrupt_doctype_public_identifier() -> u32 { return 26 as u32; }
+pub fn err_missing_whitespace_between_doctype_public_and_system_identifiers() -> u32 { return 27 as u32; }
+pub fn err_missing_quote_before_doctype_system_identifier() -> u32 { return 28 as u32; }
+pub fn err_missing_whitespace_after_doctype_system_keyword() -> u32 { return 29 as u32; }
+pub fn err_missing_doctype_system_identifier() -> u32 { return 30 as u32; }
+pub fn err_abrupt_doctype_system_identifier() -> u32 { return 31 as u32; }
+pub fn err_unexpected_character_after_doctype_system_identifier() -> u32 { return 32 as u32; }
+pub fn err_cdata_in_html_content() -> u32 { return 33 as u32; }
+pub fn err_missing_semicolon_after_character_reference() -> u32 { return 34 as u32; }
+pub fn err_unknown_named_character_reference() -> u32 { return 35 as u32; }
+pub fn err_absence_of_digits_in_numeric_character_reference() -> u32 { return 36 as u32; }
+pub fn err_null_character_reference() -> u32 { return 37 as u32; }
+pub fn err_character_reference_outside_unicode_range() -> u32 { return 38 as u32; }
+pub fn err_surrogate_character_reference() -> u32 { return 39 as u32; }
+pub fn err_noncharacter_character_reference() -> u32 { return 40 as u32; }
+pub fn err_control_character_reference() -> u32 { return 41 as u32; }
+pub fn err_end_tag_with_attributes() -> u32 { return 42 as u32; }
+pub fn err_end_tag_with_trailing_solidus() -> u32 { return 43 as u32; }
+
+pub fn error_name(code: u32) -> *u8 {
+    if code == 1 as u32 { return "unexpected-null-character"; }
+    if code == 2 as u32 { return "unexpected-question-mark-instead-of-tag-name"; }
+    if code == 3 as u32 { return "invalid-first-character-of-tag-name"; }
+    if code == 4 as u32 { return "missing-end-tag-name"; }
+    if code == 5 as u32 { return "eof-before-tag-name"; }
+    if code == 6 as u32 { return "eof-in-tag"; }
+    if code == 7 as u32 { return "unexpected-equals-sign-before-attribute-name"; }
+    if code == 8 as u32 { return "unexpected-character-in-attribute-name"; }
+    if code == 9 as u32 { return "duplicate-attribute"; }
+    if code == 10 as u32 { return "missing-attribute-value"; }
+    if code == 11 as u32 { return "unexpected-character-in-unquoted-attribute-value"; }
+    if code == 12 as u32 { return "missing-whitespace-between-attributes"; }
+    if code == 13 as u32 { return "unexpected-solidus-in-tag"; }
+    if code == 14 as u32 { return "incorrectly-opened-comment"; }
+    if code == 15 as u32 { return "abrupt-closing-of-empty-comment"; }
+    if code == 16 as u32 { return "eof-in-comment"; }
+    if code == 17 as u32 { return "nested-comment"; }
+    if code == 18 as u32 { return "incorrectly-closed-comment"; }
+    if code == 19 as u32 { return "eof-in-doctype"; }
+    if code == 20 as u32 { return "missing-whitespace-before-doctype-name"; }
+    if code == 21 as u32 { return "missing-doctype-name"; }
+    if code == 22 as u32 { return "invalid-character-sequence-after-doctype-name"; }
+    if code == 23 as u32 { return "missing-whitespace-after-doctype-public-keyword"; }
+    if code == 24 as u32 { return "missing-doctype-public-identifier"; }
+    if code == 25 as u32 { return "missing-quote-before-doctype-public-identifier"; }
+    if code == 26 as u32 { return "abrupt-doctype-public-identifier"; }
+    if code == 27 as u32 { return "missing-whitespace-between-doctype-public-and-system-identifiers"; }
+    if code == 28 as u32 { return "missing-quote-before-doctype-system-identifier"; }
+    if code == 29 as u32 { return "missing-whitespace-after-doctype-system-keyword"; }
+    if code == 30 as u32 { return "missing-doctype-system-identifier"; }
+    if code == 31 as u32 { return "abrupt-doctype-system-identifier"; }
+    if code == 32 as u32 { return "unexpected-character-after-doctype-system-identifier"; }
+    if code == 33 as u32 { return "cdata-in-html-content"; }
+    if code == 34 as u32 { return "missing-semicolon-after-character-reference"; }
+    if code == 35 as u32 { return "unknown-named-character-reference"; }
+    if code == 36 as u32 { return "absence-of-digits-in-numeric-character-reference"; }
+    if code == 37 as u32 { return "null-character-reference"; }
+    if code == 38 as u32 { return "character-reference-outside-unicode-range"; }
+    if code == 39 as u32 { return "surrogate-character-reference"; }
+    if code == 40 as u32 { return "noncharacter-character-reference"; }
+    if code == 41 as u32 { return "control-character-reference"; }
+    if code == 42 as u32 { return "end-tag-with-attributes"; }
+    if code == 43 as u32 { return "end-tag-with-trailing-solidus"; }
+    return "unknown-parse-error";
+}

@@ -1,0 +1,5 @@
+import std.string;
+
+test "string length" {
+    assert(str_len("Mort") == 4);
+}

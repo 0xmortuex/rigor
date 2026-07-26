@@ -1,0 +1,145 @@
+// rigor — developer CLI for the Rigor engine.
+//
+// Reads an HTML document on stdin and dumps the tokenizer's output stream,
+// followed by any parse errors (with their spec names and byte offsets):
+//
+//     Get-Content page.html | rigor        (PowerShell)
+//     rigor < page.html                    (cmd / sh)
+//
+// Mort has no argv access yet, so stdin is the whole interface for now.
+
+import std.vec;
+import engine.lib;
+import engine.html.preprocess;
+import engine.html.tokenizer;
+import engine.html.tokens;
+
+extern fn getchar() -> c_int;
+
+fn read_stdin() -> Vec<u8> {
+    let buf: Vec<u8> = vec.new<u8>();
+    loop {
+        let c: c_int = getchar();
+        if c < 0 {
+            break;
+        }
+        vec.push(&buf, c as u8);
+    }
+    return move buf;
+}
+
+fn out_str(out: *Vec<u8>, text: *u8) -> void {
+    let index: u64 = 0;
+    while text[index] != 0 as u8 {
+        vec.push(out, text[index]);
+        index = index + 1;
+    }
+}
+
+fn out_pool(out: *Vec<u8>, sink: *HtmlTokenSink, off: u64, length: u64) -> void {
+    let view: []const u8 = tokens.pool_bytes(sink, off, length);
+    for index: u64 in 0..length {
+        vec.push(out, view[index]);
+    }
+}
+
+fn out_u64(out: *Vec<u8>, value: u64) -> void {
+    if value >= 10 {
+        out_u64(out, value / 10);
+    }
+    vec.push(out, '0' + ((value % 10) as u8));
+}
+
+fn out_line(out: *Vec<u8>) -> void {
+    vec.push(out, 0 as u8);
+    println((*out).data);
+    vec.clear(out);
+}
+
+fn dump_token(out: *Vec<u8>, sink: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(sink, index);
+    if token.kind == tokens.kind_chars() {
+        out_str(out, "text    \"");
+        out_pool(out, sink, token.data_off, token.data_len);
+        out_str(out, "\"");
+    } else if token.kind == tokens.kind_start_tag() {
+        out_str(out, "start   <");
+        out_pool(out, sink, token.data_off, token.data_len);
+        for a: u64 in 0..token.attr_count {
+            let attr: HtmlAttr = tokens.get_attr(sink, token.attr_first + a);
+            out_str(out, " ");
+            out_pool(out, sink, attr.name_off, attr.name_len);
+            out_str(out, "=\"");
+            out_pool(out, sink, attr.value_off, attr.value_len);
+            out_str(out, "\"");
+        }
+        if token.self_closing {
+            out_str(out, " /");
+        }
+        out_str(out, ">");
+    } else if token.kind == tokens.kind_end_tag() {
+        out_str(out, "end     </");
+        out_pool(out, sink, token.data_off, token.data_len);
+        out_str(out, ">");
+    } else if token.kind == tokens.kind_comment() {
+        out_str(out, "comment <!--");
+        out_pool(out, sink, token.data_off, token.data_len);
+        out_str(out, "-->");
+    } else if token.kind == tokens.kind_doctype() {
+        out_str(out, "doctype <!DOCTYPE");
+        if token.has_name {
+            out_str(out, " ");
+            out_pool(out, sink, token.data_off, token.data_len);
+        }
+        if token.has_public {
+            out_str(out, " PUBLIC \"");
+            out_pool(out, sink, token.public_off, token.public_len);
+            out_str(out, "\"");
+        }
+        if token.has_system {
+            out_str(out, " SYSTEM \"");
+            out_pool(out, sink, token.system_off, token.system_len);
+            out_str(out, "\"");
+        }
+        out_str(out, ">");
+        if token.force_quirks {
+            out_str(out, "  (force-quirks)");
+        }
+    } else {
+        out_str(out, "eof");
+    }
+    out_line(out);
+}
+
+fn main() -> int {
+    let raw: Vec<u8> = read_stdin();
+    let normalized: Vec<u8> =
+    preprocess.normalize(raw.data as *const u8, raw.length);
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.run(&t, &sink);
+
+    let out: Vec<u8> = vec.new<u8>();
+    out_str(&out, "rigor ");
+    out_str(&out, lib.version());
+    out_str(&out, " — token dump");
+    out_line(&out);
+    for index: u64 in 0..tokens.token_count(&sink) {
+        dump_token(&out, &sink, index);
+    }
+    let errors: u64 = tokens.error_count(&sink);
+    if errors > 0 {
+        out_str(&out, "-- parse errors --");
+        out_line(&out);
+        for index: u64 in 0..errors {
+            let e: HtmlParseError = tokens.get_error(&sink, index);
+            out_str(&out, "error   ");
+            out_str(&out, tokens.error_name(e.code));
+            out_str(&out, " @ byte ");
+            out_u64(&out, e.pos);
+            out_line(&out);
+        }
+    }
+    return 0;
+}

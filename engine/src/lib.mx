@@ -1,0 +1,9 @@
+// Rigor — a browser engine written in Mort.
+//
+// This file is the package entry point. Importers reach the engine's modules
+// through the `engine` package alias, e.g. `import engine.html.tokenizer;`.
+module engine.lib;
+
+pub fn version() -> *u8 {
+    return "0.1.0";
+}
