@@ -107,6 +107,11 @@ fn write_attributes(
         }
         let attr: DomAttr = node.get_attr(doc, n.attr_first + best);
         push_indent(out, depth);
+        // A namespaced attribute prints as "prefix local".
+        if attr.prefix_len > 0 {
+            push_view(out, node.bytes(doc, attr.prefix_off, attr.prefix_len));
+            push_str(out, " ");
+        }
         push_view(out, node.bytes(doc, attr.name_off, attr.name_len));
         push_str(out, "=\"");
         push_view(out, node.bytes(doc, attr.value_off, attr.value_len));

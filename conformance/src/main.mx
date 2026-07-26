@@ -211,7 +211,7 @@ fn put_token(sink: *HtmlTokenSink, index: u64) -> void {
 }
 
 fn state_code(view: []const u8) -> u32 {
-    // 0 data, 1 RCDATA, 2 RAWTEXT, 3 PLAINTEXT.
+    // 0 data, 1 RCDATA, 2 RAWTEXT, 3 PLAINTEXT, 4 CDATA.
     if len(view) == 0 {
         return 0 as u32;
     }
@@ -224,6 +224,9 @@ fn state_code(view: []const u8) -> u32 {
     }
     if first == 'P' {
         return 3 as u32;
+    }
+    if first == 'C' {
+        return 4 as u32;
     }
     return 0 as u32;
 }
@@ -258,9 +261,9 @@ fn run_case(doc: *Document, case_index: u64) -> void {
     // runs without the byte stream decoder's BOM removal.
     let sink: HtmlTokenSink = tokens.new_sink();
     let normalized: Vec<u8> =
-        preprocess.normalize(slice_ptr(source), len(source), &sink);
+    preprocess.normalize(slice_ptr(source), len(source), &sink);
     let t: HtmlTokenizer =
-        tokenizer.new(normalized.data as *const u8, normalized.length);
+    tokenizer.new(normalized.data as *const u8, normalized.length);
     if len(last_tag) > 0 {
         tokenizer.set_last_start_tag(&t, &sink, slice_ptr(last_tag), len(last_tag));
     }
@@ -270,6 +273,8 @@ fn run_case(doc: *Document, case_index: u64) -> void {
         tokenizer.set_rawtext(&t);
     } else if state == 3 as u32 {
         tokenizer.set_plaintext(&t);
+    } else if state == 4 as u32 {
+        tokenizer.set_cdata(&t);
     }
     tokenizer.run(&t, &sink);
 
@@ -315,10 +320,10 @@ fn run_tree_case(doc: *Document, case_index: u64) -> void {
     }
     let sink: HtmlTokenSink = tokens.new_sink();
     let normalized: Vec<u8> =
-        preprocess.normalize(slice_ptr(source), len(source), &sink);
+    preprocess.normalize(slice_ptr(source), len(source), &sink);
     let tree: DomDocument = node.new_document();
     treebuilder.parse(
-        normalized.data as *const u8, normalized.length, &tree, &sink);
+    normalized.data as *const u8, normalized.length, &tree, &sink);
     let text: Vec<u8> = serialize.document(&tree);
 
     put("{\"tree\":");

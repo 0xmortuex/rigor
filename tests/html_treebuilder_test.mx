@@ -192,6 +192,66 @@ test "a document ending inside script still gets a body" {
     "| <html>\n|   <head>\n|     <script>\n|       \"a\"\n|   <body>\n"));
 }
 
+test "svg and mathml elements carry their namespace" {
+    assert(tree_is("<math><mi>x</mi></math>",
+    "| <html>\n|   <head>\n|   <body>\n|     <math math>\n|       <math mi>\n|         \"x\"\n"));
+}
+
+test "svg tag names are restored to their camel case" {
+    assert(tree_is("<svg><lineargradient/><textpath/></svg>",
+    "| <html>\n|   <head>\n|   <body>\n|     <svg svg>\n|       <svg linearGradient>\n|       <svg textPath>\n"));
+}
+
+test "inside an integration point, names follow html rules again" {
+    // foreignObject is an HTML integration point, so its children are HTML
+    // elements and get no SVG case fix-up.
+    assert(tree_is("<svg><foreignobject><lineargradient/></foreignobject></svg>",
+    "| <html>\n|   <head>\n|   <body>\n|     <svg svg>\n|       <svg foreignObject>\n|         <lineargradient>\n"));
+}
+
+test "svg attribute names are restored to their camel case" {
+    assert(tree_is("<svg viewbox=\"0 0 1 1\"></svg>",
+    "| <html>\n|   <head>\n|   <body>\n|     <svg svg>\n|       viewBox=\"0 0 1 1\"\n"));
+}
+
+test "foreign attributes gain their xml namespace prefix" {
+    assert(tree_is("<svg><a xlink:href=\"x\"></a></svg>",
+    "| <html>\n|   <head>\n|   <body>\n|     <svg svg>\n|       <svg a>\n|         xlink href=\"x\"\n"));
+}
+
+test "a self-closing tag really closes in foreign content" {
+    // Unlike in HTML, where the solidus is ignored.
+    assert(tree_is("<svg><path/><circle/></svg>",
+    "| <html>\n|   <head>\n|   <body>\n|     <svg svg>\n|       <svg path>\n|       <svg circle>\n"));
+}
+
+test "an html integration point holds html children" {
+    assert(tree_is("<svg><foreignobject><p>hi</p></foreignobject></svg>",
+    "| <html>\n|   <head>\n|   <body>\n|     <svg svg>\n|       <svg foreignObject>\n|         <p>\n|           \"hi\"\n"));
+}
+
+test "a mathml text integration point holds html text" {
+    assert(tree_is("<math><mtext><b>x</b></mtext></math>",
+    "| <html>\n|   <head>\n|   <body>\n|     <math math>\n|       <math mtext>\n|         <b>\n|           \"x\"\n"));
+}
+
+test "an html start tag breaks out of foreign content" {
+    // <p> is on the breakout list, so it closes the svg subtree entirely
+    // rather than becoming an SVG element.
+    assert(tree_is("<svg><circle></circle><p>out",
+    "| <html>\n|   <head>\n|   <body>\n|     <svg svg>\n|       <svg circle>\n|     <p>\n|       \"out\"\n"));
+}
+
+test "a cdata section inside foreign content is text" {
+    assert(tree_is("<svg><![CDATA[a<b>c]]></svg>",
+    "| <html>\n|   <head>\n|   <body>\n|     <svg svg>\n|       \"a<b>c\"\n"));
+}
+
+test "a cdata section in html content is a bogus comment" {
+    assert(tree_is("<p><![CDATA[x]]></p>",
+    "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       <!-- [CDATA[x]] -->\n"));
+}
+
 test "unknown elements are ordinary elements" {
     assert(tree_is("<my-widget>x</my-widget>",
     "| <html>\n|   <head>\n|   <body>\n|     <my-widget>\n|       \"x\"\n"));

@@ -1,0 +1,172 @@
+// Name adjustments for foreign content — WHATWG HTML §13.2.6.5.
+//
+// SVG and MathML are case-sensitive XML vocabularies, but the HTML tokenizer
+// lowercases every tag and attribute name. The spec therefore publishes
+// fix-up tables: `foreignobject` becomes `foreignObject`, `viewbox` becomes
+// `viewBox`, `definitionurl` becomes `definitionURL`, and a handful of
+// attributes gain an XML namespace prefix.
+//
+// Each lookup returns a NUL-terminated replacement, or null when the name
+// needs no adjustment — which is the common case, so the caller keeps the
+// original bytes and nothing is copied.
+module engine.html.foreign;
+
+fn matches(name: []const u8, text: *u8) -> bool {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if len(name) != length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        if name[index] != text[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// §13.2.6.5 "adjust SVG tag names". Input is the lowercased tag name.
+pub fn adjust_svg_tag(name: []const u8) -> *u8 {
+    if matches(name, "altglyph") { return "altGlyph"; }
+    if matches(name, "altglyphdef") { return "altGlyphDef"; }
+    if matches(name, "altglyphitem") { return "altGlyphItem"; }
+    if matches(name, "animatecolor") { return "animateColor"; }
+    if matches(name, "animatemotion") { return "animateMotion"; }
+    if matches(name, "animatetransform") { return "animateTransform"; }
+    if matches(name, "clippath") { return "clipPath"; }
+    if matches(name, "feblend") { return "feBlend"; }
+    if matches(name, "fecolormatrix") { return "feColorMatrix"; }
+    if matches(name, "fecomponenttransfer") { return "feComponentTransfer"; }
+    if matches(name, "fecomposite") { return "feComposite"; }
+    if matches(name, "feconvolvematrix") { return "feConvolveMatrix"; }
+    if matches(name, "fediffuselighting") { return "feDiffuseLighting"; }
+    if matches(name, "fedisplacementmap") { return "feDisplacementMap"; }
+    if matches(name, "fedistantlight") { return "feDistantLight"; }
+    if matches(name, "fedropshadow") { return "feDropShadow"; }
+    if matches(name, "feflood") { return "feFlood"; }
+    if matches(name, "fefunca") { return "feFuncA"; }
+    if matches(name, "fefuncb") { return "feFuncB"; }
+    if matches(name, "fefuncg") { return "feFuncG"; }
+    if matches(name, "fefuncr") { return "feFuncR"; }
+    if matches(name, "fegaussianblur") { return "feGaussianBlur"; }
+    if matches(name, "feimage") { return "feImage"; }
+    if matches(name, "femerge") { return "feMerge"; }
+    if matches(name, "femergenode") { return "feMergeNode"; }
+    if matches(name, "femorphology") { return "feMorphology"; }
+    if matches(name, "feoffset") { return "feOffset"; }
+    if matches(name, "fepointlight") { return "fePointLight"; }
+    if matches(name, "fespecularlighting") { return "feSpecularLighting"; }
+    if matches(name, "fespotlight") { return "feSpotLight"; }
+    if matches(name, "fetile") { return "feTile"; }
+    if matches(name, "feturbulence") { return "feTurbulence"; }
+    if matches(name, "foreignobject") { return "foreignObject"; }
+    if matches(name, "glyphref") { return "glyphRef"; }
+    if matches(name, "lineargradient") { return "linearGradient"; }
+    if matches(name, "radialgradient") { return "radialGradient"; }
+    if matches(name, "textpath") { return "textPath"; }
+    return null;
+}
+
+// §13.2.6.5 "adjust SVG attributes".
+pub fn adjust_svg_attribute(name: []const u8) -> *u8 {
+    if matches(name, "attributename") { return "attributeName"; }
+    if matches(name, "attributetype") { return "attributeType"; }
+    if matches(name, "basefrequency") { return "baseFrequency"; }
+    if matches(name, "baseprofile") { return "baseProfile"; }
+    if matches(name, "calcmode") { return "calcMode"; }
+    if matches(name, "clippathunits") { return "clipPathUnits"; }
+    if matches(name, "diffuseconstant") { return "diffuseConstant"; }
+    if matches(name, "edgemode") { return "edgeMode"; }
+    if matches(name, "filterunits") { return "filterUnits"; }
+    if matches(name, "glyphref") { return "glyphRef"; }
+    if matches(name, "gradienttransform") { return "gradientTransform"; }
+    if matches(name, "gradientunits") { return "gradientUnits"; }
+    if matches(name, "kernelmatrix") { return "kernelMatrix"; }
+    if matches(name, "kernelunitlength") { return "kernelUnitLength"; }
+    if matches(name, "keypoints") { return "keyPoints"; }
+    if matches(name, "keysplines") { return "keySplines"; }
+    if matches(name, "keytimes") { return "keyTimes"; }
+    if matches(name, "lengthadjust") { return "lengthAdjust"; }
+    if matches(name, "limitingconeangle") { return "limitingConeAngle"; }
+    if matches(name, "markerheight") { return "markerHeight"; }
+    if matches(name, "markerunits") { return "markerUnits"; }
+    if matches(name, "markerwidth") { return "markerWidth"; }
+    if matches(name, "maskcontentunits") { return "maskContentUnits"; }
+    if matches(name, "maskunits") { return "maskUnits"; }
+    if matches(name, "numoctaves") { return "numOctaves"; }
+    if matches(name, "pathlength") { return "pathLength"; }
+    if matches(name, "patterncontentunits") { return "patternContentUnits"; }
+    if matches(name, "patterntransform") { return "patternTransform"; }
+    if matches(name, "patternunits") { return "patternUnits"; }
+    if matches(name, "pointsatx") { return "pointsAtX"; }
+    if matches(name, "pointsaty") { return "pointsAtY"; }
+    if matches(name, "pointsatz") { return "pointsAtZ"; }
+    if matches(name, "preservealpha") { return "preserveAlpha"; }
+    if matches(name, "preserveaspectratio") { return "preserveAspectRatio"; }
+    if matches(name, "primitiveunits") { return "primitiveUnits"; }
+    if matches(name, "refx") { return "refX"; }
+    if matches(name, "refy") { return "refY"; }
+    if matches(name, "repeatcount") { return "repeatCount"; }
+    if matches(name, "repeatdur") { return "repeatDur"; }
+    if matches(name, "requiredextensions") { return "requiredExtensions"; }
+    if matches(name, "requiredfeatures") { return "requiredFeatures"; }
+    if matches(name, "specularconstant") { return "specularConstant"; }
+    if matches(name, "specularexponent") { return "specularExponent"; }
+    if matches(name, "spreadmethod") { return "spreadMethod"; }
+    if matches(name, "startoffset") { return "startOffset"; }
+    if matches(name, "stddeviation") { return "stdDeviation"; }
+    if matches(name, "stitchtiles") { return "stitchTiles"; }
+    if matches(name, "surfacescale") { return "surfaceScale"; }
+    if matches(name, "systemlanguage") { return "systemLanguage"; }
+    if matches(name, "tablevalues") { return "tableValues"; }
+    if matches(name, "targetx") { return "targetX"; }
+    if matches(name, "targety") { return "targetY"; }
+    if matches(name, "textlength") { return "textLength"; }
+    if matches(name, "viewbox") { return "viewBox"; }
+    if matches(name, "viewtarget") { return "viewTarget"; }
+    if matches(name, "xchannelselector") { return "xChannelSelector"; }
+    if matches(name, "ychannelselector") { return "yChannelSelector"; }
+    if matches(name, "zoomandpan") { return "zoomAndPan"; }
+    return null;
+}
+
+// §13.2.6.5 "adjust MathML attributes" — a table of exactly one entry.
+pub fn adjust_mathml_attribute(name: []const u8) -> *u8 {
+    if matches(name, "definitionurl") { return "definitionURL"; }
+    return null;
+}
+
+// §13.2.6.5 "adjust foreign attributes": the attributes that gain an XML
+// namespace. The prefix and the local name are returned separately, because
+// the DOM records them separately and the html5lib serialization prints them
+// as "prefix local".
+struct ForeignAttribute {
+    adjusted: bool,
+    prefix: *u8,
+    local: *u8,
+}
+
+fn plain() -> ForeignAttribute {
+    return ForeignAttribute { adjusted: false, prefix: null, local: null };
+}
+
+fn namespaced(prefix: *u8, local: *u8) -> ForeignAttribute {
+    return ForeignAttribute { adjusted: true, prefix: prefix, local: local };
+}
+
+pub fn adjust_foreign_attribute(name: []const u8) -> ForeignAttribute {
+    if matches(name, "xlink:actuate") { return namespaced("xlink", "actuate"); }
+    if matches(name, "xlink:arcrole") { return namespaced("xlink", "arcrole"); }
+    if matches(name, "xlink:href") { return namespaced("xlink", "href"); }
+    if matches(name, "xlink:role") { return namespaced("xlink", "role"); }
+    if matches(name, "xlink:show") { return namespaced("xlink", "show"); }
+    if matches(name, "xlink:title") { return namespaced("xlink", "title"); }
+    if matches(name, "xlink:type") { return namespaced("xlink", "type"); }
+    if matches(name, "xml:lang") { return namespaced("xml", "lang"); }
+    if matches(name, "xml:space") { return namespaced("xml", "space"); }
+    if matches(name, "xmlns") { return namespaced("", "xmlns"); }
+    if matches(name, "xmlns:xlink") { return namespaced("xmlns", "xlink"); }
+    return plain();
+}

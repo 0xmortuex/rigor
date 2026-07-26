@@ -10,9 +10,7 @@
 // references (numeric fully; named via engine.html.entities).
 // Not yet implemented (tracked in docs/ROADMAP.md): the script-data states
 // (§13.2.5.15–31, wired up with tree construction, which owns the state
-// switch) and the CDATA-section states (§13.2.5.69–71, reachable only in
-// foreign content). `<![CDATA[` in HTML content takes the spec's
-// cdata-in-html-content bogus-comment path, which is correct until SVG/MathML.
+// switch).
 //
 // The tokenizer is plain data over a normalized input buffer (the caller runs
 // engine.html.preprocess first); all output accumulates in an HtmlTokenSink.
@@ -77,6 +75,9 @@ const ST_DOCTYPE_SYSTEM_ID_DQ: u32 = 65;   // §13.2.5.65
 const ST_DOCTYPE_SYSTEM_ID_SQ: u32 = 66;   // §13.2.5.66
 const ST_AFTER_DOCTYPE_SYSTEM_ID: u32 = 67;    // §13.2.5.67
 const ST_BOGUS_DOCTYPE: u32 = 68;          // §13.2.5.68
+const ST_CDATA: u32 = 69;                  // §13.2.5.69
+const ST_CDATA_BRACKET: u32 = 70;          // §13.2.5.70
+const ST_CDATA_END: u32 = 71;              // §13.2.5.71
 const ST_CHAR_REF: u32 = 72;               // §13.2.5.72
 const ST_NAMED_CHAR_REF: u32 = 73;         // §13.2.5.73
 const ST_AMBIGUOUS_AMPERSAND: u32 = 74;    // §13.2.5.74
@@ -140,6 +141,11 @@ struct HtmlTokenizer {
     // Character reference bookkeeping.
     ref_start: u64,
     char_ref_code: u32,
+
+    // Whether the tree builder's adjusted current node is a foreign element.
+    // Only §13.2.5.42 consults it, to decide whether `<![CDATA[` opens a CDATA
+    // section or is a bogus comment.
+    in_foreign: bool,
 }
 
 // `input` must already be newline-normalized (engine.html.preprocess); the
@@ -161,6 +167,7 @@ pub fn new(input: *const u8, length: u64) -> HtmlTokenizer {
         doctype_system_off: 0, doctype_system_len: 0,
         has_last_start: false, last_start_off: 0, last_start_len: 0,
         ref_start: 0, char_ref_code: 0 as u32,
+        in_foreign: false,
     };
 }
 
@@ -171,6 +178,18 @@ pub fn set_rcdata(t: *HtmlTokenizer) -> void { (*t).state = ST_RCDATA; }
 pub fn set_rawtext(t: *HtmlTokenizer) -> void { (*t).state = ST_RAWTEXT; }
 pub fn set_plaintext(t: *HtmlTokenizer) -> void { (*t).state = ST_PLAINTEXT; }
 pub fn set_data(t: *HtmlTokenizer) -> void { (*t).state = ST_DATA; }
+
+// Tree construction reports whether the adjusted current node is a foreign
+// element, which is the one piece of tree state the tokenizer needs: it
+// decides whether <![CDATA[ opens a CDATA section (§13.2.5.42).
+pub fn set_foreign(t: *HtmlTokenizer, foreign: bool) -> void {
+    (*t).in_foreign = foreign;
+}
+
+// Start inside a CDATA section. Normal parsing reaches this state only through
+// §13.2.5.42; this entry point exists for a harness that wants to exercise the
+// state directly.
+pub fn set_cdata(t: *HtmlTokenizer) -> void { (*t).state = ST_CDATA; }
 
 // Seed the "appropriate end tag" name without having tokenized a start tag.
 // Tree construction needs this when it resumes a tokenizer in a text state,
@@ -641,6 +660,9 @@ fn step(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
     else if st == ST_DOCTYPE_SYSTEM_ID_SQ { doctype_system_id_state(t, s, 39 as u8); }
     else if st == ST_AFTER_DOCTYPE_SYSTEM_ID { after_doctype_system_id_state(t, s); }
     else if st == ST_BOGUS_DOCTYPE { bogus_doctype_state(t, s); }
+    else if st == ST_CDATA { cdata_state(t, s); }
+    else if st == ST_CDATA_BRACKET { cdata_bracket_state(t, s); }
+    else if st == ST_CDATA_END { cdata_end_state(t, s); }
     else if st == ST_CHAR_REF { char_ref_state(t, s); }
     else if st == ST_NAMED_CHAR_REF { named_char_ref_state(t, s); }
     else if st == ST_AMBIGUOUS_AMPERSAND { ambiguous_ampersand_state(t, s); }
@@ -1179,9 +1201,13 @@ fn markup_decl_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
         return;
     }
     if matches_here(t, "[CDATA[") {
-        // No tree construction yet, so there is never an adjusted current
-        // node in a non-HTML namespace: always the HTML-content error path.
         (*t).pos = (*t).pos + 7;
+        if (*t).in_foreign {
+            // Inside SVG or MathML this really is a CDATA section; in HTML
+            // content it is a parse error recovered as a bogus comment.
+            (*t).state = ST_CDATA;
+            return;
+        }
         error(t, s, tokens.err_cdata_in_html_content());
         comment_begin(t, s);
         comment_push(t, s, '[');
@@ -2042,4 +2068,52 @@ fn map_c1(code: u32) -> u32 {
     if code == 0x9E as u32 { return 0x017E as u32; }
     if code == 0x9F as u32 { return 0x0178 as u32; }
     return code;
+}
+
+// --- CDATA sections ----------------------------------------------------------
+
+// §13.2.5.69
+fn cdata_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_cdata());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == 93 as u8 {
+        (*t).state = ST_CDATA_BRACKET;
+        return;
+    }
+    text_push(t, s, c);
+}
+
+// §13.2.5.70
+fn cdata_bracket_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) && (*t).input[(*t).pos] == 93 as u8 {
+        (*t).pos = (*t).pos + 1;
+        (*t).state = ST_CDATA_END;
+        return;
+    }
+    text_push(t, s, 93 as u8);
+    (*t).state = ST_CDATA;
+}
+
+// §13.2.5.71
+fn cdata_end_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = (*t).input[(*t).pos];
+        if c == 93 as u8 {
+            (*t).pos = (*t).pos + 1;
+            text_push(t, s, 93 as u8);
+            return;
+        }
+        if c == 62 as u8 {
+            (*t).pos = (*t).pos + 1;
+            (*t).state = ST_DATA;
+            return;
+        }
+    }
+    text_push(t, s, 93 as u8);
+    text_push(t, s, 93 as u8);
+    (*t).state = ST_CDATA;
 }

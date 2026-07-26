@@ -22,6 +22,7 @@ import std.vec;
 import tokens;
 import tokenizer;
 import tagnames;
+import foreign;
 import engine.dom.node;
 
 // --- Insertion modes (§13.2.4.1) --------------------------------------------
@@ -1008,6 +1009,9 @@ pub fn process(
         return;
     }
     dispatch(b, s, index);
+    // The tokenizer needs to know whether it is inside foreign content, so
+    // that <![CDATA[ opens a CDATA section rather than a bogus comment.
+    tokenizer.set_foreign(t, namespace_of(b, current(b)) != node.ns_html());
     if (*b).pending_text_state != TEXT_NONE {
         if (*b).pending_text_state == TEXT_RCDATA {
             tokenizer.set_rcdata(t);
@@ -1020,7 +1024,316 @@ pub fn process(
     }
 }
 
+// --- Foreign content (§13.2.6.5) ---------------------------------------------
+
+fn namespace_of(b: *HtmlTreeBuilder, element: u64) -> u8 {
+    if element == node.none() {
+        return node.ns_html();
+    }
+    return node.get((*b).doc, element).namespace;
+}
+
+fn name_of(b: *HtmlTreeBuilder, element: u64) -> []const u8 {
+    let current: DomNode = node.get((*b).doc, element);
+    return node.bytes((*b).doc, current.name_off, current.name_len);
+}
+
+fn views_equal(left: []const u8, right: []const u8) -> bool {
+    if len(left) != len(right) {
+        return false;
+    }
+    for index: u64 in 0..len(left) {
+        if left[index] != right[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn name_equals(b: *HtmlTreeBuilder, element: u64, text: *u8) -> bool {
+    return views_equal(name_of(b, element), view_of(text));
+}
+
+// §13.2.6.5: mi, mo, mn, ms and mtext in the MathML namespace hold ordinary
+// HTML text, so HTML rules apply to their character content.
+fn is_mathml_text_integration_point(b: *HtmlTreeBuilder, element: u64) -> bool {
+    if namespace_of(b, element) != node.ns_mathml() {
+        return false;
+    }
+    return name_equals(b, element, "mi") || name_equals(b, element, "mo")
+        || name_equals(b, element, "mn") || name_equals(b, element, "ms")
+        || name_equals(b, element, "mtext");
+}
+
+// An HTML integration point holds a full HTML subtree: SVG's foreignObject,
+// desc and title, and a MathML annotation-xml declaring HTML content.
+fn is_html_integration_point(b: *HtmlTreeBuilder, element: u64) -> bool {
+    let ns: u8 = namespace_of(b, element);
+    if ns == node.ns_svg() {
+        return name_equals(b, element, "foreignObject")
+            || name_equals(b, element, "desc")
+            || name_equals(b, element, "title");
+    }
+    if ns == node.ns_mathml() && name_equals(b, element, "annotation-xml") {
+        let encoding: DomAttrValue =
+            node.find_attr((*b).doc, element, view_of("encoding"));
+        if !encoding.found {
+            return false;
+        }
+        let value: []const u8 =
+            node.bytes((*b).doc, encoding.value_off, encoding.value_len);
+        return equals_ci_view(value, "text/html")
+            || equals_ci_view(value, "application/xhtml+xml");
+    }
+    return false;
+}
+
+fn equals_ci_view(view: []const u8, text: *u8) -> bool {
+    return view_equals_ci(view, text);
+}
+
+// §13.2.6 "tree construction dispatcher": decide whether this token is handled
+// by the current insertion mode or by the foreign content rules.
+fn use_foreign_rules(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> bool {
+    if depth(b) == 0 {
+        return false;
+    }
+    let current_element: u64 = current(b);
+    if namespace_of(b, current_element) == node.ns_html() {
+        return false;
+    }
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_eof() {
+        return false;
+    }
+    if is_mathml_text_integration_point(b, current_element) {
+        if token.kind == tokens.kind_chars() {
+            return false;
+        }
+        if token.kind == tokens.kind_start_tag() {
+            let name: []const u8 = token_data(s, token);
+            if !views_equal(name, view_of("mglyph"))
+                && !views_equal(name, view_of("malignmark")) {
+                return false;
+            }
+        }
+    }
+    if namespace_of(b, current_element) == node.ns_mathml()
+        && name_equals(b, current_element, "annotation-xml")
+        && token.kind == tokens.kind_start_tag()
+        && views_equal(token_data(s, token), view_of("svg")) {
+        return false;
+    }
+    if is_html_integration_point(b, current_element) {
+        if token.kind == tokens.kind_chars()
+            || token.kind == tokens.kind_start_tag() {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The HTML start tags that break out of foreign content entirely.
+fn breaks_out_of_foreign(tag: u32) -> bool {
+    return tag == tagnames.tag_b() || tag == tagnames.tag_big()
+        || tag == tagnames.tag_blockquote() || tag == tagnames.tag_body()
+        || tag == tagnames.tag_br() || tag == tagnames.tag_center()
+        || tag == tagnames.tag_code() || tag == tagnames.tag_dd()
+        || tag == tagnames.tag_div() || tag == tagnames.tag_dl()
+        || tag == tagnames.tag_dt() || tag == tagnames.tag_em()
+        || tag == tagnames.tag_embed() || is_heading(tag)
+        || tag == tagnames.tag_head() || tag == tagnames.tag_hr()
+        || tag == tagnames.tag_i() || tag == tagnames.tag_img()
+        || tag == tagnames.tag_li() || tag == tagnames.tag_listing()
+        || tag == tagnames.tag_menu() || tag == tagnames.tag_meta()
+        || tag == tagnames.tag_nobr() || tag == tagnames.tag_ol()
+        || tag == tagnames.tag_p() || tag == tagnames.tag_pre()
+        || tag == tagnames.tag_ruby() || tag == tagnames.tag_s()
+        || tag == tagnames.tag_small() || tag == tagnames.tag_span()
+        || tag == tagnames.tag_strong() || tag == tagnames.tag_strike()
+        || tag == tagnames.tag_sub() || tag == tagnames.tag_sup()
+        || tag == tagnames.tag_table() || tag == tagnames.tag_tt()
+        || tag == tagnames.tag_u() || tag == tagnames.tag_ul()
+        || tag == tagnames.tag_var();
+}
+
+// Copy a start tag's attributes onto a foreign element, applying the spec's
+// name adjustments for the element's namespace.
+fn copy_foreign_attributes(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    element: u64,
+    namespace: u8
+) -> void {
+    for index: u64 in 0..token.attr_count {
+        let attr: HtmlAttr = tokens.get_attr(s, token.attr_first + index);
+        let name: []const u8 = tokens.pool_bytes(s, attr.name_off, attr.name_len);
+        let value: []const u8 =
+            tokens.pool_bytes(s, attr.value_off, attr.value_len);
+
+        let namespaced: ForeignAttribute = foreign.adjust_foreign_attribute(name);
+        if namespaced.adjusted {
+            node.add_prefixed_attr((*b).doc, element,
+                view_of(namespaced.prefix), view_of(namespaced.local), value);
+            continue;
+        }
+        let adjusted: *u8 = null;
+        if namespace == node.ns_svg() {
+            adjusted = foreign.adjust_svg_attribute(name);
+        } else if namespace == node.ns_mathml() {
+            adjusted = foreign.adjust_mathml_attribute(name);
+        }
+        if adjusted != null {
+            node.add_attr((*b).doc, element, view_of(adjusted), value);
+        } else {
+            node.add_attr((*b).doc, element, name, value);
+        }
+    }
+}
+
+// Create and insert a foreign element for a start tag.
+fn insert_foreign_element(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    token: HtmlToken,
+    namespace: u8
+) -> u64 {
+    let name: []const u8 = token_data(s, token);
+    let adjusted: *u8 = null;
+    if namespace == node.ns_svg() {
+        adjusted = foreign.adjust_svg_tag(name);
+    }
+    let element: u64 = 0;
+    if adjusted != null {
+        element = node.create_element((*b).doc, view_of(adjusted), namespace);
+    } else {
+        element = node.create_element((*b).doc, name, namespace);
+    }
+    copy_foreign_attributes(b, s, token, element, namespace);
+    insert_at(b, appropriate_place(b), element);
+    push_open(b, element);
+    return element;
+}
+
+// §13.2.6.5 "the rules for parsing tokens in foreign content".
+fn foreign_content(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+
+    if token.kind == tokens.kind_chars() {
+        let view: []const u8 = token_data(s, token);
+        insert_text(b, view);
+        if !all_whitespace(view) {
+            (*b).frameset_ok = false;
+        }
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        let breaks_out: bool = breaks_out_of_foreign(tag);
+        if !breaks_out && tag == tagnames.tag_font() {
+            // <font> only breaks out when it carries a presentational
+            // attribute, which is what makes it HTML rather than SVG text.
+            breaks_out = has_attr_named(s, token, "color")
+                || has_attr_named(s, token, "face")
+                || has_attr_named(s, token, "size");
+        }
+        if breaks_out {
+            // Pop back to HTML content and reprocess in the current mode.
+            loop {
+                if depth(b) == 0 {
+                    break;
+                }
+                let element: u64 = current(b);
+                if namespace_of(b, element) == node.ns_html()
+                    || is_mathml_text_integration_point(b, element)
+                    || is_html_integration_point(b, element) {
+                    break;
+                }
+                pop_open(b);
+            }
+            dispatch_html(b, s, index);
+            return;
+        }
+        let namespace: u8 = namespace_of(b, current(b));
+        insert_foreign_element(b, s, token, namespace);
+        if token.self_closing {
+            // In XML a self-closing tag really does close, unlike in HTML.
+            pop_open(b);
+        }
+        return;
+    }
+
+    // End tag: walk the stack for an element whose name matches, popping as it
+    // goes. An HTML element on the way is handled by the current mode instead.
+    let name: []const u8 = token_data(s, token);
+    let position: u64 = depth(b);
+    while position > 0 {
+        position = position - 1;
+        let element: u64 = at(b, position);
+        if position == 0 {
+            return;
+        }
+        if names_equal_ci(name_of(b, element), name) {
+            while depth(b) > position {
+                pop_open(b);
+            }
+            return;
+        }
+        if namespace_of(b, element) == node.ns_html() {
+            dispatch_html(b, s, index);
+            return;
+        }
+    }
+}
+
+fn names_equal_ci(left: []const u8, right: []const u8) -> bool {
+    if len(left) != len(right) {
+        return false;
+    }
+    for index: u64 in 0..len(left) {
+        if ascii_lower(left[index]) != ascii_lower(right[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn has_attr_named(s: *HtmlTokenSink, token: HtmlToken, name: *u8) -> bool {
+    for index: u64 in 0..token.attr_count {
+        let attr: HtmlAttr = tokens.get_attr(s, token.attr_first + index);
+        if view_equals_ci(tokens.pool_bytes(s, attr.name_off, attr.name_len),
+            name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The tree construction dispatcher (§13.2.6): foreign content rules, or the
+// current insertion mode.
 fn dispatch(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    if use_foreign_rules(b, s, index) {
+        foreign_content(b, s, index);
+        return;
+    }
+    dispatch_html(b, s, index);
+}
+
+// Process a token in the current insertion mode, bypassing the dispatcher.
+// Foreign content calls this directly when the spec says to process a token
+// "according to the rules given in the section corresponding to the current
+// insertion mode in HTML content" — going back through dispatch() there would
+// re-enter the foreign rules and never terminate, because the stack has not
+// been unwound at that point.
+fn dispatch_html(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
     let mode: u32 = (*b).mode;
     if mode == MODE_INITIAL { mode_initial(b, s, index); }
     else if mode == MODE_BEFORE_HTML { mode_before_html(b, s, index); }
@@ -2302,6 +2615,20 @@ fn in_body_start_tag(
         insert_element(b, s, token);
         (*b).frameset_ok = false;
         (*b).mode = MODE_IN_TABLE;
+        return;
+    }
+    if tag == tagnames.tag_svg() || tag == tagnames.tag_math() {
+        // §13.2.6.4.7: these open a foreign subtree, and everything inside
+        // goes through the foreign content rules until it is closed.
+        reconstruct_formatting(b);
+        let namespace: u8 = node.ns_svg();
+        if tag == tagnames.tag_math() {
+            namespace = node.ns_mathml();
+        }
+        insert_foreign_element(b, s, token, namespace);
+        if token.self_closing {
+            pop_open(b);
+        }
         return;
     }
     if tag == tagnames.tag_caption() || tag == tagnames.tag_col()

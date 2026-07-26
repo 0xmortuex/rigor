@@ -16,18 +16,19 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       spec-named parse errors
 - [x] Full named-entity table generated from entities.json (2231 names,
       `tools/gen_entities.py` → `engine/src/html/entities.mx`)
-- [x] html5lib-tests tokenizer conformance harness — **6887/6887 tokens and
-      1737/1737 parse-error codes**; 145 cases skipped pending script-data
-      and CDATA states
+- [x] html5lib-tests tokenizer conformance harness — **6943/6943 tokens and
+      1789/1789 parse-error codes**; 89 cases skipped pending script-data
+      states
 - [x] Tree construction → DOM (§13.2.6): document-structure modes, "in body",
       text modes, frameset modes, scopes, implied end tags, active formatting
       elements, adoption agency
 - [x] Table insertion modes (in table / in caption / in column group / in
-      table body / in row / in cell) with foster parenting — **1058/1304
-      (81%)** of the html5lib tree-construction suites
-- [ ] Foreign content: SVG and MathML integration points, CDATA sections, and
-      the script-data tokenizer states — the biggest remaining conformance win
-      (tests9–tests12 and tests21, ~120 cases)
+      table body / in row / in cell) with foster parenting
+- [x] Foreign content: SVG and MathML namespaces, name adjustment tables,
+      integration points, breakout rules, and CDATA sections — tree
+      construction **1205/1304 (92%)**, tokenizer **6943/6943**
+- [ ] The script-data tokenizer states (§13.2.5.15–31), which is what tests16
+      still needs — the largest single remaining parsing gap
 - [ ] `select` insertion modes, `template` contents, fragment parsing
       (`innerHTML`)
 - [x] CSS tokenizer (css-syntax-3 §4) and parser (§5): rules, at-rules,
@@ -62,8 +63,8 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       is no kerning (`kern`/`GPOS`), no ligatures, and no support for scripts
       needing reordering or contextual forms. This is the largest remaining
       typography gap now that outlines are real.
-- [ ] A glyph cache: every glyph is re-rasterized on every paint, which is the
-      obvious performance win and the reason a long page is slow to render
+- [x] A glyph cache, keyed on (face, glyph, size) — about 3x faster on a
+      text-heavy page
 - [ ] CFF/Type-2 outlines, so OpenType fonts without a `glyf` table render
       rather than falling back
 - [ ] Re-layout on window resize (the viewer keeps its initial width)

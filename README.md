@@ -41,19 +41,19 @@ formatting markup.
 ### Tree construction
 
 `python tools/run_tree_conformance.py` against the html5lib-tests
-tree-construction suites: **1058/1304 (81%)**, 26 skipped.
+tree-construction suites: **1205/1304 (92%)**, 26 skipped. 24 of the 41 suites
+pass completely.
 
-The remaining gap is concentrated in features that are not implemented yet,
-and the driver prints the per-suite numbers so it stays visible:
+The driver prints per-suite numbers so the gap stays visible:
 
 | suite | passing | what it covers |
 | --- | ---: | --- |
 | blocks, comments01, doctype01, entities01/02 | 100% | core parsing |
-| tables01, tests6–tests8 | 94–100% | tables and foster parenting |
-| adoption01/02 | 16/19 | misnested formatting |
-| tests1–tests5, tests14–tests25 | 73–100% | general |
-| tests9–tests12 | 0–7% | **foreign content (SVG/MathML)** |
-| tests21 | 4% | **CDATA sections** |
+| tables01, tests8, tests21–tests25 | 100% | tables, CDATA, misc |
+| tests11, ruby, html5test-com | 100% | foreign content, ruby |
+| tests9, tests10 | 85% | SVG/MathML corner cases |
+| tests16 | 79% | **script-data tokenizer states** |
+| adoption01 | 15/17 | misnested formatting |
 
 ### Tokenizer
 
@@ -71,12 +71,12 @@ tokenizer suites (vendored, pinned), via `python tools/run_conformance.py`:
 | pendingSpecChanges | 1 | 100% |
 | test1–test4 | 1874 | 100% |
 | unicodeChars (+ problematic) | 328 | 100% |
-| **total** | **6887** | **100%** |
-| parse-error codes | 1737 | 100% |
+| **total** | **6943** | **100%** |
+| parse-error codes | 1789 | 100% |
 
-145 cases are **skipped, not passed**: they need the script-data or CDATA
-tokenizer states, which arrive with tree construction (those states are driven
-by the tree builder). The harness prints the skip count on every run.
+89 cases are **skipped, not passed**: they need the script-data tokenizer
+states, which are driven by the tree builder and are not implemented. The
+harness prints the skip count on every run.
 
 ## What works today
 
@@ -95,6 +95,10 @@ by the tree builder). The harness prints the skip count on every run.
   "in body", raw-text/RCDATA handling, the full table mode family with foster
   parenting, the frameset modes, the scope algorithms, implied end tags,
   active formatting elements, and the adoption agency algorithm.
+- **Foreign content** (§13.2.6.5): SVG and MathML subtrees with their own
+  namespaces, the tag and attribute case fix-up tables, XML-namespaced
+  attributes such as `xlink:href`, HTML and MathML-text integration points,
+  the breakout rules, self-closing foreign tags, and CDATA sections.
 - **DOM**: a flat-arena tree with elements, text, comments, doctypes and
   attributes, plus a serializer that emits the html5lib tree format.
 - **CSS tokenizer** (Syntax Level 3 §4): every token type, the escape and

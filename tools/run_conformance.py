@@ -39,8 +39,9 @@ STATE_MAP = {
     "PLAINTEXT state": "PLAINTEXT",
     "RCDATA state": "RCDATA",
     "RAWTEXT state": "RAWTEXT",
+    "CDATA section state": "CDATA",
 }
-UNSUPPORTED_STATES = {"Script data state", "CDATA section state"}
+UNSUPPORTED_STATES = {"Script data state"}
 
 ESCAPE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})")
 
@@ -183,7 +184,7 @@ def main():
               f"{epct:6.2f}%  (codes only; rigor records byte offsets, not line/col)")
     if skipped:
         print(f"  {'skipped':<{width}}  {len(skipped):>5}        "
-              f"(script-data / CDATA states, not implemented yet)")
+              f"(script-data states, not implemented yet)")
 
     if args.errors and error_failures:
         from collections import Counter

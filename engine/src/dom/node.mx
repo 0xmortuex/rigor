@@ -37,6 +37,11 @@ struct DomAttr {
     name_len: u64,
     value_off: u64,
     value_len: u64,
+    // Foreign attributes such as xlink:href carry an XML namespace prefix,
+    // which the DOM records separately from the local name. Both are empty for
+    // ordinary HTML attributes, which have no namespace.
+    prefix_off: u64,
+    prefix_len: u64,
 }
 
 struct DomNode {
@@ -125,7 +130,10 @@ pub fn get_attr(doc: *DomDocument, index: u64) -> DomAttr {
     match vec.get(&(*doc).attrs, index) {
         Option<DomAttr>.Some(attr) => { return attr; },
         Option<DomAttr>.None => {
-            return DomAttr { name_off: 0, name_len: 0, value_off: 0, value_len: 0 };
+            return DomAttr {
+                name_off: 0, name_len: 0, value_off: 0, value_len: 0,
+                prefix_off: 0, prefix_len: 0,
+            };
         },
     }
 }
@@ -223,6 +231,7 @@ pub fn add_attr(
     vec.push(&(*doc).attrs, DomAttr {
         name_off: name_off, name_len: len(name),
         value_off: value_off, value_len: len(value),
+        prefix_off: 0, prefix_len: 0,
     });
     node.attr_count = node.attr_count + 1;
     set(doc, element, node);
@@ -427,4 +436,29 @@ pub fn extend_text(doc: *DomDocument, text: u64, data: []const u8) -> void {
     }
     node.data_len = node.data_len + len(data);
     set(doc, text, node);
+}
+
+// Add an attribute carrying an XML namespace prefix, as foreign content's
+// xlink: and xml: attributes do.
+pub fn add_prefixed_attr(
+    doc: *DomDocument,
+    element: u64,
+    prefix: []const u8,
+    name: []const u8,
+    value: []const u8
+) -> void {
+    let node: DomNode = get(doc, element);
+    if node.attr_count == 0 {
+        node.attr_first = (*doc).attrs.length;
+    }
+    let prefix_off: u64 = intern(doc, prefix);
+    let name_off: u64 = intern(doc, name);
+    let value_off: u64 = intern(doc, value);
+    vec.push(&(*doc).attrs, DomAttr {
+        name_off: name_off, name_len: len(name),
+        value_off: value_off, value_len: len(value),
+        prefix_off: prefix_off, prefix_len: len(prefix),
+    });
+    node.attr_count = node.attr_count + 1;
+    set(doc, element, node);
 }
