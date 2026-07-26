@@ -1,0 +1,183 @@
+// Style attributes — CSS Style Attributes (the `style=""` specification).
+//
+// A style attribute holds a declaration list with no selector and no braces,
+// so it is parsed by §5.4.4 "consume a list of declarations" directly. The
+// cascade then treats those declarations as author-origin, but sorting above
+// every author rule regardless of specificity (Cascade §6.4.4 "element-attached
+// styles").
+//
+// All of a document's style attributes are gathered into one arena rather than
+// one per element: their text is concatenated into a single buffer, tokenized
+// in one pass, and parsed into one declaration list, with each element keeping
+// only the range of declarations that came from it. That keeps a page with a
+// thousand inline styles to one tokenizer run instead of a thousand.
+module engine.style.attrstyle;
+
+import std.vec;
+import engine.css.preprocess as css_preprocess;
+import engine.css.tokenizer as css_tokenizer;
+import engine.css.tokens as css_tokens;
+import engine.css.parser as css_parser;
+import engine.css.stylesheet;
+import engine.dom.node;
+
+// Where one element's declarations live in the shared sheet.
+struct AttrRange {
+    decl_first: u64,
+    decl_count: u64,
+}
+
+// Byte bounds of one element's attribute text inside the shared source buffer,
+// used only while building.
+struct AttrSegment {
+    element: u64,
+    start: u64,
+    end: u64,
+}
+
+resource struct AttrStyles {
+    source: Vec<u8>,
+    sink: CssTokenSink,
+    sheet: CssStylesheet,
+    // Indexed by DOM node index; a node with no style attribute has count 0.
+    ranges: Vec<AttrRange>,
+}
+
+pub fn destroy(styles: *AttrStyles) -> void {
+    vec.destroy(&(*styles).source);
+    css_tokens.destroy(&(*styles).sink);
+    stylesheet.destroy(&(*styles).sheet);
+    vec.destroy(&(*styles).ranges);
+}
+
+pub fn sheet_of(styles: *AttrStyles) -> *CssStylesheet {
+    return &(*styles).sheet;
+}
+
+pub fn sink_of(styles: *AttrStyles) -> *CssTokenSink {
+    return &(*styles).sink;
+}
+
+pub fn source_of(styles: *AttrStyles) -> []const u8 {
+    if (*styles).source.length == 0 {
+        return slice(0 as *const u8, 0);
+    }
+    return slice((*styles).source.data as *const u8, (*styles).source.length);
+}
+
+pub fn range_of(styles: *AttrStyles, element: u64) -> AttrRange {
+    match vec.get(&(*styles).ranges, element) {
+        Option<AttrRange>.Some(range) => { return range; },
+        Option<AttrRange>.None => {
+            return AttrRange { decl_first: 0, decl_count: 0 };
+        },
+    }
+}
+
+fn append(out: *Vec<u8>, view: []const u8) -> void {
+    for index: u64 in 0..len(view) {
+        vec.push(out, view[index]);
+    }
+}
+
+fn collect(
+    doc: *DomDocument,
+    element: u64,
+    source: *Vec<u8>,
+    segments: *Vec<AttrSegment>
+) -> void {
+    let n: DomNode = node.get(doc, element);
+    if n.kind == node.kind_element() {
+        let found: DomAttrValue = node.find_attr(doc, element, name_view());
+        if found.found && found.value_len > 0 {
+            // Each attribute is preprocessed on its own and appended already
+            // normalized, so the offsets recorded here are the ones the
+            // tokenizer will report and nothing has to be remapped later.
+            let value: []const u8 =
+                node.bytes(doc, found.value_off, found.value_len);
+            let normalized: Vec<u8> =
+                css_preprocess.normalize(slice_start(value), len(value));
+            let start: u64 = (*source).length;
+            append(source, vec.as_const_slice(&normalized));
+            let end: u64 = (*source).length;
+            vec.destroy(&normalized);
+            // A semicolon and newline keep one element's last declaration from
+            // running into the next element's first.
+            vec.push(source, ';' as u8);
+            vec.push(source, 10 as u8);
+            vec.push(segments, AttrSegment {
+                element: element, start: start, end: end,
+            });
+        }
+    }
+    let child: u64 = n.first_child;
+    while child != node.none() {
+        collect(doc, child, source, segments);
+        child = node.get(doc, child).next_sibling;
+    }
+}
+
+// Taking &view[0] is bounds-checked, so an empty value would trap.
+fn slice_start(view: []const u8) -> *const u8 {
+    if len(view) == 0 {
+        return 0 as *const u8;
+    }
+    return &view[0];
+}
+
+fn name_view() -> []const u8 {
+    let text: *u8 = "style";
+    return slice(text as *const u8, 5);
+}
+
+// Gather, tokenize and parse every style attribute in the document.
+pub fn parse_document(doc: *DomDocument) -> AttrStyles {
+    let source: Vec<u8> = vec.new<u8>();
+    let segments: Vec<AttrSegment> = vec.new<AttrSegment>();
+    collect(doc, 0, &source, &segments);
+
+    let sink: CssTokenSink = css_tokens.new_sink();
+    let t: CssTokenizer =
+        css_tokenizer.new(source.data as *const u8, source.length);
+    css_tokenizer.run(&t, &sink);
+
+    let sheet: CssStylesheet = stylesheet.new_stylesheet();
+    let ranges: Vec<AttrRange> = vec.new<AttrRange>();
+    for index: u64 in 0..node.node_count(doc) {
+        vec.push(&ranges, AttrRange { decl_first: 0, decl_count: 0 });
+    }
+
+    // Tokens are in source order, so one walk assigns every segment its range.
+    let token: u64 = 0;
+    let total: u64 = css_tokens.token_count(&sink);
+    for index: u64 in 0..segments.length {
+        match vec.get(&segments, index) {
+            Option<AttrSegment>.Some(segment) => {
+                while token < total
+                    && css_tokens.get_token(&sink, token).pos < segment.start {
+                    token = token + 1;
+                }
+                let first: u64 = token;
+                while token < total
+                    && css_tokens.get_token(&sink, token).pos < segment.end {
+                    token = token + 1;
+                }
+                let decl_first: u64 = sheet.declarations.length;
+                let count: u64 =
+                    css_parser.parse_declaration_block(&sheet, &sink, first, token);
+                vec.set(&ranges, segment.element, AttrRange {
+                    decl_first: decl_first, decl_count: count,
+                });
+            },
+            Option<AttrSegment>.None => {},
+        }
+    }
+
+    vec.destroy(&segments);
+    return AttrStyles {
+        source: move source,
+        sink: move sink,
+        sheet: move sheet,
+        ranges: move ranges,
+    };
+}

@@ -23,6 +23,9 @@ import engine.css.stylesheet;
 import engine.html.tagnames;
 import engine.style.computed;
 import engine.style.cascade;
+import engine.style.custom;
+import engine.style.media;
+import engine.style.attrstyle;
 import engine.style.ua;
 import engine.layout.box;
 import engine.layout.flow;
@@ -209,9 +212,6 @@ fn main() -> int {
     let ua_sheet: CssStylesheet = stylesheet.new_stylesheet();
     css_parser.parse_stylesheet(&ua_sheet, &ua_sink);
 
-    let styles: StyleTree = computed.new_tree(node.node_count(&doc));
-    cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &styles);
-
     let instance: Handle = win32.module_handle();
     let class_name: *u8 = "RigorWindow";
     let window_class: Win32WindowClass = Win32WindowClass {
@@ -238,14 +238,30 @@ fn main() -> int {
         return 1;
     }
 
-    // Lay out to the window's actual client width rather than a guess, so the
-    // page fits the frame the user sees. Re-laying out on resize is not
-    // implemented yet; the window keeps its initial layout width.
+    // Style and lay out to the window's actual client size rather than a
+    // guess, so that both the page width and any @media query see the frame
+    // the user is actually looking at. The window is therefore created before
+    // the cascade runs, not after.
     let client: Win32Rect = win32.client_rect(window);
     let viewport: f64 = (client.right - client.left) as f64;
     if viewport < 1.0 {
         viewport = 800.0;
     }
+    let view_height: f64 = (client.bottom - client.top) as f64;
+    if view_height < 1.0 {
+        view_height = 600.0;
+    }
+
+    let attrs: AttrStyles = attrstyle.parse_document(&doc);
+    let styles: StyleTree = computed.new_tree(node.node_count(&doc));
+    let env: CustomEnv = custom.new_env();
+    cascade.compute(&doc,
+    cascade.new_source(&ua_sheet, &ua_sink,
+    vec.as_const_slice(&ua_normalized), cascade.origin_ua()),
+    cascade.new_source(&sheet, &css_sink,
+    vec.as_const_slice(&css_normalized), cascade.origin_author()),
+    &attrs, &env, media.screen_context(viewport, view_height), &styles);
+
     let font_set: TextFontSet = fonts.new_set();
     load.load_windows_defaults(&font_set);
     let boxes: LayoutTree = box.new_tree();
@@ -276,6 +292,8 @@ fn main() -> int {
     box.destroy(&boxes);
     fonts.destroy(&font_set);
     computed.destroy(&styles);
+    custom.destroy(&env);
+    attrstyle.destroy(&attrs);
     stylesheet.destroy(&ua_sheet);
     css_tokens.destroy(&ua_sink);
     vec.destroy(&ua_normalized);

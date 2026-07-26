@@ -16,6 +16,9 @@ import engine.css.parser as css_parser;
 import engine.css.stylesheet;
 import engine.style.computed;
 import engine.style.cascade;
+import engine.style.custom;
+import engine.style.media;
+import engine.style.attrstyle;
 import engine.style.ua;
 import engine.layout.box;
 import engine.layout.flow;
@@ -32,6 +35,8 @@ resource struct Laid {
     css_normalized: Vec<u8>,
     css_sink: CssTokenSink,
     sheet: CssStylesheet,
+    attrs: AttrStyles,
+    env: CustomEnv,
     styles: StyleTree,
     font_set: TextFontSet,
     boxes: LayoutTree,
@@ -63,8 +68,15 @@ fn build(html: *u8, css: *u8, viewport: f64) -> Laid {
     let sheet: CssStylesheet = stylesheet.new_stylesheet();
     let css_normalized: Vec<u8> = parse_css(css, &css_sink, &sheet);
 
+    let attrs: AttrStyles = attrstyle.parse_document(&doc);
+    let env: CustomEnv = custom.new_env();
     let styles: StyleTree = computed.new_tree(node.node_count(&doc));
-    cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &styles);
+    cascade.compute(&doc,
+    cascade.new_source(&ua_sheet, &ua_sink,
+    vec.as_const_slice(&ua_normalized), cascade.origin_ua()),
+    cascade.new_source(&sheet, &css_sink,
+    vec.as_const_slice(&css_normalized), cascade.origin_author()),
+    &attrs, &env, media.screen_context(viewport, 600.0), &styles);
 
     // No faces are installed, so metrics use the estimate table. That keeps
     // these expectations independent of which fonts the machine has.
@@ -82,6 +94,8 @@ fn build(html: *u8, css: *u8, viewport: f64) -> Laid {
         css_normalized: move css_normalized,
         css_sink: move css_sink,
         sheet: move sheet,
+        attrs: move attrs,
+        env: move env,
         styles: move styles,
         font_set: move font_set,
         boxes: move boxes,
@@ -92,6 +106,8 @@ fn destroy(l: *Laid) -> void {
     box.destroy(&(*l).boxes);
     fonts.destroy(&(*l).font_set);
     computed.destroy(&(*l).styles);
+    custom.destroy(&(*l).env);
+    attrstyle.destroy(&(*l).attrs);
     stylesheet.destroy(&(*l).sheet);
     css_tokens.destroy(&(*l).css_sink);
     vec.destroy(&(*l).css_normalized);

@@ -426,6 +426,66 @@ pub fn parse_white_space(s: *CssTokenSink, index: u64) -> StyleKeywordResult {
     return StyleKeywordResult { ok: false, value: 0 as u8 };
 }
 
+// visibility (CSS Display §5). Returns 0 for visible and 1 for hidden;
+// `collapse` is only different from `hidden` inside a table, which layout does
+// not distinguish yet, so it is treated as hidden.
+pub fn parse_visibility(s: *CssTokenSink, index: u64) -> StyleKeywordResult {
+    let token: CssToken = css_tokens.get_token(s, index);
+    if token.kind != css_tokens.kind_ident() {
+        return StyleKeywordResult { ok: false, value: 0 as u8 };
+    }
+    let name: []const u8 = css_tokens.token_value(s, token);
+    if equals_ci(name, "visible") {
+        return StyleKeywordResult { ok: true, value: 0 as u8 };
+    }
+    if equals_ci(name, "hidden") || equals_ci(name, "collapse") {
+        return StyleKeywordResult { ok: true, value: 1 as u8 };
+    }
+    return StyleKeywordResult { ok: false, value: 0 as u8 };
+}
+
+pub fn parse_float(s: *CssTokenSink, index: u64) -> StyleKeywordResult {
+    let token: CssToken = css_tokens.get_token(s, index);
+    if token.kind != css_tokens.kind_ident() {
+        return StyleKeywordResult { ok: false, value: 0 as u8 };
+    }
+    let name: []const u8 = css_tokens.token_value(s, token);
+    if equals_ci(name, "none") {
+        return StyleKeywordResult { ok: true, value: computed.float_none() };
+    }
+    // The flow-relative keywords are the logical spellings of left and right
+    // in a left-to-right, top-to-bottom writing mode, which is the only one
+    // rigor lays out.
+    if equals_ci(name, "left") || equals_ci(name, "inline-start") {
+        return StyleKeywordResult { ok: true, value: computed.float_left() };
+    }
+    if equals_ci(name, "right") || equals_ci(name, "inline-end") {
+        return StyleKeywordResult { ok: true, value: computed.float_right() };
+    }
+    return StyleKeywordResult { ok: false, value: 0 as u8 };
+}
+
+pub fn parse_clear(s: *CssTokenSink, index: u64) -> StyleKeywordResult {
+    let token: CssToken = css_tokens.get_token(s, index);
+    if token.kind != css_tokens.kind_ident() {
+        return StyleKeywordResult { ok: false, value: 0 as u8 };
+    }
+    let name: []const u8 = css_tokens.token_value(s, token);
+    if equals_ci(name, "none") {
+        return StyleKeywordResult { ok: true, value: computed.clear_none() };
+    }
+    if equals_ci(name, "left") || equals_ci(name, "inline-start") {
+        return StyleKeywordResult { ok: true, value: computed.clear_left() };
+    }
+    if equals_ci(name, "right") || equals_ci(name, "inline-end") {
+        return StyleKeywordResult { ok: true, value: computed.clear_right() };
+    }
+    if equals_ci(name, "both") {
+        return StyleKeywordResult { ok: true, value: computed.clear_both() };
+    }
+    return StyleKeywordResult { ok: false, value: 0 as u8 };
+}
+
 // font-family: walk the comma-separated list and take the generic family of
 // the first entry recognised. Specific face names are mapped by the table
 // below rather than looked up in a font database, so an unlisted name falls

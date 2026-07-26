@@ -1,0 +1,746 @@
+// Media queries — Media Queries Level 4.
+//
+// A media query list is evaluated against the device rigor is rendering for,
+// which is always a continuous colour screen at the layout viewport's size.
+// Everything here is a boolean decision made once per at-rule per cascade, so
+// the parser works directly over the at-rule's prelude token range rather than
+// building a tree.
+//
+// Grammar covered (§3, §4): comma-separated queries; `not` and `only`; the
+// media types `all`, `screen`, `print`, `speech`; `and`/`or`/`not` conditions
+// with parenthesised nesting; the discrete features `orientation`, `scan`,
+// `grid`, `hover`, `any-hover`, `pointer`, `any-pointer` and `update`; and the
+// range features `width`, `height`, `device-width`, `device-height`,
+// `aspect-ratio`, `device-aspect-ratio`, `resolution` and `color`, in the
+// `min-`/`max-` prefixed form, the plain form, and the `<`/`<=`/`>`/`>=`/`=`
+// range form including the two-sided `100px <= width < 900px`.
+//
+// A feature rigor does not know is false, and a malformed query is false —
+// §3.1 says an unknown or malformed query evaluates to false rather than
+// being dropped, which is what makes `@media (unknown: 1)` hide its rules.
+module engine.style.media;
+
+import std.vec;
+import engine.css.tokens as css_tokens;
+import engine.style.computed;
+import engine.style.values;
+
+// What the queries are evaluated against. Sizes are CSS pixels.
+struct MediaContext {
+    width: f64,
+    height: f64,
+    // The screen, as opposed to paged output.
+    print: bool,
+}
+
+pub fn screen_context(width: f64, height: f64) -> MediaContext {
+    return MediaContext { width: width, height: height, print: false };
+}
+
+// --- Token cursor ------------------------------------------------------------
+
+struct MediaCursor {
+    pos: u64,
+    limit: u64,
+}
+
+fn kind_at(s: *CssTokenSink, index: u64) -> u8 {
+    return css_tokens.get_token(s, index).kind;
+}
+
+fn at_end(c: *MediaCursor, s: *CssTokenSink) -> bool {
+    return (*c).pos >= (*c).limit
+        || kind_at(s, (*c).pos) == css_tokens.kind_eof();
+}
+
+fn skip_ws(c: *MediaCursor, s: *CssTokenSink) -> void {
+    while !at_end(c, s) && kind_at(s, (*c).pos) == css_tokens.kind_whitespace() {
+        (*c).pos = (*c).pos + 1;
+    }
+}
+
+fn ident_is(s: *CssTokenSink, index: u64, text: *u8) -> bool {
+    let token: CssToken = css_tokens.get_token(s, index);
+    if token.kind != css_tokens.kind_ident() {
+        return false;
+    }
+    return values.equals_ci(css_tokens.token_value(s, token), text);
+}
+
+// Consume `word` if it is the next non-whitespace token.
+fn eat_ident(c: *MediaCursor, s: *CssTokenSink, word: *u8) -> bool {
+    skip_ws(c, s);
+    if at_end(c, s) || !ident_is(s, (*c).pos, word) {
+        return false;
+    }
+    (*c).pos = (*c).pos + 1;
+    return true;
+}
+
+// Move past a balanced (...) group whose opening token is at the cursor.
+fn skip_group(c: *MediaCursor, s: *CssTokenSink) -> void {
+    let depth: u64 = 0;
+    while !at_end(c, s) {
+        let kind: u8 = kind_at(s, (*c).pos);
+        if kind == css_tokens.kind_open_paren()
+            || kind == css_tokens.kind_function() {
+            depth = depth + 1;
+        } else if kind == css_tokens.kind_close_paren() {
+            depth = depth - 1;
+            if depth == 0 {
+                (*c).pos = (*c).pos + 1;
+                return;
+            }
+        }
+        (*c).pos = (*c).pos + 1;
+    }
+}
+
+// --- Comparison --------------------------------------------------------------
+
+// Comparison operators, as the direction the *feature value* must satisfy.
+const CMP_NONE: u8 = 0;
+const CMP_LT: u8 = 1;
+const CMP_LE: u8 = 2;
+const CMP_GT: u8 = 3;
+const CMP_GE: u8 = 4;
+const CMP_EQ: u8 = 5;
+
+fn flip(op: u8) -> u8 {
+    if op == CMP_LT { return CMP_GT; }
+    if op == CMP_LE { return CMP_GE; }
+    if op == CMP_GT { return CMP_LT; }
+    if op == CMP_GE { return CMP_LE; }
+    return op;
+}
+
+fn compare(left: f64, op: u8, right: f64) -> bool {
+    if op == CMP_LT { return left < right; }
+    if op == CMP_LE { return left <= right; }
+    if op == CMP_GT { return left > right; }
+    if op == CMP_GE { return left >= right; }
+    // Equality on computed pixel lengths, with the tolerance a float compare
+    // needs to survive `min-width: 40em` resolving to 640.00000000000006.
+    let difference: f64 = left - right;
+    if difference < 0.0 {
+        difference = 0.0 - difference;
+    }
+    return difference < 0.0001;
+}
+
+// Read `<`, `<=`, `>`, `>=` or `=` at the cursor. CMP_NONE when there is none.
+fn read_comparison(c: *MediaCursor, s: *CssTokenSink) -> u8 {
+    skip_ws(c, s);
+    if at_end(c, s) {
+        return CMP_NONE;
+    }
+    let token: CssToken = css_tokens.get_token(s, (*c).pos);
+    if token.kind != css_tokens.kind_delim() {
+        return CMP_NONE;
+    }
+    if token.delim == ('=' as u32) {
+        (*c).pos = (*c).pos + 1;
+        return CMP_EQ;
+    }
+    if token.delim != ('<' as u32) && token.delim != ('>' as u32) {
+        return CMP_NONE;
+    }
+    let less: bool = token.delim == ('<' as u32);
+    (*c).pos = (*c).pos + 1;
+    // `<=` is two delim tokens with nothing between them; a space would make
+    // it `<` followed by an `=`, which is not the range syntax.
+    if !at_end(c, s) {
+        let next: CssToken = css_tokens.get_token(s, (*c).pos);
+        if next.kind == css_tokens.kind_delim() && next.delim == ('=' as u32) {
+            (*c).pos = (*c).pos + 1;
+            if less { return CMP_LE; }
+            return CMP_GE;
+        }
+    }
+    if less { return CMP_LT; }
+    return CMP_GT;
+}
+
+// --- Feature values ----------------------------------------------------------
+
+struct MediaValue {
+    ok: bool,
+    number: f64,
+    // Set for an ident value such as `landscape`, so discrete features can
+    // compare names rather than numbers.
+    is_ident: bool,
+    ident_off: u64,
+    ident_len: u64,
+}
+
+fn no_value() -> MediaValue {
+    return MediaValue {
+        ok: false, number: 0.0, is_ident: false, ident_off: 0, ident_len: 0,
+    };
+}
+
+fn numeric(value: f64) -> MediaValue {
+    return MediaValue {
+        ok: true, number: value, is_ident: false, ident_off: 0, ident_len: 0,
+    };
+}
+
+// Read one feature value: a length, a plain number, a ratio, or an ident.
+fn read_value(c: *MediaCursor, s: *CssTokenSink) -> MediaValue {
+    skip_ws(c, s);
+    if at_end(c, s) {
+        return no_value();
+    }
+    let token: CssToken = css_tokens.get_token(s, (*c).pos);
+    if token.kind == css_tokens.kind_ident() {
+        (*c).pos = (*c).pos + 1;
+        return MediaValue {
+            ok: true, number: 0.0, is_ident: true,
+            ident_off: token.value_off, ident_len: token.value_len,
+        };
+    }
+    if token.kind == css_tokens.kind_dimension() {
+        let unit: []const u8 = css_tokens.token_value(s, token);
+        // Resolutions are their own unit family (CSS Values §8.2) and are
+        // normalised to dppx, which is what `resolution` reports.
+        if values.equals_ci(unit, "dppx") || values.equals_ci(unit, "x") {
+            (*c).pos = (*c).pos + 1;
+            return numeric(token.number);
+        }
+        if values.equals_ci(unit, "dpi") {
+            (*c).pos = (*c).pos + 1;
+            return numeric(token.number / 96.0);
+        }
+        if values.equals_ci(unit, "dpcm") {
+            (*c).pos = (*c).pos + 1;
+            return numeric(token.number * 2.54 / 96.0);
+        }
+        // Media feature lengths resolve against the initial font size: there
+        // is no element for em to refer to (§1.2), so em and rem are both 16px.
+        let length: StyleLengthResult =
+            values.parse_length(s, (*c).pos, 16.0, 16.0, false);
+        (*c).pos = (*c).pos + 1;
+        if !length.ok || length.length.kind != computed.length_px() {
+            return no_value();
+        }
+        return numeric(length.length.value);
+    }
+    if token.kind != css_tokens.kind_number() {
+        return no_value();
+    }
+    (*c).pos = (*c).pos + 1;
+    let number: f64 = token.number;
+    // A ratio is `<number> / <number>`, which is how aspect-ratio is written.
+    let save: u64 = (*c).pos;
+    skip_ws(c, s);
+    if !at_end(c, s) {
+        let slash: CssToken = css_tokens.get_token(s, (*c).pos);
+        if slash.kind == css_tokens.kind_delim() && slash.delim == ('/' as u32) {
+            (*c).pos = (*c).pos + 1;
+            skip_ws(c, s);
+            if !at_end(c, s) {
+                let denominator: CssToken = css_tokens.get_token(s, (*c).pos);
+                if denominator.kind == css_tokens.kind_number()
+                    && denominator.number != 0.0 {
+                    (*c).pos = (*c).pos + 1;
+                    return MediaValue {
+                        ok: true, number: number / denominator.number,
+                        is_ident: false, ident_off: 0, ident_len: 0,
+                    };
+                }
+            }
+            return no_value();
+        }
+    }
+    (*c).pos = save;
+    return MediaValue {
+        ok: true, number: number, is_ident: false, ident_off: 0, ident_len: 0,
+    };
+}
+
+fn value_is(s: *CssTokenSink, value: MediaValue, text: *u8) -> bool {
+    if !value.is_ident {
+        return false;
+    }
+    return values.equals_ci(
+        css_tokens.pool_bytes(s, value.ident_off, value.ident_len), text);
+}
+
+// --- Features ----------------------------------------------------------------
+
+// The value rigor's device has for a range feature, or ok=false when the
+// feature is not one it knows.
+struct FeatureValue {
+    known: bool,
+    value: f64,
+}
+
+fn range_feature(name: []const u8, ctx: MediaContext) -> FeatureValue {
+    if values.equals_ci(name, "width") || values.equals_ci(name, "device-width") {
+        return FeatureValue { known: true, value: ctx.width };
+    }
+    if values.equals_ci(name, "height")
+        || values.equals_ci(name, "device-height") {
+        return FeatureValue { known: true, value: ctx.height };
+    }
+    if values.equals_ci(name, "aspect-ratio")
+        || values.equals_ci(name, "device-aspect-ratio") {
+        if ctx.height == 0.0 {
+            return FeatureValue { known: true, value: 0.0 };
+        }
+        return FeatureValue { known: true, value: ctx.width / ctx.height };
+    }
+    if values.equals_ci(name, "resolution") {
+        // parse_length turns dppx and dpi into pixels-per-px already; rigor
+        // renders at exactly one device pixel per CSS pixel.
+        return FeatureValue { known: true, value: 1.0 };
+    }
+    if values.equals_ci(name, "color") {
+        // Bits per colour component. rigor's canvas is 8 bits per channel.
+        return FeatureValue { known: true, value: 8.0 };
+    }
+    if values.equals_ci(name, "color-index") || values.equals_ci(name, "monochrome") {
+        // A truecolour display has no colour lookup table and is not
+        // monochrome, so both are zero (§11.5, §11.6).
+        return FeatureValue { known: true, value: 0.0 };
+    }
+    return FeatureValue { known: false, value: 0.0 };
+}
+
+// Evaluate a feature written with no value, e.g. `(color)`. §2.4.3: that form
+// is true when the feature's value is neither zero nor `none`.
+fn boolean_feature(name: []const u8, ctx: MediaContext) -> bool {
+    let range: FeatureValue = range_feature(name, ctx);
+    if range.known {
+        return range.value != 0.0;
+    }
+    if values.equals_ci(name, "orientation") || values.equals_ci(name, "scan")
+        || values.equals_ci(name, "update") {
+        return true;
+    }
+    if values.equals_ci(name, "hover") || values.equals_ci(name, "any-hover")
+        || values.equals_ci(name, "pointer")
+        || values.equals_ci(name, "any-pointer") {
+        // A mouse-driven window: hover works and the pointer is fine.
+        return true;
+    }
+    if values.equals_ci(name, "grid") {
+        // A bitmap device, not a character grid.
+        return false;
+    }
+    return false;
+}
+
+// Discrete features compare against a keyword rather than a number.
+struct DiscreteResult {
+    known: bool,
+    value: bool,
+}
+
+fn discrete_feature(
+    s: *CssTokenSink,
+    name: []const u8,
+    value: MediaValue,
+    ctx: MediaContext
+) -> DiscreteResult {
+    if values.equals_ci(name, "orientation") {
+        let landscape: bool = ctx.width >= ctx.height;
+        if value_is(s, value, "landscape") {
+            return DiscreteResult { known: true, value: landscape };
+        }
+        if value_is(s, value, "portrait") {
+            return DiscreteResult { known: true, value: !landscape };
+        }
+        return DiscreteResult { known: true, value: false };
+    }
+    if values.equals_ci(name, "scan") {
+        // A window is progressive, not interlaced.
+        return DiscreteResult {
+            known: true, value: value_is(s, value, "progressive"),
+        };
+    }
+    if values.equals_ci(name, "grid") {
+        return DiscreteResult {
+            known: true, value: !value.is_ident && value.number == 0.0,
+        };
+    }
+    if values.equals_ci(name, "hover") || values.equals_ci(name, "any-hover") {
+        return DiscreteResult { known: true, value: value_is(s, value, "hover") };
+    }
+    if values.equals_ci(name, "pointer")
+        || values.equals_ci(name, "any-pointer") {
+        return DiscreteResult { known: true, value: value_is(s, value, "fine") };
+    }
+    if values.equals_ci(name, "update") {
+        return DiscreteResult { known: true, value: value_is(s, value, "fast") };
+    }
+    return DiscreteResult { known: false, value: false };
+}
+
+// --- Conditions --------------------------------------------------------------
+
+// One parenthesised feature test or nested condition, from the open paren.
+fn evaluate_in_parens(
+    c: *MediaCursor,
+    s: *CssTokenSink,
+    ctx: MediaContext
+) -> bool {
+    let start: u64 = (*c).pos;
+    let outer_limit: u64 = (*c).limit;
+    // Confine the cursor to the inside of this group so an inner parse cannot
+    // run past its closing paren.
+    let scan: MediaCursor = MediaCursor { pos: start, limit: outer_limit };
+    skip_group(&scan, s);
+    let after: u64 = scan.pos;
+    let inner_limit: u64 = after;
+    if inner_limit > start {
+        inner_limit = inner_limit - 1;
+    }
+
+    let inner: MediaCursor = MediaCursor { pos: start + 1, limit: inner_limit };
+    let result: bool = evaluate_inside(&inner, s, ctx);
+    (*c).pos = after;
+    return result;
+}
+
+// The contents of a (...) group: either a nested condition or a feature test.
+fn evaluate_inside(
+    c: *MediaCursor,
+    s: *CssTokenSink,
+    ctx: MediaContext
+) -> bool {
+    skip_ws(c, s);
+    if at_end(c, s) {
+        return false;
+    }
+    let kind: u8 = kind_at(s, (*c).pos);
+    if kind == css_tokens.kind_open_paren() || ident_is(s, (*c).pos, "not") {
+        return evaluate_condition(c, s, ctx);
+    }
+    if kind != css_tokens.kind_ident() {
+        // The value-first range form: `400px <= width`.
+        return evaluate_reverse_range(c, s, ctx);
+    }
+
+    let name_token: CssToken = css_tokens.get_token(s, (*c).pos);
+    let name: []const u8 = css_tokens.token_value(s, name_token);
+    (*c).pos = (*c).pos + 1;
+    skip_ws(c, s);
+    if at_end(c, s) {
+        return boolean_feature(name, ctx);
+    }
+
+    if kind_at(s, (*c).pos) == css_tokens.kind_colon() {
+        (*c).pos = (*c).pos + 1;
+        return evaluate_colon_feature(c, s, name, ctx);
+    }
+
+    // `width >= 600px`, possibly with a second bound after it.
+    let op: u8 = read_comparison(c, s);
+    if op == CMP_NONE {
+        return false;
+    }
+    let feature: FeatureValue = range_feature(name, ctx);
+    let bound: MediaValue = read_value(c, s);
+    if !feature.known || !bound.ok || bound.is_ident {
+        return false;
+    }
+    if !compare(feature.value, op, bound.number) {
+        return false;
+    }
+    skip_ws(c, s);
+    if at_end(c, s) {
+        return true;
+    }
+    // A two-sided range: the first bound was really the lower one.
+    let second_op: u8 = read_comparison(c, s);
+    if second_op == CMP_NONE {
+        return false;
+    }
+    let second: MediaValue = read_value(c, s);
+    if !second.ok || second.is_ident {
+        return false;
+    }
+    return compare(feature.value, second_op, second.number);
+}
+
+// `400px <= width <= 700px`: the feature name comes after the first bound, so
+// the comparison reads backwards.
+fn evaluate_reverse_range(
+    c: *MediaCursor,
+    s: *CssTokenSink,
+    ctx: MediaContext
+) -> bool {
+    let lower: MediaValue = read_value(c, s);
+    if !lower.ok || lower.is_ident {
+        return false;
+    }
+    let op: u8 = read_comparison(c, s);
+    if op == CMP_NONE {
+        return false;
+    }
+    skip_ws(c, s);
+    if at_end(c, s) || kind_at(s, (*c).pos) != css_tokens.kind_ident() {
+        return false;
+    }
+    let name_token: CssToken = css_tokens.get_token(s, (*c).pos);
+    let name: []const u8 = css_tokens.token_value(s, name_token);
+    (*c).pos = (*c).pos + 1;
+    let feature: FeatureValue = range_feature(name, ctx);
+    if !feature.known {
+        return false;
+    }
+    // `lower <= width` means `width >= lower`.
+    if !compare(feature.value, flip(op), lower.number) {
+        return false;
+    }
+    skip_ws(c, s);
+    if at_end(c, s) {
+        return true;
+    }
+    let upper_op: u8 = read_comparison(c, s);
+    if upper_op == CMP_NONE {
+        return false;
+    }
+    let upper: MediaValue = read_value(c, s);
+    if !upper.ok || upper.is_ident {
+        return false;
+    }
+    return compare(feature.value, upper_op, upper.number);
+}
+
+// `(min-width: 600px)`, `(orientation: portrait)`, `(width: 800px)`.
+fn evaluate_colon_feature(
+    c: *MediaCursor,
+    s: *CssTokenSink,
+    name: []const u8,
+    ctx: MediaContext
+) -> bool {
+    let value: MediaValue = read_value(c, s);
+    if !value.ok {
+        return false;
+    }
+    // §2.4.1: a min-/max- prefix is a range feature written the old way.
+    let op: u8 = CMP_EQ;
+    let bare: []const u8 = name;
+    if starts_with_ci(name, "min-") {
+        op = CMP_GE;
+        bare = drop_prefix(name, 4);
+    } else if starts_with_ci(name, "max-") {
+        op = CMP_LE;
+        bare = drop_prefix(name, 4);
+    }
+
+    let feature: FeatureValue = range_feature(bare, ctx);
+    if feature.known {
+        if value.is_ident {
+            return false;
+        }
+        return compare(feature.value, op, value.number);
+    }
+    if op != CMP_EQ {
+        // A min-/max- prefix on something that is not a range feature.
+        return false;
+    }
+    let discrete: DiscreteResult = discrete_feature(s, name, value, ctx);
+    if discrete.known {
+        return discrete.value;
+    }
+    return false;
+}
+
+fn starts_with_ci(view: []const u8, prefix: *u8) -> bool {
+    let length: u64 = 0;
+    while prefix[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if len(view) < length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        let c: u8 = view[index];
+        if c >= 'A' && c <= 'Z' {
+            c = c + 32 as u8;
+        }
+        if c != prefix[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn drop_prefix(view: []const u8, count: u64) -> []const u8 {
+    if len(view) <= count {
+        return slice(0 as *const u8, 0);
+    }
+    return slice((&view[count]) as *const u8, len(view) - count);
+}
+
+// §3.3 <media-condition>: `not`, or a chain of `and`/`or` over parens.
+fn evaluate_condition(
+    c: *MediaCursor,
+    s: *CssTokenSink,
+    ctx: MediaContext
+) -> bool {
+    skip_ws(c, s);
+    if eat_ident(c, s, "not") {
+        skip_ws(c, s);
+        if at_end(c, s) || kind_at(s, (*c).pos) != css_tokens.kind_open_paren() {
+            return false;
+        }
+        return !evaluate_in_parens(c, s, ctx);
+    }
+    skip_ws(c, s);
+    if at_end(c, s) || kind_at(s, (*c).pos) != css_tokens.kind_open_paren() {
+        return false;
+    }
+    let result: bool = evaluate_in_parens(c, s, ctx);
+    loop {
+        skip_ws(c, s);
+        if at_end(c, s) {
+            return result;
+        }
+        let is_and: bool = ident_is(s, (*c).pos, "and");
+        let is_or: bool = ident_is(s, (*c).pos, "or");
+        if !is_and && !is_or {
+            // Junk after a complete condition makes the query malformed.
+            return false;
+        }
+        (*c).pos = (*c).pos + 1;
+        skip_ws(c, s);
+        if at_end(c, s) || kind_at(s, (*c).pos) != css_tokens.kind_open_paren() {
+            return false;
+        }
+        let next: bool = evaluate_in_parens(c, s, ctx);
+        if is_and {
+            result = result && next;
+        } else {
+            result = result || next;
+        }
+    }
+}
+
+fn media_type_matches(s: *CssTokenSink, index: u64, ctx: MediaContext) -> bool {
+    if ident_is(s, index, "all") {
+        return true;
+    }
+    if ident_is(s, index, "screen") {
+        return !ctx.print;
+    }
+    if ident_is(s, index, "print") {
+        return ctx.print;
+    }
+    // tty, tv, projection and the rest were deprecated in Level 4 (§2.2) and
+    // match nothing, as does any unknown type.
+    return false;
+}
+
+// §3.1 <media-query>: a condition on its own, or a type with an optional
+// `not`/`only` in front and an optional `and <condition>` after.
+fn evaluate_query(
+    c: *MediaCursor,
+    s: *CssTokenSink,
+    ctx: MediaContext
+) -> bool {
+    skip_ws(c, s);
+    if at_end(c, s) {
+        // An empty query is `all`, which is how `@media { }` behaves.
+        return true;
+    }
+    if kind_at(s, (*c).pos) == css_tokens.kind_open_paren() {
+        return evaluate_condition(c, s, ctx);
+    }
+    let negated: bool = false;
+    if ident_is(s, (*c).pos, "not") {
+        // `not (...)` is a condition; `not screen` negates a type.
+        let save: u64 = (*c).pos;
+        (*c).pos = (*c).pos + 1;
+        skip_ws(c, s);
+        if !at_end(c, s) && kind_at(s, (*c).pos) == css_tokens.kind_open_paren() {
+            (*c).pos = save;
+            return evaluate_condition(c, s, ctx);
+        }
+        negated = true;
+    } else if ident_is(s, (*c).pos, "only") {
+        // `only` exists to hide the query from CSS2 user agents; it has no
+        // effect on the result.
+        (*c).pos = (*c).pos + 1;
+        skip_ws(c, s);
+    }
+    if at_end(c, s) || kind_at(s, (*c).pos) != css_tokens.kind_ident() {
+        return false;
+    }
+    let matches: bool = media_type_matches(s, (*c).pos, ctx);
+    (*c).pos = (*c).pos + 1;
+    skip_ws(c, s);
+    if !at_end(c, s) {
+        if !eat_ident(c, s, "and") {
+            return false;
+        }
+        // The trailing condition may not use `or` at the top level (§3.1).
+        skip_ws(c, s);
+        if at_end(c, s) {
+            return false;
+        }
+        let condition: bool = false;
+        if ident_is(s, (*c).pos, "not")
+            || kind_at(s, (*c).pos) == css_tokens.kind_open_paren() {
+            condition = evaluate_condition(c, s, ctx);
+        }
+        matches = matches && condition;
+    }
+    if negated {
+        return !matches;
+    }
+    return matches;
+}
+
+// Evaluate a media query list. True when any query in the list matches, which
+// is what makes the comma a union (§3.2).
+pub fn evaluate(
+    s: *CssTokenSink,
+    first: u64,
+    count: u64,
+    ctx: MediaContext
+) -> bool {
+    let limit: u64 = first + count;
+    let c: MediaCursor = MediaCursor { pos: first, limit: limit };
+    skip_ws(&c, s);
+    if at_end(&c, s) {
+        // `@media { }` with no prelude applies everywhere.
+        return true;
+    }
+    let matched: bool = false;
+    loop {
+        // Each query runs against its own slice, so one malformed query cannot
+        // swallow the comma that ends it.
+        let query_end: u64 = c.pos;
+        let depth: u64 = 0;
+        while query_end < limit {
+            let kind: u8 = kind_at(s, query_end);
+            if kind == css_tokens.kind_eof() {
+                break;
+            }
+            if kind == css_tokens.kind_open_paren()
+                || kind == css_tokens.kind_function() {
+                depth = depth + 1;
+            } else if kind == css_tokens.kind_close_paren() && depth > 0 {
+                depth = depth - 1;
+            } else if depth == 0 && kind == css_tokens.kind_comma() {
+                break;
+            }
+            query_end = query_end + 1;
+        }
+        let query: MediaCursor = MediaCursor { pos: c.pos, limit: query_end };
+        if evaluate_query(&query, s, ctx) {
+            // Every remaining query still has to be well formed enough to skip,
+            // but the answer cannot change.
+            matched = true;
+        }
+        c.pos = query_end;
+        if c.pos >= limit || kind_at(s, c.pos) != css_tokens.kind_comma() {
+            return matched;
+        }
+        c.pos = c.pos + 1;
+    }
+}

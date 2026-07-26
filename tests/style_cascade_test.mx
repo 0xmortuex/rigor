@@ -13,6 +13,9 @@ import engine.css.parser as css_parser;
 import engine.css.stylesheet;
 import engine.style.computed;
 import engine.style.cascade;
+import engine.style.custom;
+import engine.style.media;
+import engine.style.attrstyle;
 import engine.style.ua;
 
 resource struct Styled {
@@ -25,6 +28,8 @@ resource struct Styled {
     css_normalized: Vec<u8>,
     css_sink: CssTokenSink,
     sheet: CssStylesheet,
+    attrs: AttrStyles,
+    env: CustomEnv,
     tree: StyleTree,
 }
 
@@ -60,8 +65,15 @@ fn build(html: *u8, css: *u8) -> Styled {
     let sheet: CssStylesheet = stylesheet.new_stylesheet();
     parse_css(css, &css_normalized, &css_sink, &sheet);
 
+    let attrs: AttrStyles = attrstyle.parse_document(&doc);
+    let env: CustomEnv = custom.new_env();
     let tree: StyleTree = computed.new_tree(node.node_count(&doc));
-    cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &tree);
+    cascade.compute(&doc,
+    cascade.new_source(&ua_sheet, &ua_sink,
+    vec.as_const_slice(&ua_normalized), cascade.origin_ua()),
+    cascade.new_source(&sheet, &css_sink,
+    vec.as_const_slice(&css_normalized), cascade.origin_author()),
+    &attrs, &env, media.screen_context(800.0, 600.0), &tree);
 
     return Styled {
         html_normalized: move html_normalized,
@@ -73,12 +85,16 @@ fn build(html: *u8, css: *u8) -> Styled {
         css_normalized: move css_normalized,
         css_sink: move css_sink,
         sheet: move sheet,
+        attrs: move attrs,
+        env: move env,
         tree: move tree,
     };
 }
 
 fn destroy(s: *Styled) -> void {
     computed.destroy(&(*s).tree);
+    custom.destroy(&(*s).env);
+    attrstyle.destroy(&(*s).attrs);
     stylesheet.destroy(&(*s).sheet);
     css_tokens.destroy(&(*s).css_sink);
     vec.destroy(&(*s).css_normalized);
@@ -344,5 +360,189 @@ test "descendant selectors are matched during the cascade" {
     ".box p { color: red }");
     assert(style_of(&s, "a").color.r == 255 as u8);
     assert(style_of(&s, "b").color.r == 0 as u8);
+    destroy(&s);
+}
+
+// --- Style attributes (CSS Style Attributes) ---------------------------------
+
+test "a style attribute applies" {
+    let s: Styled = build("<p id=a style='color:#ff0000; font-size: 20px'>x</p>", "");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    assert(near(style_of(&s, "a").font_size, 20.0));
+    destroy(&s);
+}
+
+test "a style attribute beats an id selector" {
+    // Cascade §6.4.4: element-attached styles sort above every rule of the
+    // same origin, however specific the rule is.
+    let s: Styled = build("<p id=a style='color:#00ff00'>x</p>",
+    "#a { color: #ff0000 }");
+    assert(style_of(&s, "a").color.g == 255 as u8);
+    destroy(&s);
+}
+
+test "an important rule still beats a style attribute" {
+    let s: Styled = build("<p id=a style='color:#00ff00'>x</p>",
+    "p { color: #ff0000 !important }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "each element gets only its own style attribute" {
+    let s: Styled = build(
+    "<p id=a style='color:#ff0000'>x</p><p id=b style='font-size:30px'>y</p>",
+    "");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    assert(near(style_of(&s, "a").font_size, 16.0));
+    assert(style_of(&s, "b").color.r == 0 as u8);
+    assert(near(style_of(&s, "b").font_size, 30.0));
+    destroy(&s);
+}
+
+// --- CSS-wide keywords (Cascade §7.3) ----------------------------------------
+
+test "inherit takes the parent's computed value" {
+    let s: Styled = build("<div id=a><b id=b>x</b></div>",
+    "#a { font-weight: 300 } #b { font-weight: inherit }");
+    assert(style_of(&s, "b").font_weight == 300 as u32);
+    destroy(&s);
+}
+
+test "initial takes the property's initial value, not the ua value" {
+    let s: Styled = build("<b id=a>x</b>", "b { font-weight: initial }");
+    assert(style_of(&s, "a").font_weight == 400 as u32);
+    destroy(&s);
+}
+
+test "unset inherits an inherited property and resets the rest" {
+    let s: Styled = build("<div id=a><p id=b>x</p></div>",
+    "#a { color: #ff0000 } #b { color: unset; display: unset }");
+    assert(style_of(&s, "b").color.r == 255 as u8);
+    assert(style_of(&s, "b").display == computed.display_inline());
+    destroy(&s);
+}
+
+test "revert rolls back to the previous origin" {
+    // The author's own earlier declaration is in the same origin, so revert
+    // skips past it to what the ua stylesheet left.
+    let s: Styled = build("<b id=a>x</b>",
+    "b { font-weight: 100 } b { font-weight: revert }");
+    assert(style_of(&s, "a").font_weight == 700 as u32);
+    destroy(&s);
+}
+
+test "a wide keyword on a shorthand covers its longhands" {
+    let s: Styled = build("<p id=a>x</p>", "p { margin: initial }");
+    assert(near(style_of(&s, "a").margin_top.value, 0.0));
+    assert(near(style_of(&s, "a").margin_bottom.value, 0.0));
+    destroy(&s);
+}
+
+// --- Custom properties (css-variables-1) -------------------------------------
+
+test "a custom property substitutes into a value" {
+    let s: Styled = build("<p id=a>x</p>",
+    "p { --size: 24px; font-size: var(--size) }");
+    assert(near(style_of(&s, "a").font_size, 24.0));
+    destroy(&s);
+}
+
+test "custom properties inherit" {
+    let s: Styled = build("<div id=a><p id=b>x</p></div>",
+    "#a { --c: #ff0000 } #b { color: var(--c) }");
+    assert(style_of(&s, "b").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "a nearer definition shadows the inherited one" {
+    let s: Styled = build("<div id=a><p id=b>x</p></div>",
+    "#a { --c: #ff0000 } #b { --c: #00ff00; color: var(--c) }");
+    assert(style_of(&s, "b").color.g == 255 as u8);
+    destroy(&s);
+}
+
+test "var() falls back when the property is undefined" {
+    let s: Styled = build("<p id=a>x</p>", "p { font-size: var(--missing, 40px) }");
+    assert(near(style_of(&s, "a").font_size, 40.0));
+    destroy(&s);
+}
+
+test "an undefined var with no fallback is invalid at computed-value time" {
+    // §3.2 says such a declaration behaves as unset, so an inherited property
+    // takes the parent's value rather than the declaration's.
+    let s: Styled = build("<div id=a><p id=b>x</p></div>",
+    "#a { color: #ff0000 } #b { color: var(--missing) }");
+    assert(style_of(&s, "b").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "a custom property may itself use var()" {
+    let s: Styled = build("<p id=a>x</p>",
+    "p { --a: 30px; --b: var(--a); font-size: var(--b) }");
+    assert(near(style_of(&s, "a").font_size, 30.0));
+    destroy(&s);
+}
+
+test "custom property names are case sensitive" {
+    let s: Styled = build("<p id=a>x</p>",
+    "p { --Size: 24px; font-size: var(--size, 12px) }");
+    assert(near(style_of(&s, "a").font_size, 12.0));
+    destroy(&s);
+}
+
+// --- Media queries (mediaqueries-4) ------------------------------------------
+//
+// build() evaluates against an 800x600 screen.
+
+test "a matching media query lets its rules through" {
+    let s: Styled = build("<p id=a>x</p>",
+    "@media (min-width: 600px) { p { color: #ff0000 } }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "a non-matching media query hides its rules" {
+    let s: Styled = build("<p id=a>x</p>",
+    "@media (min-width: 2000px) { p { color: #ff0000 } }");
+    assert(style_of(&s, "a").color.r == 0 as u8);
+    destroy(&s);
+}
+
+test "media types are honoured" {
+    let s: Styled = build("<p id=a>x</p>",
+    "@media screen { p { color: #ff0000 } } @media print { p { color: #00ff00 } }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    assert(style_of(&s, "a").color.g == 0 as u8);
+    destroy(&s);
+}
+
+test "and, or and not combine conditions" {
+    let s: Styled = build("<p id=a>x</p><b id=b>y</b><i id=c>z</i>",
+    "@media (min-width: 100px) and (max-width: 900px) { p { color: #ff0000 } }\n@media (min-width: 9000px) or (orientation: landscape) { b { color: #ff0000 } }\n@media not (min-width: 9000px) { i { color: #ff0000 } }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    assert(style_of(&s, "b").color.r == 255 as u8);
+    assert(style_of(&s, "c").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "the range syntax works in both directions" {
+    let s: Styled = build("<p id=a>x</p><b id=b>y</b>",
+    "@media (width >= 600px) { p { color: #ff0000 } }\n@media (400px <= width <= 900px) { b { color: #ff0000 } }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    assert(style_of(&s, "b").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "a comma list matches when any query does" {
+    let s: Styled = build("<p id=a>x</p>",
+    "@media (min-width: 9000px), (min-width: 100px) { p { color: #ff0000 } }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "an unknown feature makes the query false" {
+    let s: Styled = build("<p id=a>x</p>",
+    "@media (nonsense: 3) { p { color: #ff0000 } }");
+    assert(style_of(&s, "a").color.r == 0 as u8);
     destroy(&s);
 }

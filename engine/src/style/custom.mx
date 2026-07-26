@@ -1,0 +1,152 @@
+// Custom properties — CSS Custom Properties for Cascading Variables Level 1.
+//
+// A custom property (`--brand: #204`) is an inherited property whose value is
+// an arbitrary token sequence, so it cannot live in ComputedStyle's fixed set
+// of fields. Instead every element's style carries one index into this arena:
+// the head of a chain of definitions, each linked to the one it shadows.
+//
+// That makes inheritance free — a child starts with its parent's head — and
+// shadowing free too, because defining a property conses a new entry onto the
+// front and lookup walks from the front, so the newest definition of a name is
+// the one found. Elements that define nothing share their parent's chain
+// outright rather than copying it.
+//
+// Values are stored already substituted: §3 resolves any var() inside a custom
+// property's own value at the element that declares it, so what is stored here
+// is the computed value and a later reader never has to re-substitute.
+module engine.style.custom;
+
+import std.vec;
+
+struct CustomEntry {
+    name_off: u64,
+    name_len: u64,
+    value_off: u64,
+    value_len: u64,
+    // The definition this one shadows. Entries are addressed 1-based so that
+    // 0 can mean "end of chain" without a sentinel entry.
+    prev: u64,
+}
+
+resource struct CustomEnv {
+    entries: Vec<CustomEntry>,
+    pool: Vec<u8>,
+}
+
+pub fn new_env() -> CustomEnv {
+    return CustomEnv {
+        entries: vec.new<CustomEntry>(),
+        pool: vec.new<u8>(),
+    };
+}
+
+pub fn destroy(env: *CustomEnv) -> void {
+    vec.destroy(&(*env).entries);
+    vec.destroy(&(*env).pool);
+}
+
+// The empty chain: an element that has seen no custom property at all.
+pub fn none() -> u64 { return 0; }
+
+fn intern(env: *CustomEnv, view: []const u8) -> u64 {
+    let offset: u64 = (*env).pool.length;
+    for index: u64 in 0..len(view) {
+        vec.push(&(*env).pool, view[index]);
+    }
+    return offset;
+}
+
+pub fn bytes(env: *CustomEnv, offset: u64, length: u64) -> []const u8 {
+    if length == 0 {
+        return slice(0 as *const u8, 0);
+    }
+    let base: *const u8 = (*env).pool.data as *const u8;
+    return slice((&base[offset]) as *const u8, length);
+}
+
+// Add `name: value` in front of the chain at `head`, returning the new head.
+pub fn define(
+    env: *CustomEnv,
+    head: u64,
+    name: []const u8,
+    value: []const u8
+) -> u64 {
+    let entry: CustomEntry = CustomEntry {
+        name_off: intern(env, name),
+        name_len: len(name),
+        value_off: intern(env, value),
+        value_len: len(value),
+        prev: head,
+    };
+    vec.push(&(*env).entries, entry);
+    return (*env).entries.length;
+}
+
+struct CustomLookup {
+    found: bool,
+    value_off: u64,
+    value_len: u64,
+}
+
+fn names_equal(left: []const u8, right: []const u8) -> bool {
+    // Custom property names are case-sensitive (§2), unlike every other
+    // property name in CSS.
+    if len(left) != len(right) {
+        return false;
+    }
+    for index: u64 in 0..len(left) {
+        if left[index] != right[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn lookup(env: *CustomEnv, head: u64, name: []const u8) -> CustomLookup {
+    let cursor: u64 = head;
+    while cursor != none() {
+        match vec.get(&(*env).entries, cursor - 1) {
+            Option<CustomEntry>.Some(entry) => {
+                if names_equal(bytes(env, entry.name_off, entry.name_len), name) {
+                    return CustomLookup {
+                        found: true,
+                        value_off: entry.value_off,
+                        value_len: entry.value_len,
+                    };
+                }
+                cursor = entry.prev;
+            },
+            Option<CustomEntry>.None => {
+                cursor = none();
+            },
+        }
+    }
+    return CustomLookup { found: false, value_off: 0, value_len: 0 };
+}
+
+// A property name is a custom property when it starts with two dashes (§2).
+pub fn is_custom_name(name: []const u8) -> bool {
+    return len(name) >= 2 && name[0] == '-' && name[1] == '-';
+}
+
+// How many definitions are live, for the debug dump.
+pub fn entry_count(env: *CustomEnv) -> u64 {
+    return (*env).entries.length;
+}
+
+// Walk a chain oldest-last, for serialization. Returns the entry at `cursor`
+// and writes the next cursor into `next`.
+pub fn entry_at(env: *CustomEnv, cursor: u64, next: *u64) -> CustomEntry {
+    match vec.get(&(*env).entries, cursor - 1) {
+        Option<CustomEntry>.Some(entry) => {
+            (*next) = entry.prev;
+            return entry;
+        },
+        Option<CustomEntry>.None => {
+            (*next) = none();
+            return CustomEntry {
+                name_off: 0, name_len: 0, value_off: 0, value_len: 0, prev: 0,
+            };
+        },
+    }
+}

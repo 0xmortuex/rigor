@@ -3,31 +3,45 @@
 // For each element, in tree order:
 //   1. Start from the parent's inherited values (§7), or the initial values at
 //      the root.
-//   2. Collect every declaration whose selector matches, from every sheet.
+//   2. Collect every declaration whose selector matches, from every sheet,
+//      skipping any inside an @media whose query does not match.
 //   3. Sort those declarations by cascade order and apply them in sequence,
 //      so the winner is simply the last one applied.
 //   4. Recurse into children, which now see this element's computed values.
 //
-// Cascade order here is: origin and importance first (§6.2 — UA normal, then
-// author normal, then author important, then UA important), then specificity,
-// then document order. Sorting is an insertion sort over the matched
-// declarations, which is the right choice because the matched set per element
-// is small (usually under ten) and insertion sort is stable, so document order
-// falls out for free rather than needing a tiebreak key.
+// Cascade order here is §6.4.4: origin and importance first (UA normal, then
+// author normal, then author important, then UA important), then whether the
+// declaration came from a style attribute rather than a rule, then
+// specificity, then document order. Sorting is an insertion sort over the
+// matched declarations, which is the right choice because the matched set per
+// element is small (usually under ten) and insertion sort is stable, so
+// document order falls out for free rather than needing a tiebreak key.
 //
-// Not implemented: `inherit`/`initial`/`unset`/`revert` keywords, custom
-// properties, `@media` evaluation (rules inside a media block are applied
-// unconditionally, as if the query matched), and shorthand expansion beyond
-// the ones listed in apply_declaration.
+// Two things happen between step 2 and step 3 that the simple picture above
+// leaves out. A declaration whose value mentions var() is resolved by
+// substituting text and re-tokenizing it (§Custom Properties §3), because
+// substitution happens on the token stream and not on parsed values. And a
+// declaration whose value is one of the CSS-wide keywords never reaches
+// property parsing at all: it copies the property from the parent, from the
+// initial values, or from the state the previous origin left behind (§7.3).
+//
+// Not implemented: `@supports` conditions (rules inside one always apply),
+// animations and transitions, and shorthand expansion beyond the ones listed
+// in apply_named.
 module engine.style.cascade;
 
 import std.vec;
 import engine.css.tokens as css_tokens;
+import engine.css.tokenizer as css_tokenizer;
+import engine.css.preprocess as css_preprocess;
 import engine.css.stylesheet;
 import engine.css.matching;
 import engine.dom.node;
 import engine.style.computed;
 import engine.style.values;
+import engine.style.custom;
+import engine.style.media;
+import engine.style.attrstyle;
 
 // Origins, ordered so a larger number wins (§6.2).
 pub fn origin_ua() -> u8 { return 0 as u8; }
@@ -41,13 +55,33 @@ struct MatchedDeclaration {
     order: u64,
     // Sort key combining origin and importance, larger winning.
     weight: u8,
+    // §6.4.4 "element-attached styles": a style attribute's declarations sort
+    // above every rule of the same origin and importance, whatever the rule's
+    // specificity.
+    from_attribute: bool,
 }
 
-// A stylesheet paired with the token sink holding its declaration values.
+// A stylesheet paired with the token sink holding its declaration values, and
+// with the text those tokens came from — var() substitution works on text, so
+// the source has to be reachable from a declaration.
 struct StyleSource {
     sheet: *CssStylesheet,
     sink: *CssTokenSink,
+    source: []const u8,
     origin: u8,
+    from_attribute: bool,
+}
+
+pub fn new_source(
+    sheet: *CssStylesheet,
+    sink: *CssTokenSink,
+    source: []const u8,
+    origin: u8
+) -> StyleSource {
+    return StyleSource {
+        sheet: sheet, sink: sink, source: source, origin: origin,
+        from_attribute: false,
+    };
 }
 
 fn weight_of(origin: u8, important: bool) -> u8 {
@@ -64,6 +98,20 @@ fn weight_of(origin: u8, important: bool) -> u8 {
     return 1 as u8;
 }
 
+// Everything the cascade needs that is not per-element: the sources, the
+// device the media queries are asked about, and the arena custom properties
+// live in.
+struct CascadeContext {
+    ua: StyleSource,
+    author: StyleSource,
+    attribute: StyleSource,
+    attrs: *AttrStyles,
+    env: *CustomEnv,
+    device: MediaContext,
+}
+
+// --- Collecting --------------------------------------------------------------
+
 // Collect the declarations of every rule in `source` matching `element`.
 // `order` counts declarations across all sources so document order survives.
 fn collect_from_rule(
@@ -73,15 +121,17 @@ fn collect_from_rule(
     source_index: u64,
     rule_index: u64,
     matched: *Vec<MatchedDeclaration>,
-    order: *u64
+    order: *u64,
+    device: MediaContext
 ) -> void {
     let rule: CssRule = stylesheet.get_rule(source.sheet, rule_index);
     if rule.kind == stylesheet.rule_at() {
-        // Rules nested in an at-rule are applied as though the condition
-        // matched; media query evaluation is not implemented.
+        if !at_rule_applies(source, rule, device) {
+            return;
+        }
         for child: u64 in 0..rule.child_count {
             collect_from_rule(doc, element, source, source_index,
-                rule.child_first + child, matched, order);
+                rule.child_first + child, matched, order, device);
         }
         return;
     }
@@ -101,23 +151,58 @@ fn collect_from_rule(
         return;
     }
     for step: u64 in 0..rule.decl_count {
-        let declaration: CssDeclaration =
-            stylesheet.get_declaration(source.sheet, rule.decl_first + step);
-        vec.push(matched, MatchedDeclaration {
-            sheet: source_index,
-            declaration: rule.decl_first + step,
-            specificity: best,
-            order: (*order),
-            weight: weight_of(source.origin, declaration.important),
-        });
-        (*order) = (*order) + 1;
+        push_matched(source, source_index, rule.decl_first + step, best,
+            matched, order);
     }
+}
+
+fn push_matched(
+    source: StyleSource,
+    source_index: u64,
+    declaration_index: u64,
+    specificity: u32,
+    matched: *Vec<MatchedDeclaration>,
+    order: *u64
+) -> void {
+    let declaration: CssDeclaration =
+        stylesheet.get_declaration(source.sheet, declaration_index);
+    vec.push(matched, MatchedDeclaration {
+        sheet: source_index,
+        declaration: declaration_index,
+        specificity: specificity,
+        order: (*order),
+        weight: weight_of(source.origin, declaration.important),
+        from_attribute: source.from_attribute,
+    });
+    (*order) = (*order) + 1;
+}
+
+// Does a conditional group rule's condition hold? @media is evaluated; the
+// other grouping rules rigor's parser keeps (@supports, @layer, @container,
+// @scope) are entered unconditionally, which is the only honest thing to do
+// with a condition that is not implemented — and is what @layer and @scope
+// with no prelude would do anyway.
+fn at_rule_applies(
+    source: StyleSource,
+    rule: CssRule,
+    device: MediaContext
+) -> bool {
+    let name: []const u8 =
+        stylesheet.bytes(source.sheet, rule.name_off, rule.name_len);
+    if !values.equals_ci(name, "media") {
+        return true;
+    }
+    return media.evaluate(source.sink, rule.prelude_first, rule.prelude_count,
+        device);
 }
 
 // Does `left` cascade before `right`? Equal keys keep document order.
 fn cascades_before(left: MatchedDeclaration, right: MatchedDeclaration) -> bool {
     if left.weight != right.weight {
         return left.weight < right.weight;
+    }
+    if left.from_attribute != right.from_attribute {
+        return right.from_attribute;
     }
     if left.specificity != right.specificity {
         return left.specificity < right.specificity;
@@ -138,49 +223,516 @@ fn sort_matched(matched: *Vec<MatchedDeclaration>) -> void {
     }
 }
 
-fn name_is(sheet: *CssStylesheet, declaration: CssDeclaration, text: *u8) -> bool {
-    return values.equals_ci(
-        stylesheet.bytes(sheet, declaration.name_off, declaration.name_len), text);
+// --- Token text --------------------------------------------------------------
+
+// The source text a token range covers. Tokens record their byte offset in the
+// input, so a range's text runs from the first token's offset to the offset of
+// the token after it — which is what var() substitution needs, since the spec
+// substitutes token streams and rigor re-tokenizes the result.
+fn token_text(
+    source: []const u8,
+    s: *CssTokenSink,
+    first: u64,
+    count: u64
+) -> []const u8 {
+    if count == 0 || len(source) == 0 {
+        return slice(0 as *const u8, 0);
+    }
+    let start: u64 = css_tokens.get_token(s, first).pos;
+    let end: u64 = len(source);
+    if first + count < css_tokens.token_count(s) {
+        end = css_tokens.get_token(s, first + count).pos;
+    }
+    if start > len(source) {
+        return slice(0 as *const u8, 0);
+    }
+    if end > len(source) {
+        end = len(source);
+    }
+    if end <= start {
+        return slice(0 as *const u8, 0);
+    }
+    return slice((&source[start]) as *const u8, end - start);
 }
+
+fn append_view(out: *Vec<u8>, view: []const u8) -> void {
+    for index: u64 in 0..len(view) {
+        vec.push(out, view[index]);
+    }
+}
+
+// --- var() substitution ------------------------------------------------------
+
+fn is_var_function(s: *CssTokenSink, index: u64) -> bool {
+    let token: CssToken = css_tokens.get_token(s, index);
+    return token.kind == css_tokens.kind_function()
+        && values.equals_ci(css_tokens.token_value(s, token), "var");
+}
+
+// Does this token range mention var() anywhere?
+fn uses_var(s: *CssTokenSink, first: u64, limit: u64) -> bool {
+    for index: u64 in first..limit {
+        if is_var_function(s, index) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The index just past the balanced group opened at `open`.
+fn group_end(s: *CssTokenSink, open: u64, limit: u64) -> u64 {
+    let depth: u64 = 0;
+    let index: u64 = open;
+    while index < limit {
+        let kind: u8 = css_tokens.get_token(s, index).kind;
+        if kind == css_tokens.kind_function()
+            || kind == css_tokens.kind_open_paren()
+            || kind == css_tokens.kind_open_square()
+            || kind == css_tokens.kind_open_curly() {
+            depth = depth + 1;
+        } else if kind == css_tokens.kind_close_paren()
+            || kind == css_tokens.kind_close_square()
+            || kind == css_tokens.kind_close_curly() {
+            depth = depth - 1;
+            if depth == 0 {
+                return index + 1;
+            }
+        }
+        index = index + 1;
+    }
+    return limit;
+}
+
+const SUBSTITUTE_OK: u8 = 0;
+// §3 "guaranteed-invalid value": a var() naming something undefined with no
+// fallback makes the whole declaration invalid at computed-value time.
+const SUBSTITUTE_INVALID: u8 = 1;
+
+struct Substitution {
+    status: u8,
+    text: Vec<u8>,
+}
+
+// Replace every var() in `first`..`limit` with the custom property's value, or
+// with its fallback. `depth` bounds the recursion so a cyclic reference — one
+// custom property whose fallback names another that names it back — cannot run
+// forever; §3.2 requires cycles to make the value invalid, and exhausting the
+// depth is how that is detected here.
+fn substitute(
+    source: []const u8,
+    s: *CssTokenSink,
+    first: u64,
+    limit: u64,
+    env: *CustomEnv,
+    head: u64,
+    depth: u64
+) -> Substitution {
+    let out: Vec<u8> = vec.new<u8>();
+    if depth > 16 {
+        return Substitution { status: SUBSTITUTE_INVALID, text: move out };
+    }
+    let index: u64 = first;
+    while index < limit {
+        if !is_var_function(s, index) {
+            append_view(&out, token_text(source, s, index, 1));
+            index = index + 1;
+            continue;
+        }
+        let after: u64 = group_end(s, index, limit);
+        // Inside the parens: the name, then optionally a comma and a fallback.
+        let inner: u64 = values.skip_ws(s, index + 1, after);
+        let close: u64 = after;
+        if close > index + 1 {
+            close = close - 1;
+        }
+        let name_token: CssToken = css_tokens.get_token(s, inner);
+        if inner >= close || name_token.kind != css_tokens.kind_ident() {
+            vec.destroy(&out);
+            let empty: Vec<u8> = vec.new<u8>();
+            return Substitution { status: SUBSTITUTE_INVALID, text: move empty };
+        }
+        let name: []const u8 = css_tokens.token_value(s, name_token);
+        let comma: u64 = inner + 1;
+        while comma < close
+            && css_tokens.get_token(s, comma).kind
+                != css_tokens.kind_comma() {
+            comma = comma + 1;
+        }
+
+        let found: CustomLookup = custom.lookup(env, head, name);
+        if found.found {
+            append_view(&out, custom.bytes(env, found.value_off, found.value_len));
+        } else if comma < close {
+            // The fallback may itself contain var().
+            let fallback: Substitution = substitute(source, s, comma + 1, close,
+                env, head, depth + 1);
+            if fallback.status != SUBSTITUTE_OK {
+                vec.destroy(&out);
+                return move fallback;
+            }
+            append_view(&out, vec.as_const_slice(&fallback.text));
+            vec.destroy(&fallback.text);
+        } else {
+            vec.destroy(&out);
+            let empty: Vec<u8> = vec.new<u8>();
+            return Substitution { status: SUBSTITUTE_INVALID, text: move empty };
+        }
+        // A substituted value has to be separated from what follows it, or
+        // `var(--a)px` would fuse into one token.
+        vec.push(&out, ' ' as u8);
+        index = after;
+    }
+    return Substitution { status: SUBSTITUTE_OK, text: move out };
+}
+
+// --- CSS-wide keywords -------------------------------------------------------
+
+const WIDE_NONE: u8 = 0;
+const WIDE_INHERIT: u8 = 1;
+const WIDE_INITIAL: u8 = 2;
+const WIDE_UNSET: u8 = 3;
+const WIDE_REVERT: u8 = 4;
+
+// §7.3: a declaration whose value is exactly one of these keywords sets the
+// property rather than being parsed as a value of its own type.
+fn wide_keyword(s: *CssTokenSink, first: u64, limit: u64) -> u8 {
+    let index: u64 = values.skip_ws(s, first, limit);
+    if index >= limit {
+        return WIDE_NONE;
+    }
+    let token: CssToken = css_tokens.get_token(s, index);
+    if token.kind != css_tokens.kind_ident() {
+        return WIDE_NONE;
+    }
+    // The keyword must be the whole value.
+    if values.skip_ws(s, index + 1, limit) < limit {
+        return WIDE_NONE;
+    }
+    let name: []const u8 = css_tokens.token_value(s, token);
+    if values.equals_ci(name, "inherit") { return WIDE_INHERIT; }
+    if values.equals_ci(name, "initial") { return WIDE_INITIAL; }
+    if values.equals_ci(name, "unset") { return WIDE_UNSET; }
+    if values.equals_ci(name, "revert") { return WIDE_REVERT; }
+    if values.equals_ci(name, "revert-layer") {
+        // With no cascade layers, reverting a layer reverts to the same place
+        // reverting an origin does.
+        return WIDE_REVERT;
+    }
+    return WIDE_NONE;
+}
+
+// The properties that inherit, per each property's own definition. Everything
+// else resets, which is what makes `unset` two different things.
+fn property_inherits(name: []const u8) -> bool {
+    return values.equals_ci(name, "color")
+        || values.equals_ci(name, "font")
+        || values.equals_ci(name, "font-size")
+        || values.equals_ci(name, "font-weight")
+        || values.equals_ci(name, "font-style")
+        || values.equals_ci(name, "font-family")
+        || values.equals_ci(name, "line-height")
+        || values.equals_ci(name, "text-align")
+        || values.equals_ci(name, "white-space")
+        || values.equals_ci(name, "visibility");
+}
+
+// Copy the longhands a property name covers from `from` into `style`. This is
+// what all four CSS-wide keywords reduce to once the source style is chosen.
+fn copy_property(
+    name: []const u8,
+    style: *ComputedStyle,
+    from: ComputedStyle
+) -> void {
+    if values.equals_ci(name, "display") {
+        (*style).display = from.display;
+        return;
+    }
+    if values.equals_ci(name, "color") {
+        (*style).color = from.color;
+        return;
+    }
+    if values.equals_ci(name, "background-color")
+        || values.equals_ci(name, "background") {
+        (*style).background_color = from.background_color;
+        return;
+    }
+    if values.equals_ci(name, "visibility") {
+        (*style).visible = from.visible;
+        return;
+    }
+    if values.equals_ci(name, "font-size") {
+        (*style).font_size = from.font_size;
+        return;
+    }
+    if values.equals_ci(name, "font-weight") {
+        (*style).font_weight = from.font_weight;
+        return;
+    }
+    if values.equals_ci(name, "font-style") {
+        (*style).font_style = from.font_style;
+        return;
+    }
+    if values.equals_ci(name, "font-family") {
+        (*style).font_family = from.font_family;
+        return;
+    }
+    if values.equals_ci(name, "line-height") {
+        (*style).line_height = from.line_height;
+        return;
+    }
+    if values.equals_ci(name, "font") {
+        (*style).font_size = from.font_size;
+        (*style).font_weight = from.font_weight;
+        (*style).font_style = from.font_style;
+        (*style).font_family = from.font_family;
+        (*style).line_height = from.line_height;
+        return;
+    }
+    if values.equals_ci(name, "text-align") {
+        (*style).text_align = from.text_align;
+        return;
+    }
+    if values.equals_ci(name, "white-space") {
+        (*style).white_space = from.white_space;
+        return;
+    }
+    if values.equals_ci(name, "width") {
+        (*style).width = from.width;
+        return;
+    }
+    if values.equals_ci(name, "height") {
+        (*style).height = from.height;
+        return;
+    }
+    if values.equals_ci(name, "float") {
+        (*style).float_side = from.float_side;
+        return;
+    }
+    if values.equals_ci(name, "clear") {
+        (*style).clear_side = from.clear_side;
+        return;
+    }
+    if copy_edges(name, style, from) {
+        return;
+    }
+    copy_border(name, style, from);
+}
+
+fn copy_edges(
+    name: []const u8,
+    style: *ComputedStyle,
+    from: ComputedStyle
+) -> bool {
+    if values.equals_ci(name, "margin") {
+        (*style).margin_top = from.margin_top;
+        (*style).margin_right = from.margin_right;
+        (*style).margin_bottom = from.margin_bottom;
+        (*style).margin_left = from.margin_left;
+        return true;
+    }
+    if values.equals_ci(name, "padding") {
+        (*style).padding_top = from.padding_top;
+        (*style).padding_right = from.padding_right;
+        (*style).padding_bottom = from.padding_bottom;
+        (*style).padding_left = from.padding_left;
+        return true;
+    }
+    if values.equals_ci(name, "margin-top") {
+        (*style).margin_top = from.margin_top;
+        return true;
+    }
+    if values.equals_ci(name, "margin-right") {
+        (*style).margin_right = from.margin_right;
+        return true;
+    }
+    if values.equals_ci(name, "margin-bottom") {
+        (*style).margin_bottom = from.margin_bottom;
+        return true;
+    }
+    if values.equals_ci(name, "margin-left") {
+        (*style).margin_left = from.margin_left;
+        return true;
+    }
+    if values.equals_ci(name, "padding-top") {
+        (*style).padding_top = from.padding_top;
+        return true;
+    }
+    if values.equals_ci(name, "padding-right") {
+        (*style).padding_right = from.padding_right;
+        return true;
+    }
+    if values.equals_ci(name, "padding-bottom") {
+        (*style).padding_bottom = from.padding_bottom;
+        return true;
+    }
+    if values.equals_ci(name, "padding-left") {
+        (*style).padding_left = from.padding_left;
+        return true;
+    }
+    return false;
+}
+
+fn copy_border_side(
+    style: *ComputedStyle,
+    from: ComputedStyle,
+    side: u64,
+    width: bool,
+    line_style: bool,
+    color: bool
+) -> void {
+    if side == 0 {
+        if width { (*style).border_top_width = from.border_top_width; }
+        if line_style { (*style).border_top_style = from.border_top_style; }
+        if color { (*style).border_top_color = from.border_top_color; }
+    } else if side == 1 {
+        if width { (*style).border_right_width = from.border_right_width; }
+        if line_style { (*style).border_right_style = from.border_right_style; }
+        if color { (*style).border_right_color = from.border_right_color; }
+    } else if side == 2 {
+        if width { (*style).border_bottom_width = from.border_bottom_width; }
+        if line_style { (*style).border_bottom_style = from.border_bottom_style; }
+        if color { (*style).border_bottom_color = from.border_bottom_color; }
+    } else {
+        if width { (*style).border_left_width = from.border_left_width; }
+        if line_style { (*style).border_left_style = from.border_left_style; }
+        if color { (*style).border_left_color = from.border_left_color; }
+    }
+}
+
+fn copy_border(
+    name: []const u8,
+    style: *ComputedStyle,
+    from: ComputedStyle
+) -> void {
+    // Which sides and which of the three components the name names.
+    let sides: u64 = 15;
+    let width: bool = true;
+    let line_style: bool = true;
+    let color: bool = true;
+    let matched: bool = false;
+
+    if values.equals_ci(name, "border") { matched = true; }
+    else if values.equals_ci(name, "border-top") { sides = 1; matched = true; }
+    else if values.equals_ci(name, "border-right") { sides = 2; matched = true; }
+    else if values.equals_ci(name, "border-bottom") { sides = 4; matched = true; }
+    else if values.equals_ci(name, "border-left") { sides = 8; matched = true; }
+    else if values.equals_ci(name, "border-width") {
+        line_style = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-style") {
+        width = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-color") {
+        width = false; line_style = false; matched = true;
+    } else if values.equals_ci(name, "border-top-width") {
+        sides = 1; line_style = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-right-width") {
+        sides = 2; line_style = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-bottom-width") {
+        sides = 4; line_style = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-left-width") {
+        sides = 8; line_style = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-top-style") {
+        sides = 1; width = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-right-style") {
+        sides = 2; width = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-bottom-style") {
+        sides = 4; width = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-left-style") {
+        sides = 8; width = false; color = false; matched = true;
+    } else if values.equals_ci(name, "border-top-color") {
+        sides = 1; width = false; line_style = false; matched = true;
+    } else if values.equals_ci(name, "border-right-color") {
+        sides = 2; width = false; line_style = false; matched = true;
+    } else if values.equals_ci(name, "border-bottom-color") {
+        sides = 4; width = false; line_style = false; matched = true;
+    } else if values.equals_ci(name, "border-left-color") {
+        sides = 8; width = false; line_style = false; matched = true;
+    }
+    if !matched {
+        return;
+    }
+    for side: u64 in 0..4 {
+        if (sides & ((1 as u64) << side)) != (0 as u64) {
+            copy_border_side(style, from, side, width, line_style, color);
+        }
+    }
+}
+
+// Apply one of the CSS-wide keywords. `revert_base` is the style as the
+// previous origin left it, which is what `revert` rolls back to (§7.3).
+fn apply_wide_keyword(
+    keyword: u8,
+    name: []const u8,
+    style: *ComputedStyle,
+    parent: ComputedStyle,
+    revert_base: ComputedStyle
+) -> void {
+    let from: ComputedStyle = computed.initial_style();
+    if keyword == WIDE_INHERIT {
+        from = parent;
+    } else if keyword == WIDE_REVERT {
+        from = revert_base;
+    } else if keyword == WIDE_UNSET && property_inherits(name) {
+        from = parent;
+    }
+    // Inheriting a property means taking the parent's *computed* value, and
+    // the parent's custom properties are already this element's starting
+    // point, so only the fixed fields need copying.
+    copy_property(name, style, from);
+}
+
+// --- Property application ----------------------------------------------------
 
 // Apply one declaration to `style`. Invalid values leave the property alone,
 // which is what makes an unparseable declaration simply not apply.
-fn apply_declaration(
-    source: StyleSource,
-    declaration: CssDeclaration,
+fn apply_named(
+    name: []const u8,
+    s: *CssTokenSink,
+    first: u64,
+    limit: u64,
     style: *ComputedStyle,
     parent_font_size: f64,
     root_font_size: f64
 ) -> void {
-    let s: *CssTokenSink = source.sink;
-    let sheet: *CssStylesheet = source.sheet;
-    let first: u64 = declaration.value_first;
-    let limit: u64 = declaration.value_first + declaration.value_count;
     let font_size: f64 = (*style).font_size;
 
-    if name_is(sheet, declaration, "display") {
+    if values.equals_ci(name, "display") {
         let result: StyleKeywordResult = values.parse_display(s, first);
         if result.ok { (*style).display = result.value; }
         return;
     }
-    if name_is(sheet, declaration, "color") {
+    if values.equals_ci(name, "color") {
         let result: StyleColorResult = values.parse_color(s, first, limit);
         if result.ok { (*style).color = result.color; }
         return;
     }
-    if name_is(sheet, declaration, "background-color") {
+    if values.equals_ci(name, "background-color") {
         let result: StyleColorResult = values.parse_color(s, first, limit);
         if result.ok { (*style).background_color = result.color; }
         return;
     }
-    if name_is(sheet, declaration, "background") {
+    if values.equals_ci(name, "background") {
         // Only the colour component of the shorthand is understood; the rest
         // (images, position, repeat) is ignored rather than guessed at.
         let result: StyleColorResult = values.parse_color(s, first, limit);
         if result.ok { (*style).background_color = result.color; }
         return;
     }
-    if name_is(sheet, declaration, "font-size") {
+    if values.equals_ci(name, "visibility") {
+        let result: StyleKeywordResult = values.parse_visibility(s, first);
+        if result.ok { (*style).visible = result.value == 0 as u8; }
+        return;
+    }
+    if values.equals_ci(name, "float") {
+        let result: StyleKeywordResult = values.parse_float(s, first);
+        if result.ok { (*style).float_side = result.value; }
+        return;
+    }
+    if values.equals_ci(name, "clear") {
+        let result: StyleKeywordResult = values.parse_clear(s, first);
+        if result.ok { (*style).clear_side = result.value; }
+        return;
+    }
+    if values.equals_ci(name, "font-size") {
         let result: StyleNumberResult =
             values.parse_font_size(s, first, parent_font_size, root_font_size);
         if result.ok {
@@ -191,54 +743,54 @@ fn apply_declaration(
         }
         return;
     }
-    if name_is(sheet, declaration, "font-weight") {
+    if values.equals_ci(name, "font-weight") {
         let result: StyleNumberResult = values.parse_font_weight(s, first);
         if result.ok { (*style).font_weight = result.value as u32; }
         return;
     }
-    if name_is(sheet, declaration, "font-style") {
+    if values.equals_ci(name, "font-style") {
         let result: StyleKeywordResult = values.parse_font_style(s, first);
         if result.ok { (*style).font_style = result.value; }
         return;
     }
-    if name_is(sheet, declaration, "font-family") {
+    if values.equals_ci(name, "font-family") {
         let result: StyleKeywordResult =
             values.parse_font_family(s, first, limit);
         if result.ok { (*style).font_family = result.value; }
         return;
     }
-    if name_is(sheet, declaration, "line-height") {
+    if values.equals_ci(name, "line-height") {
         let result: StyleNumberResult =
             values.parse_line_height(s, first, font_size, root_font_size);
         if result.ok { (*style).line_height = result.value; }
         return;
     }
-    if name_is(sheet, declaration, "text-align") {
+    if values.equals_ci(name, "text-align") {
         let result: StyleKeywordResult = values.parse_text_align(s, first);
         if result.ok { (*style).text_align = result.value; }
         return;
     }
-    if name_is(sheet, declaration, "white-space") {
+    if values.equals_ci(name, "white-space") {
         let result: StyleKeywordResult = values.parse_white_space(s, first);
         if result.ok { (*style).white_space = result.value; }
         return;
     }
-    if name_is(sheet, declaration, "width") {
+    if values.equals_ci(name, "width") {
         let result: StyleLengthResult =
             values.parse_length(s, first, font_size, root_font_size, true);
         if result.ok { (*style).width = result.length; }
         return;
     }
-    if name_is(sheet, declaration, "height") {
+    if values.equals_ci(name, "height") {
         let result: StyleLengthResult =
             values.parse_length(s, first, font_size, root_font_size, true);
         if result.ok { (*style).height = result.length; }
         return;
     }
-    if apply_box_edges(source, declaration, style, font_size, root_font_size) {
+    if apply_box_edges(name, s, first, limit, style, font_size, root_font_size) {
         return;
     }
-    apply_border(source, declaration, style, font_size, root_font_size);
+    apply_border(name, s, first, limit, style, font_size, root_font_size);
 }
 
 // Read up to four length values from a declaration, which is the shape of the
@@ -249,6 +801,14 @@ struct EdgeValues {
     right: StyleLength,
     bottom: StyleLength,
     left: StyleLength,
+}
+
+fn no_edges() -> EdgeValues {
+    return EdgeValues {
+        count: 0,
+        top: computed.zero_length(), right: computed.zero_length(),
+        bottom: computed.zero_length(), left: computed.zero_length(),
+    };
 }
 
 fn read_edges(
@@ -272,22 +832,14 @@ fn read_edges(
         let value: StyleLengthResult =
             values.parse_length(s, cursor, font_size, root_font_size, true);
         if !value.ok {
-            return EdgeValues {
-                count: 0,
-                top: computed.zero_length(), right: computed.zero_length(),
-                bottom: computed.zero_length(), left: computed.zero_length(),
-            };
+            return no_edges();
         }
         parsed[count] = value.length;
         count = count + 1;
         cursor = cursor + 1;
     }
     if count == 0 {
-        return EdgeValues {
-            count: 0,
-            top: computed.zero_length(), right: computed.zero_length(),
-            bottom: computed.zero_length(), left: computed.zero_length(),
-        };
+        return no_edges();
     }
     // The CSS one-to-four-value rule: 1 sets all, 2 sets vertical/horizontal,
     // 3 sets top/horizontal/bottom, 4 sets each side clockwise from the top.
@@ -311,18 +863,15 @@ fn read_edges(
 }
 
 fn apply_box_edges(
-    source: StyleSource,
-    declaration: CssDeclaration,
+    name: []const u8,
+    s: *CssTokenSink,
+    first: u64,
+    limit: u64,
     style: *ComputedStyle,
     font_size: f64,
     root_font_size: f64
 ) -> bool {
-    let s: *CssTokenSink = source.sink;
-    let sheet: *CssStylesheet = source.sheet;
-    let first: u64 = declaration.value_first;
-    let limit: u64 = declaration.value_first + declaration.value_count;
-
-    if name_is(sheet, declaration, "margin") {
+    if values.equals_ci(name, "margin") {
         let edges: EdgeValues =
             read_edges(s, first, limit, font_size, root_font_size);
         if edges.count > 0 {
@@ -333,7 +882,7 @@ fn apply_box_edges(
         }
         return true;
     }
-    if name_is(sheet, declaration, "padding") {
+    if values.equals_ci(name, "padding") {
         let edges: EdgeValues =
             read_edges(s, first, limit, font_size, root_font_size);
         if edges.count > 0 {
@@ -347,35 +896,35 @@ fn apply_box_edges(
 
     let single: StyleLengthResult =
         values.parse_length(s, first, font_size, root_font_size, true);
-    if name_is(sheet, declaration, "margin-top") {
+    if values.equals_ci(name, "margin-top") {
         if single.ok { (*style).margin_top = single.length; }
         return true;
     }
-    if name_is(sheet, declaration, "margin-right") {
+    if values.equals_ci(name, "margin-right") {
         if single.ok { (*style).margin_right = single.length; }
         return true;
     }
-    if name_is(sheet, declaration, "margin-bottom") {
+    if values.equals_ci(name, "margin-bottom") {
         if single.ok { (*style).margin_bottom = single.length; }
         return true;
     }
-    if name_is(sheet, declaration, "margin-left") {
+    if values.equals_ci(name, "margin-left") {
         if single.ok { (*style).margin_left = single.length; }
         return true;
     }
-    if name_is(sheet, declaration, "padding-top") {
+    if values.equals_ci(name, "padding-top") {
         if single.ok { (*style).padding_top = single.length; }
         return true;
     }
-    if name_is(sheet, declaration, "padding-right") {
+    if values.equals_ci(name, "padding-right") {
         if single.ok { (*style).padding_right = single.length; }
         return true;
     }
-    if name_is(sheet, declaration, "padding-bottom") {
+    if values.equals_ci(name, "padding-bottom") {
         if single.ok { (*style).padding_bottom = single.length; }
         return true;
     }
-    if name_is(sheet, declaration, "padding-left") {
+    if values.equals_ci(name, "padding-left") {
         if single.ok { (*style).padding_left = single.length; }
         return true;
     }
@@ -392,14 +941,13 @@ struct BorderShorthand {
 }
 
 fn read_border_shorthand(
-    source: StyleSource,
+    s: *CssTokenSink,
     first: u64,
     limit: u64,
     style: *ComputedStyle,
     font_size: f64,
     root_font_size: f64
 ) -> BorderShorthand {
-    let s: *CssTokenSink = source.sink;
     let width: f64 = 3.0;
     let line_style: u8 = computed.border_none();
     let color: StyleColor = (*style).color;
@@ -435,27 +983,24 @@ fn read_border_shorthand(
 }
 
 fn apply_border(
-    source: StyleSource,
-    declaration: CssDeclaration,
+    name: []const u8,
+    s: *CssTokenSink,
+    first: u64,
+    limit: u64,
     style: *ComputedStyle,
     font_size: f64,
     root_font_size: f64
 ) -> void {
-    let s: *CssTokenSink = source.sink;
-    let sheet: *CssStylesheet = source.sheet;
-    let first: u64 = declaration.value_first;
-    let limit: u64 = declaration.value_first + declaration.value_count;
-
     // The per-side shorthands, e.g. `border-left: 6px solid gold`. Same
     // grammar as `border`, applied to one edge.
     let side: i64 = 0 - 1;
-    if name_is(sheet, declaration, "border-top") { side = 0; }
-    else if name_is(sheet, declaration, "border-right") { side = 1; }
-    else if name_is(sheet, declaration, "border-bottom") { side = 2; }
-    else if name_is(sheet, declaration, "border-left") { side = 3; }
+    if values.equals_ci(name, "border-top") { side = 0; }
+    else if values.equals_ci(name, "border-right") { side = 1; }
+    else if values.equals_ci(name, "border-bottom") { side = 2; }
+    else if values.equals_ci(name, "border-left") { side = 3; }
     if side >= 0 {
         let parsed: BorderShorthand =
-            read_border_shorthand(source, first, limit, style, font_size,
+            read_border_shorthand(s, first, limit, style, font_size,
                 root_font_size);
         if side == 0 {
             (*style).border_top_width = parsed.width;
@@ -477,9 +1022,9 @@ fn apply_border(
         return;
     }
 
-    if name_is(sheet, declaration, "border") {
+    if values.equals_ci(name, "border") {
         let parsed: BorderShorthand =
-            read_border_shorthand(source, first, limit, style, font_size,
+            read_border_shorthand(s, first, limit, style, font_size,
                 root_font_size);
         (*style).border_top_width = parsed.width;
         (*style).border_right_width = parsed.width;
@@ -498,23 +1043,23 @@ fn apply_border(
 
     let width: StyleNumberResult =
         values.parse_border_width(s, first, font_size, root_font_size);
-    if name_is(sheet, declaration, "border-top-width") {
+    if values.equals_ci(name, "border-top-width") {
         if width.ok { (*style).border_top_width = width.value; }
         return;
     }
-    if name_is(sheet, declaration, "border-right-width") {
+    if values.equals_ci(name, "border-right-width") {
         if width.ok { (*style).border_right_width = width.value; }
         return;
     }
-    if name_is(sheet, declaration, "border-bottom-width") {
+    if values.equals_ci(name, "border-bottom-width") {
         if width.ok { (*style).border_bottom_width = width.value; }
         return;
     }
-    if name_is(sheet, declaration, "border-left-width") {
+    if values.equals_ci(name, "border-left-width") {
         if width.ok { (*style).border_left_width = width.value; }
         return;
     }
-    if name_is(sheet, declaration, "border-width") {
+    if values.equals_ci(name, "border-width") {
         if width.ok {
             (*style).border_top_width = width.value;
             (*style).border_right_width = width.value;
@@ -525,23 +1070,23 @@ fn apply_border(
     }
 
     let border_style: StyleKeywordResult = values.parse_border_style(s, first);
-    if name_is(sheet, declaration, "border-top-style") {
+    if values.equals_ci(name, "border-top-style") {
         if border_style.ok { (*style).border_top_style = border_style.value; }
         return;
     }
-    if name_is(sheet, declaration, "border-right-style") {
+    if values.equals_ci(name, "border-right-style") {
         if border_style.ok { (*style).border_right_style = border_style.value; }
         return;
     }
-    if name_is(sheet, declaration, "border-bottom-style") {
+    if values.equals_ci(name, "border-bottom-style") {
         if border_style.ok { (*style).border_bottom_style = border_style.value; }
         return;
     }
-    if name_is(sheet, declaration, "border-left-style") {
+    if values.equals_ci(name, "border-left-style") {
         if border_style.ok { (*style).border_left_style = border_style.value; }
         return;
     }
-    if name_is(sheet, declaration, "border-style") {
+    if values.equals_ci(name, "border-style") {
         if border_style.ok {
             (*style).border_top_style = border_style.value;
             (*style).border_right_style = border_style.value;
@@ -552,23 +1097,23 @@ fn apply_border(
     }
 
     let color: StyleColorResult = values.parse_color(s, first, limit);
-    if name_is(sheet, declaration, "border-top-color") {
+    if values.equals_ci(name, "border-top-color") {
         if color.ok { (*style).border_top_color = color.color; }
         return;
     }
-    if name_is(sheet, declaration, "border-right-color") {
+    if values.equals_ci(name, "border-right-color") {
         if color.ok { (*style).border_right_color = color.color; }
         return;
     }
-    if name_is(sheet, declaration, "border-bottom-color") {
+    if values.equals_ci(name, "border-bottom-color") {
         if color.ok { (*style).border_bottom_color = color.color; }
         return;
     }
-    if name_is(sheet, declaration, "border-left-color") {
+    if values.equals_ci(name, "border-left-color") {
         if color.ok { (*style).border_left_color = color.color; }
         return;
     }
-    if name_is(sheet, declaration, "border-color") {
+    if values.equals_ci(name, "border-color") {
         if color.ok {
             (*style).border_top_color = color.color;
             (*style).border_right_color = color.color;
@@ -578,12 +1123,133 @@ fn apply_border(
     }
 }
 
+// --- Applying one matched declaration ----------------------------------------
+
+// Apply a declaration, resolving var() and the CSS-wide keywords first. This
+// is the whole of §4.1 "the declared value" through §4.4 "the computed value"
+// for one property.
+fn apply_matched(
+    context: *CascadeContext,
+    source: StyleSource,
+    declaration: CssDeclaration,
+    style: *ComputedStyle,
+    parent: ComputedStyle,
+    revert_base: ComputedStyle,
+    root_font_size: f64
+) -> void {
+    let name: []const u8 =
+        stylesheet.bytes(source.sheet, declaration.name_off, declaration.name_len);
+    let s: *CssTokenSink = source.sink;
+    let first: u64 = declaration.value_first;
+    let limit: u64 = declaration.value_first + declaration.value_count;
+
+    if custom.is_custom_name(name) {
+        define_custom(context, source, name, first, limit, style);
+        return;
+    }
+
+    if !uses_var(s, first, limit) {
+        let keyword: u8 = wide_keyword(s, first, limit);
+        if keyword != WIDE_NONE {
+            apply_wide_keyword(keyword, name, style, parent, revert_base);
+            return;
+        }
+        apply_named(name, s, first, limit, style, parent.font_size,
+            root_font_size);
+        return;
+    }
+
+    let resolved: Substitution = substitute(source.source, s, first, limit,
+        (*context).env, (*style).custom, 0);
+    if resolved.status != SUBSTITUTE_OK {
+        // §3.2: invalid at computed-value time behaves as `unset`.
+        vec.destroy(&resolved.text);
+        apply_wide_keyword(WIDE_UNSET, name, style, parent, revert_base);
+        return;
+    }
+    apply_from_text(vec.as_const_slice(&resolved.text), name, style, parent,
+        revert_base, root_font_size);
+    vec.destroy(&resolved.text);
+}
+
+// Tokenize substituted text and apply it as this property's value.
+fn apply_from_text(
+    text: []const u8,
+    name: []const u8,
+    style: *ComputedStyle,
+    parent: ComputedStyle,
+    revert_base: ComputedStyle,
+    root_font_size: f64
+) -> void {
+    let sink: CssTokenSink = css_tokens.new_sink();
+    let t: CssTokenizer = css_tokenizer.new(view_start(text), len(text));
+    css_tokenizer.run(&t, &sink);
+    let limit: u64 = css_tokens.token_count(&sink);
+    // Trim the EOF token, which is not part of the value.
+    while limit > 0
+        && css_tokens.get_token(&sink, limit - 1).kind == css_tokens.kind_eof() {
+        limit = limit - 1;
+    }
+    let first: u64 = values.skip_ws(&sink, 0, limit);
+    while limit > first
+        && css_tokens.get_token(&sink, limit - 1).kind
+            == css_tokens.kind_whitespace() {
+        limit = limit - 1;
+    }
+    if limit > first {
+        let keyword: u8 = wide_keyword(&sink, first, limit);
+        if keyword != WIDE_NONE {
+            apply_wide_keyword(keyword, name, style, parent, revert_base);
+        } else {
+            apply_named(name, &sink, first, limit, style, parent.font_size,
+                root_font_size);
+        }
+    }
+    css_tokens.destroy(&sink);
+}
+
+fn view_start(view: []const u8) -> *const u8 {
+    if len(view) == 0 {
+        return 0 as *const u8;
+    }
+    return &view[0];
+}
+
+// A custom property's computed value is its token stream with any var() in it
+// already substituted (§3), so it is stored as text and never re-resolved.
+fn define_custom(
+    context: *CascadeContext,
+    source: StyleSource,
+    name: []const u8,
+    first: u64,
+    limit: u64,
+    style: *ComputedStyle
+) -> void {
+    let s: *CssTokenSink = source.sink;
+    if !uses_var(s, first, limit) {
+        (*style).custom = custom.define((*context).env, (*style).custom, name,
+            token_text(source.source, s, first, limit - first));
+        return;
+    }
+    let resolved: Substitution = substitute(source.source, s, first, limit,
+        (*context).env, (*style).custom, 0);
+    if resolved.status == SUBSTITUTE_OK {
+        (*style).custom = custom.define((*context).env, (*style).custom, name,
+            vec.as_const_slice(&resolved.text));
+    }
+    // A custom property that fails to substitute keeps whatever it inherited,
+    // which is what the guaranteed-invalid value amounts to for an inherited
+    // property.
+    vec.destroy(&resolved.text);
+}
+
+// --- Driving the tree --------------------------------------------------------
+
 // Compute the style of one element and then of its descendants.
 fn style_element(
     doc: *DomDocument,
     element: u64,
-    ua: StyleSource,
-    author: StyleSource,
+    context: *CascadeContext,
     tree: *StyleTree,
     parent_style: ComputedStyle,
     root_font_size: f64
@@ -596,25 +1262,44 @@ fn style_element(
 
     let matched: Vec<MatchedDeclaration> = vec.new<MatchedDeclaration>();
     let order: u64 = 0;
-    for index: u64 in 0..stylesheet.rule_count(ua.sheet) {
-        collect_from_rule(doc, element, ua, 0,
-            stylesheet.top_level_rule(ua.sheet, index), &matched, &order);
+    for index: u64 in 0..stylesheet.rule_count((*context).ua.sheet) {
+        collect_from_rule(doc, element, (*context).ua, 0,
+            stylesheet.top_level_rule((*context).ua.sheet, index), &matched,
+            &order, (*context).device);
     }
-    for index: u64 in 0..stylesheet.rule_count(author.sheet) {
-        collect_from_rule(doc, element, author, 1,
-            stylesheet.top_level_rule(author.sheet, index), &matched, &order);
+    for index: u64 in 0..stylesheet.rule_count((*context).author.sheet) {
+        collect_from_rule(doc, element, (*context).author, 1,
+            stylesheet.top_level_rule((*context).author.sheet, index), &matched,
+            &order, (*context).device);
+    }
+    // The style attribute has no selector, so its declarations are collected
+    // directly rather than matched.
+    let attribute: AttrRange = attrstyle.range_of((*context).attrs, element);
+    for index: u64 in 0..attribute.decl_count {
+        push_matched((*context).attribute, 2, attribute.decl_first + index,
+            0 as u32, &matched, &order);
     }
     sort_matched(&matched);
 
+    // `revert` rolls a property back to the value the previous origin left, so
+    // the style is snapshotted at each origin boundary as it is applied.
+    let revert_base: ComputedStyle = style;
+    let previous_weight: u8 = 0 as u8;
     for index: u64 in 0..matched.length {
         let entry: MatchedDeclaration = matched.data[index];
-        let source: StyleSource = ua;
-        if entry.sheet == 1 {
-            source = author;
+        if entry.weight != previous_weight {
+            revert_base = style;
+            previous_weight = entry.weight;
         }
-        apply_declaration(source,
+        let source: StyleSource = (*context).ua;
+        if entry.sheet == 1 {
+            source = (*context).author;
+        } else if entry.sheet == 2 {
+            source = (*context).attribute;
+        }
+        apply_matched(context, source,
             stylesheet.get_declaration(source.sheet, entry.declaration),
-            &style, parent_style.font_size, root_font_size);
+            &style, parent_style, revert_base, root_font_size);
     }
     vec.destroy(&matched);
 
@@ -622,32 +1307,38 @@ fn style_element(
 
     let child: u64 = element_node.first_child;
     while child != node.none() {
-        style_element(doc, child, ua, author, tree, style, root_font_size);
+        style_element(doc, child, context, tree, style, root_font_size);
         child = node.get(doc, child).next_sibling;
     }
 }
 
-// Compute styles for the whole document. `ua` and `author` are the two
-// origins; both must outlive the returned tree's use, since declaration values
-// are read from their sinks.
+// Compute styles for the whole document. Every source must outlive the
+// returned tree's use, since declaration values are read from their sinks, and
+// `env` must outlive it too, since custom property values live there.
 pub fn compute(
     doc: *DomDocument,
-    ua_sheet: *CssStylesheet,
-    ua_sink: *CssTokenSink,
-    author_sheet: *CssStylesheet,
-    author_sink: *CssTokenSink,
+    ua: StyleSource,
+    author: StyleSource,
+    attrs: *AttrStyles,
+    env: *CustomEnv,
+    device: MediaContext,
     tree: *StyleTree
 ) -> void {
-    let ua: StyleSource = StyleSource {
-        sheet: ua_sheet, sink: ua_sink, origin: origin_ua(),
+    let attribute: StyleSource = StyleSource {
+        sheet: attrstyle.sheet_of(attrs),
+        sink: attrstyle.sink_of(attrs),
+        source: attrstyle.source_of(attrs),
+        origin: origin_author(),
+        from_attribute: true,
     };
-    let author: StyleSource = StyleSource {
-        sheet: author_sheet, sink: author_sink, origin: origin_author(),
+    let context: CascadeContext = CascadeContext {
+        ua: ua, author: author, attribute: attribute, attrs: attrs, env: env,
+        device: device,
     };
     let root_style: ComputedStyle = computed.initial_style();
     let child: u64 = node.get(doc, 0).first_child;
     while child != node.none() {
-        style_element(doc, child, ua, author, tree, root_style,
+        style_element(doc, child, &context, tree, root_style,
             root_style.font_size);
         child = node.get(doc, child).next_sibling;
     }

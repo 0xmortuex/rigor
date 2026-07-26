@@ -25,6 +25,9 @@ import engine.css.stylesheet;
 import engine.css.serialize as css_serialize;
 import engine.style.computed;
 import engine.style.cascade;
+import engine.style.custom;
+import engine.style.media;
+import engine.style.attrstyle;
 import engine.style.ua;
 import engine.layout.box;
 import engine.layout.flow;
@@ -363,8 +366,17 @@ fn main() -> int {
     let ua_sheet: CssStylesheet = stylesheet.new_stylesheet();
     css_parser.parse_stylesheet(&ua_sheet, &ua_sink);
 
+    // Style attributes, which cascade above every author rule.
+    let attrs: AttrStyles = attrstyle.parse_document(&doc);
+
     let tree_styles: StyleTree = computed.new_tree(node.node_count(&doc));
-    cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &tree_styles);
+    let env: CustomEnv = custom.new_env();
+    cascade.compute(&doc,
+    cascade.new_source(&ua_sheet, &ua_sink,
+    vec.as_const_slice(&ua_normalized), cascade.origin_ua()),
+    cascade.new_source(&sheet, &css_sink,
+    vec.as_const_slice(&css_normalized), cascade.origin_author()),
+    &attrs, &env, media.screen_context(800.0, 600.0), &tree_styles);
 
     out_str(&out, "-- computed style --");
     out_line(&out);

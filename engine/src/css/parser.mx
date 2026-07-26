@@ -76,6 +76,20 @@ pub fn parse_stylesheet(sheet: *CssStylesheet, s: *CssTokenSink) -> void {
     parse_rules(sheet, s, &p, &(*sheet).top_level, true);
 }
 
+// Parse a bare declaration list — §5.4.4 applied to something that is not a
+// rule's block, which is what a `style` attribute is. `first`..`limit` bounds
+// the token range; the declarations are appended to the sheet and the count is
+// returned, so the caller records (sheet.declarations.length before, count).
+pub fn parse_declaration_block(
+    sheet: *CssStylesheet,
+    s: *CssTokenSink,
+    first: u64,
+    limit: u64
+) -> u64 {
+    let p: CssParser = CssParser { pos: first, limit: limit };
+    return consume_declarations(sheet, s, &p);
+}
+
 // Consume rules until the end of the current block (or of the stylesheet).
 // Appends each rule's index to `out`.
 fn parse_rules(
