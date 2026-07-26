@@ -136,6 +136,17 @@ fn write_node(out: *Vec<u8>, doc: *DomDocument, index: u64, depth: u64) -> void 
         push_view(out, node.bytes(doc, n.name_off, n.name_len));
         push_str(out, ">\n");
         write_attributes(out, doc, index, depth + 1);
+        // A template's contents are a separate fragment, which the html5lib
+        // format shows under a "content" line one level in.
+        if n.content != node.none() {
+            push_indent(out, depth + 1);
+            push_str(out, "content\n");
+            let inner: u64 = node.get(doc, n.content).first_child;
+            while inner != node.none() {
+                write_node(out, doc, inner, depth + 2);
+                inner = node.get(doc, inner).next_sibling;
+            }
+        }
     } else if n.kind == node.kind_text() {
         push_indent(out, depth);
         push_str(out, "\"");

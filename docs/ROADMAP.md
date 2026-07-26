@@ -27,11 +27,13 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       integration points, breakout rules, and CDATA sections
 - [x] The script-data tokenizer states (§13.2.5.15–31), including double
       escaping
-- [x] The `select` insertion modes (§13.2.6.4.16–17) and select scope — tree
-      construction **1274/1304 (97.7%)**, 28 of 41 suites perfect
-- [ ] `template` contents and fragment parsing (`innerHTML`) — the largest
-      remaining parsing gap, and what tests26 and the 26 skipped tree cases
-      need
+- [x] The `select` insertion modes (§13.2.6.4.16–17) and select scope
+- [x] `template` contents: the separate contents fragment, the "in template"
+      mode and the stack of template insertion modes, and the template arms of
+      the insertion-location and adoption agency algorithms — tree
+      construction **1390/1415 (98.2%)**, 31 of 42 suites perfect
+- [ ] Fragment parsing (`innerHTML`) — the last parsing gap, and what tests26
+      and the 27 skipped tree cases need
 - [x] CSS tokenizer (css-syntax-3 §4) and parser (§5): rules, at-rules,
       declarations, `!important`
 - [x] Selectors (selectors-4): type/universal/class/id/attribute/pseudo,

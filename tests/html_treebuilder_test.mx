@@ -295,3 +295,42 @@ test "unknown elements are ordinary elements" {
     assert(tree_is("<my-widget>x</my-widget>",
     "| <html>\n|   <head>\n|   <body>\n|     <my-widget>\n|       \"x\"\n"));
 }
+
+test "template children go into the contents fragment" {
+    assert(tree_is("<template><div>a</div></template><p>after",
+    "| <html>\n|   <head>\n|     <template>\n|       content\n|         <div>\n|           \"a\"\n|   <body>\n|     <p>\n|       \"after\"\n"));
+}
+
+test "an unclosed template still lets the document finish" {
+    assert(tree_is("<template><div>",
+    "| <html>\n|   <head>\n|     <template>\n|       content\n|         <div>\n|   <body>\n"));
+}
+
+test "table markup inside a template keeps its shape" {
+    assert(tree_is("<body><template><tr><td>a",
+    "| <html>\n|   <head>\n|   <body>\n|     <template>\n|       content\n|         <tr>\n|           <td>\n|             \"a\"\n"));
+}
+
+test "content fostered out of a table stays inside the template" {
+    // The table is not really an ancestor here: the template is nearer, so
+    // the div lands in the template contents rather than beside the table.
+    assert(tree_is("<body><template><tr><div></div></tr></template>",
+    "| <html>\n|   <head>\n|   <body>\n|     <template>\n|       content\n|         <tr>\n|         <div>\n"));
+}
+
+test "a template cannot change the document around it" {
+    // <html> and <body> attributes are merged onto the originals normally,
+    // but template contents are sealed off from the document.
+    assert(tree_is("<html a=b><template><html c=d>",
+    "| <html>\n|   a=\"b\"\n|   <head>\n|     <template>\n|       content\n|   <body>\n"));
+}
+
+test "templates nest" {
+    assert(tree_is("<template><template><div>",
+    "| <html>\n|   <head>\n|     <template>\n|       content\n|         <template>\n|           content\n|             <div>\n|   <body>\n"));
+}
+
+test "a template inside a select is not flattened" {
+    assert(tree_is("<select><template><option></option></template></select>",
+    "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       <template>\n|         content\n|           <option>\n"));
+}

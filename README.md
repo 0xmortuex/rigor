@@ -41,7 +41,7 @@ formatting markup.
 ### Tree construction
 
 `python tools/run_tree_conformance.py` against the html5lib-tests
-tree-construction suites: **1274/1304 (97.7%)**, 26 skipped. 28 of the 41
+tree-construction suites: **1390/1415 (98.2%)**, 27 skipped. 31 of the 42
 suites pass completely.
 
 The driver prints per-suite numbers so the gap stays visible:
@@ -52,9 +52,10 @@ The driver prints per-suite numbers so the gap stays visible:
 | tables01, tests8, tests21–tests25 | 100% | tables, CDATA, misc |
 | tests11, ruby, html5test-com | 100% | foreign content, ruby |
 | tests9, tests10, tests21 | 100% | foreign content, CDATA |
+| template | 111/111 | `<template>` contents |
 | tests16 | 97% | script data |
-| tests26 | 75% | **fragment parsing, `<template>`** |
-| adoption01 | 14/17 | misnested formatting |
+| tests26 | 75% | **fragment parsing** |
+| adoption01 | 15/17 | misnested formatting |
 
 ### Tokenizer
 

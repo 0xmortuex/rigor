@@ -22,6 +22,7 @@ pub fn kind_text() -> u8 { return 3 as u8; }
 pub fn kind_comment() -> u8 { return 8 as u8; }
 pub fn kind_document() -> u8 { return 9 as u8; }
 pub fn kind_doctype() -> u8 { return 10 as u8; }
+pub fn kind_fragment() -> u8 { return 11 as u8; }
 
 // Element namespaces (§13.2.6 foreign content).
 pub fn ns_html() -> u8 { return 0 as u8; }
@@ -68,6 +69,10 @@ struct DomNode {
     next_sibling: u64,
     attr_first: u64,
     attr_count: u64,
+    // A <template>'s contents live in a separate DocumentFragment rather than
+    // among its children, so that they are inert. This is that fragment, or
+    // none() for every other element.
+    content: u64,
 }
 
 resource struct DomDocument {
@@ -89,6 +94,7 @@ fn empty_node(kind: u8) -> DomNode {
         parent: 0, first_child: 0, last_child: 0,
         prev_sibling: 0, next_sibling: 0,
         attr_first: 0, attr_count: 0,
+        content: 0,
     };
 }
 
@@ -461,4 +467,23 @@ pub fn add_prefixed_attr(
     });
     node.attr_count = node.attr_count + 1;
     set(doc, element, node);
+}
+
+// Create a DocumentFragment, used for a template element's contents.
+pub fn create_fragment(doc: *DomDocument) -> u64 {
+    let node: DomNode = empty_node(kind_fragment());
+    let index: u64 = (*doc).nodes.length;
+    vec.push(&(*doc).nodes, node);
+    return index;
+}
+
+// Attach a template element's contents fragment.
+pub fn set_content(doc: *DomDocument, element: u64, fragment: u64) -> void {
+    let node: DomNode = get(doc, element);
+    node.content = fragment;
+    set(doc, element, node);
+}
+
+pub fn content_of(doc: *DomDocument, element: u64) -> u64 {
+    return get(doc, element).content;
 }
