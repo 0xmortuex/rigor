@@ -46,6 +46,8 @@ const MODE_IN_COLUMN_GROUP: u32 = 16;
 const MODE_IN_TABLE_BODY: u32 = 17;
 const MODE_IN_ROW: u32 = 18;
 const MODE_IN_CELL: u32 = 19;
+const MODE_IN_SELECT: u32 = 20;
+const MODE_IN_SELECT_IN_TABLE: u32 = 21;
 
 // Tokenizer states the tree builder switches into for text content.
 const TEXT_NONE: u32 = 0;
@@ -255,8 +257,28 @@ fn is_heading(tag: u32) -> bool {
 
 // --- Scopes (§13.2.4.2) ------------------------------------------------------
 
-// The base scope list, shared by every scope variant.
-fn is_scope_boundary(tag: u32) -> bool {
+// The base scope list, shared by every scope variant (§13.2.4.2).
+//
+// It is not only HTML elements: the MathML text integration points and the SVG
+// HTML integration points also terminate a scope. That is what stops a
+// `</div>` inside <svg><foreignObject> from reaching a <div> outside the SVG.
+// So the check needs the element's namespace rather than just its tag id, and
+// foreign names are compared as bytes because `foreignObject` is not a name
+// the HTML spec lists and so is never interned.
+fn is_scope_boundary(b: *HtmlTreeBuilder, element: u64) -> bool {
+    let namespace: u8 = namespace_of(b, element);
+    if namespace == node.ns_mathml() {
+        return name_equals(b, element, "mi") || name_equals(b, element, "mo")
+            || name_equals(b, element, "mn") || name_equals(b, element, "ms")
+            || name_equals(b, element, "mtext")
+            || name_equals(b, element, "annotation-xml");
+    }
+    if namespace == node.ns_svg() {
+        return name_equals(b, element, "foreignObject")
+            || name_equals(b, element, "desc")
+            || name_equals(b, element, "title");
+    }
+    let tag: u32 = tag_of(b, element);
     return tag == tagnames.tag_applet() || tag == tagnames.tag_caption()
         || tag == tagnames.tag_html() || tag == tagnames.tag_table()
         || tag == tagnames.tag_td() || tag == tagnames.tag_th()
@@ -274,14 +296,22 @@ fn has_element_in_scope(b: *HtmlTreeBuilder, tag: u32, variant: u32) -> bool {
         if is_html_element(b, element, tag) {
             return true;
         }
-        if variant == 3 as u32 {
+        if variant == 4 as u32 {
+            // Select scope is defined by exclusion: every element type
+            // terminates it *except* optgroup and option. That is the inverse
+            // of how every other scope in the spec is written.
+            if element_tag != tagnames.tag_optgroup()
+                && element_tag != tagnames.tag_option() {
+                return false;
+            }
+        } else if variant == 3 as u32 {
             if element_tag == tagnames.tag_html()
                 || element_tag == tagnames.tag_table()
                 || element_tag == tagnames.tag_template() {
                 return false;
             }
         } else {
-            if is_scope_boundary(element_tag) {
+            if is_scope_boundary(b, element) {
                 return false;
             }
             if variant == 1 as u32
@@ -1274,23 +1304,29 @@ fn foreign_content(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
         return;
     }
 
-    // End tag: walk the stack for an element whose name matches, popping as it
-    // goes. An HTML element on the way is handled by the current mode instead.
+    // End tag (§13.2.6.5 "any other end tag"). Walk outward from the current
+    // node looking for a matching name.
+    //
+    // The order of the checks matters: the name comparison applies to the
+    // current node and to every *foreign* element above it, but the moment the
+    // walk reaches an HTML element the token is handed to the insertion mode
+    // instead — without comparing that element's name. Comparing it too would
+    // let a `</div>` inside <svg><foreignObject> pop the <div> that encloses
+    // the whole SVG, when the scope rules say it must not.
     let name: []const u8 = token_data(s, token);
-    let position: u64 = depth(b);
-    while position > 0 {
-        position = position - 1;
-        let element: u64 = at(b, position);
+    let position: u64 = depth(b) - 1;
+    loop {
         if position == 0 {
             return;
         }
-        if names_equal_ci(name_of(b, element), name) {
+        if names_equal_ci(name_of(b, at(b, position)), name) {
             while depth(b) > position {
                 pop_open(b);
             }
             return;
         }
-        if namespace_of(b, element) == node.ns_html() {
+        position = position - 1;
+        if namespace_of(b, at(b, position)) == node.ns_html() {
             dispatch_html(b, s, index);
             return;
         }
@@ -1356,6 +1392,10 @@ fn dispatch_html(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
     else if mode == MODE_IN_TABLE_BODY { mode_in_table_body(b, s, index); }
     else if mode == MODE_IN_ROW { mode_in_row(b, s, index); }
     else if mode == MODE_IN_CELL { mode_in_cell(b, s, index); }
+    else if mode == MODE_IN_SELECT { mode_in_select(b, s, index); }
+    else if mode == MODE_IN_SELECT_IN_TABLE {
+        mode_in_select_in_table(b, s, index);
+    }
     else { mode_after_after_frameset(b, s, index); }
 }
 
@@ -1368,6 +1408,26 @@ fn reset_insertion_mode(b: *HtmlTreeBuilder) -> void {
         index = index - 1;
         let tag: u32 = tag_of(b, at(b, index));
         let last: bool = index == 0;
+        if tag == tagnames.tag_select() {
+            // §13.2.6.2: a select inside a table gets its own mode, so table
+            // markup can close it. Walk outward looking for that table.
+            if !last {
+                let ancestor: u64 = index;
+                while ancestor > 0 {
+                    ancestor = ancestor - 1;
+                    let outer: u32 = tag_of(b, at(b, ancestor));
+                    if outer == tagnames.tag_template() {
+                        break;
+                    }
+                    if outer == tagnames.tag_table() {
+                        (*b).mode = MODE_IN_SELECT_IN_TABLE;
+                        return;
+                    }
+                }
+            }
+            (*b).mode = MODE_IN_SELECT;
+            return;
+        }
         if tag == tagnames.tag_td() || tag == tagnames.tag_th() {
             if !last {
                 (*b).mode = MODE_IN_CELL;
@@ -1905,6 +1965,153 @@ fn mode_in_cell(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
 fn cell_in_table_scope(b: *HtmlTreeBuilder) -> bool {
     return has_element_in_scope(b, tagnames.tag_td(), 3 as u32)
         || has_element_in_scope(b, tagnames.tag_th(), 3 as u32);
+}
+
+// §13.2.6.4.16 "in select".
+//
+// A select subtree is nearly a closed world: almost every tag that is not
+// option, optgroup or hr is a parse error that is dropped, which is why a
+// stray <div> inside a <select> simply vanishes rather than breaking out.
+fn mode_in_select(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+
+    if token.kind == tokens.kind_chars() {
+        insert_text(b, token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        mode_in_body(b, s, index);
+        return;
+    }
+
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_option() {
+            if is_html_element(b, current(b), tagnames.tag_option()) {
+                pop_open(b);
+            }
+            insert_element(b, s, token);
+            return;
+        }
+        if tag == tagnames.tag_optgroup() {
+            if is_html_element(b, current(b), tagnames.tag_option()) {
+                pop_open(b);
+            }
+            if is_html_element(b, current(b), tagnames.tag_optgroup()) {
+                pop_open(b);
+            }
+            insert_element(b, s, token);
+            return;
+        }
+        if tag == tagnames.tag_hr() {
+            if is_html_element(b, current(b), tagnames.tag_option()) {
+                pop_open(b);
+            }
+            if is_html_element(b, current(b), tagnames.tag_optgroup()) {
+                pop_open(b);
+            }
+            insert_void_element(b, s, token);
+            return;
+        }
+        if tag == tagnames.tag_select() {
+            // A nested <select> is a parse error that closes the outer one.
+            close_select(b);
+            return;
+        }
+        if tag == tagnames.tag_input() || tag == tagnames.tag_keygen()
+            || tag == tagnames.tag_textarea() {
+            // Form controls cannot nest inside a select, so the select closes
+            // and the token is reprocessed outside it.
+            if !has_element_in_scope(b, tagnames.tag_select(), 4 as u32) {
+                return;
+            }
+            close_select(b);
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_script() || tag == tagnames.tag_template() {
+            in_head_start_tag(b, s, token, tag);
+            return;
+        }
+        // Anything else is a parse error and is dropped.
+        return;
+    }
+
+    let tag: u32 = token_tag(b, s, token);
+    if tag == tagnames.tag_optgroup() {
+        // An open option directly inside the optgroup is closed first.
+        if is_html_element(b, current(b), tagnames.tag_option())
+            && depth(b) > 1
+            && is_html_element(b, at(b, depth(b) - 2), tagnames.tag_optgroup()) {
+            pop_open(b);
+        }
+        if is_html_element(b, current(b), tagnames.tag_optgroup()) {
+            pop_open(b);
+        }
+        return;
+    }
+    if tag == tagnames.tag_option() {
+        if is_html_element(b, current(b), tagnames.tag_option()) {
+            pop_open(b);
+        }
+        return;
+    }
+    if tag == tagnames.tag_select() {
+        if !has_element_in_scope(b, tagnames.tag_select(), 4 as u32) {
+            return;
+        }
+        close_select(b);
+        return;
+    }
+    if tag == tagnames.tag_template() {
+        in_head_start_tag(b, s, token, tag);
+    }
+}
+
+// Pop through the open select and work out where the parser now is.
+fn close_select(b: *HtmlTreeBuilder) -> void {
+    pop_until_tag(b, tagnames.tag_select());
+    reset_insertion_mode(b);
+}
+
+// §13.2.6.4.17 "in select in table". A select inside a table is closed by any
+// table-structural tag, because the table markup has to win.
+fn mode_in_select_in_table(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    index: u64
+) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_start_tag()
+        || token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_caption() || tag == tagnames.tag_table()
+            || tag == tagnames.tag_tbody() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_thead() || tag == tagnames.tag_tr()
+            || tag == tagnames.tag_td() || tag == tagnames.tag_th() {
+            if token.kind == tokens.kind_end_tag()
+                && !has_element_in_scope(b, tag, 3 as u32) {
+                // The end tag has no matching open element, so it is dropped
+                // rather than dragging the select shut with it.
+                return;
+            }
+            close_select(b);
+            dispatch(b, s, index);
+            return;
+        }
+    }
+    mode_in_select(b, s, index);
 }
 
 // §13.2.6.4.15 "close the cell".
@@ -2622,6 +2829,28 @@ fn in_body_start_tag(
         insert_element(b, s, token);
         (*b).frameset_ok = false;
         (*b).mode = MODE_IN_TABLE;
+        return;
+    }
+    if tag == tagnames.tag_select() {
+        reconstruct_formatting(b);
+        insert_element(b, s, token);
+        (*b).frameset_ok = false;
+        // Which select mode applies depends on where the select sits.
+        if (*b).mode == MODE_IN_TABLE || (*b).mode == MODE_IN_CAPTION
+            || (*b).mode == MODE_IN_TABLE_BODY || (*b).mode == MODE_IN_ROW
+            || (*b).mode == MODE_IN_CELL {
+            (*b).mode = MODE_IN_SELECT_IN_TABLE;
+        } else {
+            (*b).mode = MODE_IN_SELECT;
+        }
+        return;
+    }
+    if tag == tagnames.tag_option() || tag == tagnames.tag_optgroup() {
+        if is_html_element(b, current(b), tagnames.tag_option()) {
+            pop_open(b);
+        }
+        reconstruct_formatting(b);
+        insert_element(b, s, token);
         return;
     }
     if tag == tagnames.tag_svg() || tag == tagnames.tag_math() {

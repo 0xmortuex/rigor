@@ -252,6 +252,45 @@ test "a cdata section in html content is a bogus comment" {
     "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       <!-- [CDATA[x]] -->\n"));
 }
 
+test "a select holds options and optgroups" {
+    assert(tree_is("<select><option>a<option>b</select>",
+    "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       <option>\n|         \"a\"\n|       <option>\n|         \"b\"\n"));
+}
+
+test "an option closes the previous one" {
+    assert(tree_is("<select><optgroup><option>a<optgroup><option>b</select>",
+    "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       <optgroup>\n|         <option>\n|           \"a\"\n|       <optgroup>\n|         <option>\n|           \"b\"\n"));
+}
+
+test "markup with no business in a select is dropped" {
+    // Almost everything that is not option, optgroup or hr is a parse error
+    // inside a select, and the token is ignored rather than breaking out.
+    assert(tree_is("<select><div>x</div><option>a</select>",
+    "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       \"x\"\n|       <option>\n|         \"a\"\n"));
+}
+
+test "a nested select closes the outer one" {
+    assert(tree_is("<select><option>a<select><option>b",
+    "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       <option>\n|         \"a\"\n|     <option>\n|       \"b\"\n"));
+}
+
+test "an input closes an open select" {
+    assert(tree_is("<select><option>a<input>b",
+    "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       <option>\n|         \"a\"\n|     <input>\n|     \"b\"\n"));
+}
+
+test "table markup closes a select inside a table" {
+    assert(tree_is("<table><tr><td><select><option>a<tr><td>b",
+    "| <html>\n|   <head>\n|   <body>\n|     <table>\n|       <tbody>\n|         <tr>\n|           <td>\n|             <select>\n|               <option>\n|                 \"a\"\n|         <tr>\n|           <td>\n|             \"b\"\n"));
+}
+
+test "an integration point stops a scope search" {
+    // </div> cannot reach the div outside the SVG, because foreignObject is
+    // a scope boundary, so it is ignored and the text stays inside.
+    assert(tree_is("<div><svg><foreignobject><math></div>a",
+    "| <html>\n|   <head>\n|   <body>\n|     <div>\n|       <svg svg>\n|         <svg foreignObject>\n|           <math math>\n|             \"a\"\n"));
+}
+
 test "unknown elements are ordinary elements" {
     assert(tree_is("<my-widget>x</my-widget>",
     "| <html>\n|   <head>\n|   <body>\n|     <my-widget>\n|       \"x\"\n"));

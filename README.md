@@ -41,8 +41,8 @@ formatting markup.
 ### Tree construction
 
 `python tools/run_tree_conformance.py` against the html5lib-tests
-tree-construction suites: **1241/1304 (95%)**, 26 skipped. 27 of the 41 suites
-pass completely.
+tree-construction suites: **1274/1304 (97.7%)**, 26 skipped. 28 of the 41
+suites pass completely.
 
 The driver prints per-suite numbers so the gap stays visible:
 
@@ -51,10 +51,10 @@ The driver prints per-suite numbers so the gap stays visible:
 | blocks, comments01, doctype01, entities01/02 | 100% | core parsing |
 | tables01, tests8, tests21–tests25 | 100% | tables, CDATA, misc |
 | tests11, ruby, html5test-com | 100% | foreign content, ruby |
+| tests9, tests10, tests21 | 100% | foreign content, CDATA |
 | tests16 | 97% | script data |
-| tests9, tests10 | 85% | SVG/MathML corner cases |
-| adoption01 | 15/17 | misnested formatting |
-| tests26 | 75% | **`select` insertion modes** |
+| tests26 | 75% | **fragment parsing, `<template>`** |
+| adoption01 | 14/17 | misnested formatting |
 
 ### Tokenizer
 
@@ -94,8 +94,9 @@ Nothing is skipped: every state the suites exercise is implemented.
   byte offset.
 - **Tree construction** (§13.2.6): the document-structure insertion modes,
   "in body", raw-text/RCDATA handling, the full table mode family with foster
-  parenting, the frameset modes, the scope algorithms, implied end tags,
-  active formatting elements, and the adoption agency algorithm.
+  parenting, the select modes, the frameset modes, the scope algorithms
+  (including the foreign integration points that terminate them), implied end
+  tags, active formatting elements, and the adoption agency algorithm.
 - **Foreign content** (§13.2.6.5): SVG and MathML subtrees with their own
   namespaces, the tag and attribute case fix-up tables, XML-namespaced
   attributes such as `xlink:href`, HTML and MathML-text integration points,

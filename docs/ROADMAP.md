@@ -26,10 +26,12 @@ HTML + CSS in, pixels in a window out. No JavaScript.
 - [x] Foreign content: SVG and MathML namespaces, name adjustment tables,
       integration points, breakout rules, and CDATA sections
 - [x] The script-data tokenizer states (§13.2.5.15–31), including double
-      escaping — tree construction **1241/1304 (95%)**
-- [ ] `select` insertion modes, `template` contents, fragment parsing
-      (`innerHTML`) — the largest remaining parsing gap, and what tests26 and
-      the 26 skipped tree cases need
+      escaping
+- [x] The `select` insertion modes (§13.2.6.4.16–17) and select scope — tree
+      construction **1274/1304 (97.7%)**, 28 of 41 suites perfect
+- [ ] `template` contents and fragment parsing (`innerHTML`) — the largest
+      remaining parsing gap, and what tests26 and the 26 skipped tree cases
+      need
 - [x] CSS tokenizer (css-syntax-3 §4) and parser (§5): rules, at-rules,
       declarations, `!important`
 - [x] Selectors (selectors-4): type/universal/class/id/attribute/pseudo,
