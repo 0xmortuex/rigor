@@ -23,6 +23,9 @@ import engine.css.tokens as css_tokens;
 import engine.css.parser as css_parser;
 import engine.css.stylesheet;
 import engine.css.serialize as css_serialize;
+import engine.style.computed;
+import engine.style.cascade;
+import engine.style.ua;
 
 extern fn getchar() -> c_int;
 extern fn putchar(character: c_int) -> c_int;
@@ -37,6 +40,14 @@ fn read_stdin() -> Vec<u8> {
         vec.push(&buf, c as u8);
     }
     return move buf;
+}
+
+fn cstr_len(text: *u8) -> u64 {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    return length;
 }
 
 fn out_str(out: *Vec<u8>, text: *u8) -> void {
@@ -159,6 +170,124 @@ fn gather_style_text(doc: *DomDocument, out: *Vec<u8>, index: u64) -> void {
     }
 }
 
+fn out_f64(out: *Vec<u8>, value: f64) -> void {
+    let magnitude: f64 = value;
+    if magnitude < 0.0 {
+        out_str(out, "-");
+        magnitude = 0.0 - magnitude;
+    }
+    let whole: u64 = magnitude as u64;
+    out_u64(out, whole);
+    let hundredths: u64 = (((magnitude - (whole as f64)) * 100.0) + 0.5) as u64;
+    if hundredths > 0 && hundredths < 100 {
+        out_str(out, ".");
+        if hundredths < 10 {
+            out_str(out, "0");
+        }
+        out_u64(out, hundredths);
+    }
+}
+
+fn out_length(out: *Vec<u8>, length: StyleLength) -> void {
+    if length.kind == computed.length_auto() {
+        out_str(out, "auto");
+        return;
+    }
+    out_f64(out, length.value);
+    if length.kind == computed.length_percent() {
+        out_str(out, "%");
+    } else {
+        out_str(out, "px");
+    }
+}
+
+fn out_color(out: *Vec<u8>, color: StyleColor) -> void {
+    if color.a == 0 as u8 {
+        out_str(out, "transparent");
+        return;
+    }
+    out_str(out, "rgb(");
+    out_u64(out, color.r as u64);
+    out_str(out, " ");
+    out_u64(out, color.g as u64);
+    out_str(out, " ");
+    out_u64(out, color.b as u64);
+    out_str(out, ")");
+}
+
+fn display_name(value: u8) -> *u8 {
+    if value == computed.display_block() { return "block"; }
+    if value == computed.display_inline() { return "inline"; }
+    if value == computed.display_inline_block() { return "inline-block"; }
+    if value == computed.display_list_item() { return "list-item"; }
+    if value == computed.display_none() { return "none"; }
+    if value == computed.display_table() { return "table"; }
+    if value == computed.display_table_row() { return "table-row"; }
+    if value == computed.display_table_cell() { return "table-cell"; }
+    return "table-row-group";
+}
+
+// One line per element: its tag, then the computed values layout will read.
+fn dump_styles(
+out: *Vec<u8>,
+doc: *DomDocument,
+tree: *StyleTree,
+index: u64,
+depth: u64
+) -> void {
+    let element: DomNode = node.get(doc, index);
+    if element.kind == node.kind_element() {
+        let style: ComputedStyle = computed.get(tree, index);
+        for step: u64 in 0..depth {
+            out_str(out, "  ");
+        }
+        out_str(out, "<");
+        let name: []const u8 = node.bytes(doc, element.name_off, element.name_len);
+        for step: u64 in 0..len(name) {
+            vec.push(out, name[step]);
+        }
+        out_str(out, ">  display:");
+        out_str(out, display_name(style.display));
+        out_str(out, " font:");
+        out_f64(out, style.font_size);
+        out_str(out, "px/");
+        out_u64(out, style.font_weight as u64);
+        out_str(out, " color:");
+        out_color(out, style.color);
+        if style.background_color.a != 0 as u8 {
+            out_str(out, " background:");
+            out_color(out, style.background_color);
+        }
+        out_str(out, " margin:");
+        out_length(out, style.margin_top);
+        out_str(out, " ");
+        out_length(out, style.margin_right);
+        out_str(out, " ");
+        out_length(out, style.margin_bottom);
+        out_str(out, " ");
+        out_length(out, style.margin_left);
+        if style.border_top_width > 0.0 {
+            out_str(out, " border:");
+            out_f64(out, style.border_top_width);
+            out_str(out, "px");
+        }
+        if style.width.kind != computed.length_auto() {
+            out_str(out, " width:");
+            out_length(out, style.width);
+        }
+        out_line(out);
+    }
+    let child: u64 = element.first_child;
+    while child != node.none() {
+        let next_depth: u64 = depth;
+        if element.kind == node.kind_element() {
+            next_depth = depth + 1;
+        }
+        dump_styles(out, doc, tree, child, next_depth);
+        child = node.get(doc, child).next_sibling;
+    }
+}
+
 fn main() -> int {
     let raw: Vec<u8> = read_stdin();
     // Raw document bytes, so the byte stream decoder runs first.
@@ -187,19 +316,21 @@ fn main() -> int {
     print_raw(out.data);
     vec.clear(&out);
 
+    // Author styles: every <style> element's text, concatenated in tree order.
     let style_text: Vec<u8> = vec.new<u8>();
     gather_style_text(&doc, &style_text, 0);
-    if style_text.length > 0 {
+    let css_normalized: Vec<u8> =
+    css_preprocess.normalize(style_text.data as *const u8, style_text.length);
+    let css_sink: CssTokenSink = css_tokens.new_sink();
+    let css_t: CssTokenizer =
+    css_tokenizer.new(css_normalized.data as *const u8, css_normalized.length);
+    css_tokenizer.run(&css_t, &css_sink);
+    let sheet: CssStylesheet = stylesheet.new_stylesheet();
+    css_parser.parse_stylesheet(&sheet, &css_sink);
+
+    if stylesheet.rule_count(&sheet) > 0 {
         out_str(&out, "-- stylesheet --");
         out_line(&out);
-        let css_normalized: Vec<u8> =
-        css_preprocess.normalize(style_text.data as *const u8, style_text.length);
-        let css_sink: CssTokenSink = css_tokens.new_sink();
-        let css_t: CssTokenizer =
-        css_tokenizer.new(css_normalized.data as *const u8, css_normalized.length);
-        css_tokenizer.run(&css_t, &css_sink);
-        let sheet: CssStylesheet = stylesheet.new_stylesheet();
-        css_parser.parse_stylesheet(&sheet, &css_sink);
         let css_text: Vec<u8> = css_serialize.stylesheet_text(&sheet, &css_sink);
         for index: u64 in 0..css_text.length {
             vec.push(&out, css_text.data[index]);
@@ -208,10 +339,33 @@ fn main() -> int {
         print_raw(out.data);
         vec.clear(&out);
         vec.destroy(&css_text);
-        stylesheet.destroy(&sheet);
-        css_tokens.destroy(&css_sink);
-        vec.destroy(&css_normalized);
     }
+
+    // The user-agent stylesheet, parsed exactly like the author's.
+    let ua_source: *u8 = ua.stylesheet_text();
+    let ua_normalized: Vec<u8> =
+    css_preprocess.normalize(ua_source as *const u8, cstr_len(ua_source));
+    let ua_sink: CssTokenSink = css_tokens.new_sink();
+    let ua_t: CssTokenizer =
+    css_tokenizer.new(ua_normalized.data as *const u8, ua_normalized.length);
+    css_tokenizer.run(&ua_t, &ua_sink);
+    let ua_sheet: CssStylesheet = stylesheet.new_stylesheet();
+    css_parser.parse_stylesheet(&ua_sheet, &ua_sink);
+
+    let tree_styles: StyleTree = computed.new_tree(node.node_count(&doc));
+    cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &tree_styles);
+
+    out_str(&out, "-- computed style --");
+    out_line(&out);
+    dump_styles(&out, &doc, &tree_styles, 0, 0);
+
+    computed.destroy(&tree_styles);
+    stylesheet.destroy(&ua_sheet);
+    css_tokens.destroy(&ua_sink);
+    vec.destroy(&ua_normalized);
+    stylesheet.destroy(&sheet);
+    css_tokens.destroy(&css_sink);
+    vec.destroy(&css_normalized);
     vec.destroy(&style_text);
 
     let errors: u64 = tokens.error_count(&sink);

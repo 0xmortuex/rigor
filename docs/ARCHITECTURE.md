@@ -13,9 +13,18 @@ Rigor is the classic engine pipeline, each stage an independent module of the
  DOM + style ──► layout tree ──► paint ──► framebuffer ──► window
 ```
 
-Everything up to and including CSS parsing exists today. The cascade, layout
-and paint do not; the pipeline shape is the contract they get built into. See
-ROADMAP.md for sequencing.
+Everything up to and including the cascade exists today. Layout and paint do
+not; the pipeline shape is the contract they get built into. See ROADMAP.md
+for sequencing.
+
+## The user-agent stylesheet is CSS
+
+`engine/src/style/ua.mx` holds the default styles as **CSS text**, parsed by
+the same parser author sheets go through. Nothing in the parser or the layout
+engine knows that `<div>` is a block or that `<b>` is bold — that is a rule in
+that sheet, and it wins or loses against author rules through the ordinary
+cascade. Hard-coding those defaults would mean a second, invisible styling
+path that authors could not override correctly.
 
 The two preprocessing stages stay separate rather than sharing code, because
 the specs genuinely differ: HTML normalizes newlines but passes U+0000 through

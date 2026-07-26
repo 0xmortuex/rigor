@@ -1,0 +1,452 @@
+// Selector matching — Selectors Level 4 §4 and §14.
+//
+// Matching runs right to left, which is what every real engine does: the
+// rightmost compound is checked against the candidate element first, and only
+// if that succeeds does the walk continue leftwards through the combinators.
+// Most selectors fail on their rightmost compound, so this rejects the vast
+// majority of rules after one comparison.
+//
+// The walk is recursive rather than a loop because descendant and
+// subsequent-sibling combinators need backtracking: in `a b c`, if the nearest
+// `b` ancestor has no `a` above it, a further-out `b` may still work, and a
+// greedy loop would wrongly report no match.
+//
+// Implemented pseudo-classes: :root, :empty, :first-child, :last-child,
+// :only-child, :first-of-type, :last-of-type, :only-of-type. Others never
+// match — including the functional ones, whose arguments the selector parser
+// records but does not yet interpret. Pseudo-elements never match an element
+// either, since they generate boxes rather than select existing ones, so a
+// rule whose selector ends in one simply does not apply.
+module engine.css.matching;
+
+import stylesheet;
+import engine.dom.node;
+
+fn ascii_lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32 as u8;
+    }
+    return c;
+}
+
+fn views_equal(left: []const u8, right: []const u8) -> bool {
+    if len(left) != len(right) {
+        return false;
+    }
+    for index: u64 in 0..len(left) {
+        if left[index] != right[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn views_equal_ci(left: []const u8, right: []const u8) -> bool {
+    if len(left) != len(right) {
+        return false;
+    }
+    for index: u64 in 0..len(left) {
+        if ascii_lower(left[index]) != ascii_lower(right[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 12 as u8
+        || c == 13 as u8;
+}
+
+// Does the whitespace-separated list `haystack` contain the token `needle`?
+// This is how class attributes and [attr~=value] both work.
+fn contains_word(haystack: []const u8, needle: []const u8) -> bool {
+    if len(needle) == 0 {
+        return false;
+    }
+    let index: u64 = 0;
+    while index < len(haystack) {
+        while index < len(haystack) && is_ws(haystack[index]) {
+            index = index + 1;
+        }
+        let start: u64 = index;
+        while index < len(haystack) && !is_ws(haystack[index]) {
+            index = index + 1;
+        }
+        if index - start == len(needle) {
+            let same: bool = true;
+            for step: u64 in 0..len(needle) {
+                if haystack[start + step] != needle[step] {
+                    same = false;
+                }
+            }
+            if same {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn starts_with(haystack: []const u8, needle: []const u8, ci: bool) -> bool {
+    if len(needle) == 0 || len(needle) > len(haystack) {
+        return false;
+    }
+    for index: u64 in 0..len(needle) {
+        let a: u8 = haystack[index];
+        let b: u8 = needle[index];
+        if ci {
+            a = ascii_lower(a);
+            b = ascii_lower(b);
+        }
+        if a != b {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn ends_with(haystack: []const u8, needle: []const u8, ci: bool) -> bool {
+    if len(needle) == 0 || len(needle) > len(haystack) {
+        return false;
+    }
+    let offset: u64 = len(haystack) - len(needle);
+    for index: u64 in 0..len(needle) {
+        let a: u8 = haystack[offset + index];
+        let b: u8 = needle[index];
+        if ci {
+            a = ascii_lower(a);
+            b = ascii_lower(b);
+        }
+        if a != b {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn contains_substring(haystack: []const u8, needle: []const u8, ci: bool) -> bool {
+    if len(needle) == 0 || len(needle) > len(haystack) {
+        return false;
+    }
+    for start: u64 in 0..(len(haystack) - len(needle) + 1) {
+        let same: bool = true;
+        for index: u64 in 0..len(needle) {
+            let a: u8 = haystack[start + index];
+            let b: u8 = needle[index];
+            if ci {
+                a = ascii_lower(a);
+                b = ascii_lower(b);
+            }
+            if a != b {
+                same = false;
+            }
+        }
+        if same {
+            return true;
+        }
+    }
+    return false;
+}
+
+// §6.3 the |= matcher: equal, or equal up to a following hyphen.
+fn dash_matches(haystack: []const u8, needle: []const u8, ci: bool) -> bool {
+    if len(haystack) == len(needle) {
+        if ci {
+            return views_equal_ci(haystack, needle);
+        }
+        return views_equal(haystack, needle);
+    }
+    if len(haystack) < len(needle) + 1 {
+        return false;
+    }
+    if haystack[len(needle)] != '-' {
+        return false;
+    }
+    return starts_with(haystack, needle, ci);
+}
+
+fn matches_attribute(
+    doc: *DomDocument,
+    element: u64,
+    sheet: *CssStylesheet,
+    simple: CssSimpleSelector
+) -> bool {
+    let name: []const u8 =
+        stylesheet.bytes(sheet, simple.name_off, simple.name_len);
+    let lookup: DomAttrValue = node.find_attr(doc, element, name);
+    if !lookup.found {
+        return false;
+    }
+    if simple.matcher == stylesheet.match_exists() {
+        return true;
+    }
+    let actual: []const u8 = node.bytes(doc, lookup.value_off, lookup.value_len);
+    let expected: []const u8 =
+        stylesheet.bytes(sheet, simple.value_off, simple.value_len);
+    let ci: bool = simple.case_insensitive;
+
+    if simple.matcher == stylesheet.match_equals() {
+        if ci {
+            return views_equal_ci(actual, expected);
+        }
+        return views_equal(actual, expected);
+    }
+    if simple.matcher == stylesheet.match_includes() {
+        // ~= is defined on whitespace-separated words and, per spec, an
+        // expected value containing whitespace can never match.
+        for index: u64 in 0..len(expected) {
+            if is_ws(expected[index]) {
+                return false;
+            }
+        }
+        return contains_word(actual, expected);
+    }
+    if simple.matcher == stylesheet.match_dash() {
+        return dash_matches(actual, expected, ci);
+    }
+    if simple.matcher == stylesheet.match_prefix() {
+        return starts_with(actual, expected, ci);
+    }
+    if simple.matcher == stylesheet.match_suffix() {
+        return ends_with(actual, expected, ci);
+    }
+    return contains_substring(actual, expected, ci);
+}
+
+fn matches_pseudo_class(
+    doc: *DomDocument,
+    element: u64,
+    sheet: *CssStylesheet,
+    simple: CssSimpleSelector
+) -> bool {
+    let name: []const u8 =
+        stylesheet.bytes(sheet, simple.name_off, simple.name_len);
+    if views_equal_ci(name, view_of("root")) {
+        let parent: u64 = node.get(doc, element).parent;
+        return parent == 0;
+    }
+    if views_equal_ci(name, view_of("empty")) {
+        let child: u64 = node.get(doc, element).first_child;
+        while child != node.none() {
+            let candidate: DomNode = node.get(doc, child);
+            if candidate.kind == node.kind_element() {
+                return false;
+            }
+            if candidate.kind == node.kind_text() && candidate.data_len > 0 {
+                return false;
+            }
+            child = candidate.next_sibling;
+        }
+        return true;
+    }
+    if views_equal_ci(name, view_of("first-child")) {
+        return node.element_child_position(doc, element).index == 0;
+    }
+    if views_equal_ci(name, view_of("last-child")) {
+        let position: DomChildPosition = node.element_child_position(doc, element);
+        return position.total > 0 && position.index == position.total - 1;
+    }
+    if views_equal_ci(name, view_of("only-child")) {
+        return node.element_child_position(doc, element).total == 1;
+    }
+    if views_equal_ci(name, view_of("first-of-type")) {
+        return type_position(doc, element, true);
+    }
+    if views_equal_ci(name, view_of("last-of-type")) {
+        return type_position(doc, element, false);
+    }
+    if views_equal_ci(name, view_of("only-of-type")) {
+        return type_position(doc, element, true)
+            && type_position(doc, element, false);
+    }
+    return false;
+}
+
+// Is `element` the first (or last) among its siblings sharing its tag name?
+fn type_position(doc: *DomDocument, element: u64, first: bool) -> bool {
+    let self_node: DomNode = node.get(doc, element);
+    let parent: u64 = self_node.parent;
+    if parent == node.none() {
+        return true;
+    }
+    let self_name: []const u8 =
+        node.bytes(doc, self_node.name_off, self_node.name_len);
+    let child: u64 = node.get(doc, parent).first_child;
+    let seen_self: bool = false;
+    while child != node.none() {
+        let candidate: DomNode = node.get(doc, child);
+        if child == element {
+            seen_self = true;
+        } else if candidate.kind == node.kind_element() {
+            let candidate_name: []const u8 =
+                node.bytes(doc, candidate.name_off, candidate.name_len);
+            if views_equal(candidate_name, self_name) {
+                if first && !seen_self {
+                    return false;
+                }
+                if !first && seen_self {
+                    return false;
+                }
+            }
+        }
+        child = candidate.next_sibling;
+    }
+    return true;
+}
+
+fn view_of(text: *u8) -> []const u8 {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    return slice(text as *const u8, length);
+}
+
+// Do all the simple selectors in one compound match `element`?
+fn matches_compound(
+    doc: *DomDocument,
+    element: u64,
+    sheet: *CssStylesheet,
+    compound_index: u64
+) -> bool {
+    let element_node: DomNode = node.get(doc, element);
+    if element_node.kind != node.kind_element() {
+        return false;
+    }
+    let compound: CssCompound = stylesheet.get_compound(sheet, compound_index);
+    for step: u64 in 0..compound.simple_count {
+        let simple: CssSimpleSelector =
+            stylesheet.get_simple(sheet, compound.simple_first + step);
+        let kind: u8 = simple.kind;
+        if kind == stylesheet.simple_universal() {
+            continue;
+        }
+        if kind == stylesheet.simple_type() {
+            let name: []const u8 =
+                stylesheet.bytes(sheet, simple.name_off, simple.name_len);
+            let actual: []const u8 =
+                node.bytes(doc, element_node.name_off, element_node.name_len);
+            // Tag names in an HTML document are matched ASCII
+            // case-insensitively; the tokenizer already lowercased the
+            // element's, so only the selector's side can differ.
+            if !views_equal_ci(actual, name) {
+                return false;
+            }
+            continue;
+        }
+        if kind == stylesheet.simple_class() {
+            let lookup: DomAttrValue =
+                node.find_attr(doc, element, view_of("class"));
+            if !lookup.found {
+                return false;
+            }
+            if !contains_word(
+                node.bytes(doc, lookup.value_off, lookup.value_len),
+                stylesheet.bytes(sheet, simple.name_off, simple.name_len)) {
+                return false;
+            }
+            continue;
+        }
+        if kind == stylesheet.simple_id() {
+            let lookup: DomAttrValue =
+                node.find_attr(doc, element, view_of("id"));
+            if !lookup.found {
+                return false;
+            }
+            if !views_equal(
+                node.bytes(doc, lookup.value_off, lookup.value_len),
+                stylesheet.bytes(sheet, simple.name_off, simple.name_len)) {
+                return false;
+            }
+            continue;
+        }
+        if kind == stylesheet.simple_attribute() {
+            if !matches_attribute(doc, element, sheet, simple) {
+                return false;
+            }
+            continue;
+        }
+        if kind == stylesheet.simple_pseudo_class() {
+            if !matches_pseudo_class(doc, element, sheet, simple) {
+                return false;
+            }
+            continue;
+        }
+        // A pseudo-element selects a generated box, not this element.
+        return false;
+    }
+    return true;
+}
+
+// Match `element` against the compound at `compound_index` and then everything
+// to its left. `stop` is the selector's first compound index.
+fn matches_from(
+    doc: *DomDocument,
+    element: u64,
+    sheet: *CssStylesheet,
+    compound_index: u64,
+    stop: u64
+) -> bool {
+    if !matches_compound(doc, element, sheet, compound_index) {
+        return false;
+    }
+    if compound_index == stop {
+        return true;
+    }
+    let compound: CssCompound = stylesheet.get_compound(sheet, compound_index);
+    let previous: u64 = compound_index - 1;
+    let combinator: u8 = compound.combinator;
+
+    if combinator == stylesheet.combinator_child() {
+        let parent: u64 = node.get(doc, element).parent;
+        if parent == node.none() {
+            return false;
+        }
+        return matches_from(doc, parent, sheet, previous, stop);
+    }
+    if combinator == stylesheet.combinator_descendant() {
+        let ancestor: u64 = node.get(doc, element).parent;
+        while ancestor != node.none() {
+            if matches_from(doc, ancestor, sheet, previous, stop) {
+                return true;
+            }
+            ancestor = node.get(doc, ancestor).parent;
+        }
+        return false;
+    }
+    if combinator == stylesheet.combinator_next_sibling() {
+        let sibling: u64 = node.previous_element_sibling(doc, element);
+        if sibling == node.none() {
+            return false;
+        }
+        return matches_from(doc, sibling, sheet, previous, stop);
+    }
+    if combinator == stylesheet.combinator_subsequent_sibling() {
+        let sibling: u64 = node.previous_element_sibling(doc, element);
+        while sibling != node.none() {
+            if matches_from(doc, sibling, sheet, previous, stop) {
+                return true;
+            }
+            sibling = node.previous_element_sibling(doc, sibling);
+        }
+        return false;
+    }
+    // combinator_none only appears on the first compound, which `stop` already
+    // caught; reaching here means the selector was malformed.
+    return false;
+}
+
+// Does `selector` match `element`?
+pub fn matches(
+    doc: *DomDocument,
+    element: u64,
+    sheet: *CssStylesheet,
+    selector: CssSelector
+) -> bool {
+    if !selector.valid || selector.compound_count == 0 {
+        return false;
+    }
+    let last: u64 = selector.compound_first + selector.compound_count - 1;
+    return matches_from(doc, element, sheet, last, selector.compound_first);
+}

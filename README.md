@@ -9,10 +9,11 @@ this project runs on: every algorithm is implemented from the WHATWG/CSSWG
 specification it cites, error recovery included, and progress is measured in
 passing conformance tests, not vibes.
 
-> **Status: pre-alpha.** HTML parses end to end (tokenizer at 100% and tree
-> construction at 81% of the html5lib conformance suites) and CSS parses into
-> rules, selectors and declarations. The cascade, layout and paint are
-> roadmap. See [docs/ROADMAP.md](docs/ROADMAP.md) for the honest ledger.
+> **Status: pre-alpha.** The front end is complete: HTML parses to a DOM
+> (tokenizer at 100% and tree construction at 81% of the html5lib conformance
+> suites), CSS parses to rules and selectors, and the cascade produces
+> computed styles for every element. Layout and paint are next. See
+> [docs/ROADMAP.md](docs/ROADMAP.md) for the honest ledger.
 
 ```
 > '<b>1<p>2</b>3</p>' | rigor
@@ -99,8 +100,17 @@ by the tree builder). The harness prints the skip count on every run.
 - **Selectors** (Selectors Level 4): type, universal, class, id, attribute
   (all six matchers plus the `i` flag), pseudo-classes and pseudo-elements,
   the four combinators, selector lists, and specificity.
-- **`rigor` CLI**: pipe HTML in, get the token stream, the parsed tree, and
-  the parsed stylesheet out.
+- **Selector matching** against the DOM, right to left with backtracking, plus
+  the structural pseudo-classes.
+- **The cascade** (CSS Cascade §6): origin and importance, specificity,
+  document order, inheritance, and a real user-agent stylesheet written as
+  CSS and parsed by the same parser — which is what makes `<div>` a block and
+  `<b>` bold.
+- **Computed values**: lengths resolved to pixels (em, rem, pt, cm, …),
+  percentages kept for layout, colors from hex/rgb()/named, and the margin,
+  padding and border shorthands.
+- **`rigor` CLI**: pipe HTML in, get the token stream, the parsed tree, the
+  parsed stylesheet, and the computed style of every element out.
 
 ```
 > '<!DOCTYPE html><p class="x">Hi &amp; bye</p>' | rigor
@@ -136,6 +146,18 @@ a[href^="https"]:hover
     width: 60%
 ```
 
+…and cascaded into computed styles, user-agent stylesheet included:
+
+```
+-- computed style --
+<html>  display:block font:16px/400 color:rgb(0 0 0) margin:0px 0px 0px 0px
+  <head>  display:none ...
+  <body>  display:block font:16px/400 color:rgb(34 34 34) margin:8px 8px 8px 8px
+    <h1>  display:block font:32px/700 color:rgb(0 0 139) margin:21.44px 0px 21.44px 0px
+    <div>  display:block ... background:rgb(245 245 245) border:2px width:60%
+      <p>  display:block font:16px/700 color:rgb(80 80 80) margin:8px 0px 8px 0px
+```
+
 ## Build
 
 Requires the [Mort toolchain](https://github.com/0xmortuex/Mort) (`mortc`).
@@ -158,7 +180,8 @@ python tools/gen_tags.py --check
 engine/            the engine library (Mort package `engine`) — embeddable
   src/html/        preprocessing, tokenizer, entities, tag names, tree builder
   src/dom/         the DOM arena and its html5lib-format serializer
-  src/css/         preprocessing, tokenizer, parser, selectors, stylesheet
+  src/css/         preprocessing, tokenizer, parser, selectors, matching
+  src/style/       the cascade, computed values, the UA stylesheet
 src/main.mx        the rigor developer CLI
 tests/             spec-behavior tests (mortc test)
 conformance/       batch driver binary for the html5lib suites

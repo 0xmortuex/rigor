@@ -34,9 +34,13 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       declarations, `!important`
 - [x] Selectors (selectors-4): type/universal/class/id/attribute/pseudo,
       the four combinators, selector lists, specificity
-- [ ] Selector *matching* against the DOM (the parsing half is done)
-- [ ] Style cascade: origin and order, inheritance, computed values
-- [ ] Property value parsing: lengths, colors, keywords, shorthands
+- [x] Selector matching against the DOM, right to left with backtracking
+- [x] Style cascade: origin, importance, specificity, document order,
+      inheritance, and a UA stylesheet written as real CSS
+- [x] Property value parsing: lengths (absolute and font-relative), colors
+      (hex, rgb(), named), keywords, and the box shorthands
+- [ ] `inherit` / `initial` / `unset` keywords and custom properties
+- [ ] `@media` query evaluation (rules inside one currently always apply)
 - [ ] Layout: block + inline formatting, box model
 - [ ] Paint: software rasterizer, bitmap font text first
 - [ ] Window: Win32 via `extern fn` FFI (CreateWindowExA + StretchDIBits)

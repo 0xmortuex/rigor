@@ -1,0 +1,18 @@
+// The user-agent stylesheet.
+//
+// This is why a <div> is a block and a <b> is bold: none of that is in the
+// parser or the layout engine, it is CSS that every browser ships and that the
+// HTML spec publishes as a "rendering" appendix (HTML §15). Keeping it as real
+// CSS text, parsed by the ordinary CSS parser, means the cascade has only one
+// code path — the UA sheet wins or loses against author rules by the normal
+// rules, exactly as the spec describes.
+//
+// This is the subset matching the properties ComputedStyle currently holds;
+// it grows alongside layout.
+module engine.style.ua;
+
+// Mort has no multi-line string literals, so the sheet is assembled from one
+// line per rule at call time.
+pub fn stylesheet_text() -> *u8 {
+    return "html, address, blockquote, body, dd, div, dl, dt, fieldset, figure, figcaption, footer, form, frame, frameset, h1, h2, h3, h4, h5, h6, header, hgroup, hr, main, nav, ol, p, search, section, ul { display: block }\nhead, link, meta, style, title, script, base { display: none }\nli { display: list-item }\ntable { display: table }\ntr { display: table-row }\ntd, th { display: table-cell }\nthead, tbody, tfoot { display: table-row-group }\nbody { margin: 8px }\np, dl, blockquote, figure { margin-top: 1em; margin-bottom: 1em }\nblockquote, figure { margin-left: 40px; margin-right: 40px }\nh1 { font-size: 2em; margin-top: 0.67em; margin-bottom: 0.67em; font-weight: bold }\nh2 { font-size: 1.5em; margin-top: 0.83em; margin-bottom: 0.83em; font-weight: bold }\nh3 { font-size: 1.17em; margin-top: 1em; margin-bottom: 1em; font-weight: bold }\nh4 { margin-top: 1.33em; margin-bottom: 1.33em; font-weight: bold }\nh5 { font-size: 0.83em; margin-top: 1.67em; margin-bottom: 1.67em; font-weight: bold }\nh6 { font-size: 0.67em; margin-top: 2.33em; margin-bottom: 2.33em; font-weight: bold }\nul, ol { margin-top: 1em; margin-bottom: 1em; padding-left: 40px }\ndd { margin-left: 40px }\nb, strong, th { font-weight: bold }\ni, em, cite, var, dfn, address { font-style: italic }\nu, ins { text-decoration: underline }\nhr { margin-top: 0.5em; margin-bottom: 0.5em; border-top-width: 1px; border-top-style: solid; border-top-color: gray }\npre, xmp, plaintext, listing { white-space: pre; margin-top: 1em; margin-bottom: 1em }\na { color: #0000ee }\nth { text-align: center }\ncaption { text-align: center; display: block }\nfieldset { margin-left: 2px; margin-right: 2px; padding-top: 0.35em; padding-bottom: 0.625em; padding-left: 0.75em; padding-right: 0.75em; border-top-width: 2px; border-right-width: 2px; border-bottom-width: 2px; border-left-width: 2px; border-top-style: solid; border-right-style: solid; border-bottom-style: solid; border-left-style: solid }\ncenter { text-align: center; display: block }\nbutton, textarea, input, select { display: inline-block }\nmark { background-color: yellow; color: black }\nbig { font-size: 1.17em }\nsmall, sub, sup { font-size: 0.83em }\n";
+}

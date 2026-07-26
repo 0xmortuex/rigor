@@ -1,0 +1,348 @@
+// The cascade and computed values (CSS Cascade §4, §6, §7).
+
+import std.vec;
+import std.string;
+import engine.html.preprocess;
+import engine.html.treebuilder;
+import engine.html.tokens;
+import engine.dom.node;
+import engine.css.preprocess as css_preprocess;
+import engine.css.tokenizer as css_tokenizer;
+import engine.css.tokens as css_tokens;
+import engine.css.parser as css_parser;
+import engine.css.stylesheet;
+import engine.style.computed;
+import engine.style.cascade;
+import engine.style.ua;
+
+resource struct Styled {
+    html_normalized: Vec<u8>,
+    html_sink: HtmlTokenSink,
+    doc: DomDocument,
+    ua_normalized: Vec<u8>,
+    ua_sink: CssTokenSink,
+    ua_sheet: CssStylesheet,
+    css_normalized: Vec<u8>,
+    css_sink: CssTokenSink,
+    sheet: CssStylesheet,
+    tree: StyleTree,
+}
+
+fn parse_css(source: *u8, normalized: *Vec<u8>, sink: *CssTokenSink,
+sheet: *CssStylesheet) -> void {
+    let text: Vec<u8> =
+    css_preprocess.normalize(source as *const u8, str_len(source));
+    let t: CssTokenizer =
+    css_tokenizer.new(text.data as *const u8, text.length);
+    css_tokenizer.run(&t, sink);
+    css_parser.parse_stylesheet(sheet, sink);
+    // Keep the buffer alive: the sink's pool copied what it needed, but the
+    // tokenizer read from this memory.
+    vec.destroy(normalized);
+    (*normalized) = move text;
+}
+
+fn build(html: *u8, css: *u8) -> Styled {
+    let html_sink: HtmlTokenSink = tokens.new_sink();
+    let html_normalized: Vec<u8> =
+    preprocess.normalize(html as *const u8, str_len(html), &html_sink);
+    let doc: DomDocument = node.new_document();
+    treebuilder.parse(html_normalized.data as *const u8,
+    html_normalized.length, &doc, &html_sink);
+
+    let ua_normalized: Vec<u8> = vec.new<u8>();
+    let ua_sink: CssTokenSink = css_tokens.new_sink();
+    let ua_sheet: CssStylesheet = stylesheet.new_stylesheet();
+    parse_css(ua.stylesheet_text(), &ua_normalized, &ua_sink, &ua_sheet);
+
+    let css_normalized: Vec<u8> = vec.new<u8>();
+    let css_sink: CssTokenSink = css_tokens.new_sink();
+    let sheet: CssStylesheet = stylesheet.new_stylesheet();
+    parse_css(css, &css_normalized, &css_sink, &sheet);
+
+    let tree: StyleTree = computed.new_tree(node.node_count(&doc));
+    cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &tree);
+
+    return Styled {
+        html_normalized: move html_normalized,
+        html_sink: move html_sink,
+        doc: move doc,
+        ua_normalized: move ua_normalized,
+        ua_sink: move ua_sink,
+        ua_sheet: move ua_sheet,
+        css_normalized: move css_normalized,
+        css_sink: move css_sink,
+        sheet: move sheet,
+        tree: move tree,
+    };
+}
+
+fn destroy(s: *Styled) -> void {
+    computed.destroy(&(*s).tree);
+    stylesheet.destroy(&(*s).sheet);
+    css_tokens.destroy(&(*s).css_sink);
+    vec.destroy(&(*s).css_normalized);
+    stylesheet.destroy(&(*s).ua_sheet);
+    css_tokens.destroy(&(*s).ua_sink);
+    vec.destroy(&(*s).ua_normalized);
+    node.destroy(&(*s).doc);
+    tokens.destroy(&(*s).html_sink);
+    vec.destroy(&(*s).html_normalized);
+}
+
+fn view_of(text: *u8) -> []const u8 {
+    return slice(text as *const u8, str_len(text));
+}
+
+fn by_id(s: *Styled, id: *u8) -> u64 {
+    let wanted: []const u8 = view_of(id);
+    for index: u64 in 0..node.node_count(&(*s).doc) {
+        let candidate: DomNode = node.get(&(*s).doc, index);
+        if candidate.kind == node.kind_element() {
+            let lookup: DomAttrValue =
+            node.find_attr(&(*s).doc, index, view_of("id"));
+            if lookup.found && lookup.value_len == len(wanted) {
+                let value: []const u8 =
+                node.bytes(&(*s).doc, lookup.value_off, lookup.value_len);
+                let same: bool = true;
+                for step: u64 in 0..len(value) {
+                    if value[step] != wanted[step] {
+                        same = false;
+                    }
+                }
+                if same {
+                    return index;
+                }
+            }
+        }
+    }
+    return node.none();
+}
+
+fn style_of(s: *Styled, id: *u8) -> ComputedStyle {
+    return computed.get(&(*s).tree, by_id(s, id));
+}
+
+fn near(actual: f64, expected: f64) -> bool {
+    let difference: f64 = actual - expected;
+    if difference < 0.0 {
+        difference = 0.0 - difference;
+    }
+    return difference < 0.01;
+}
+
+test "the ua stylesheet makes div a block and span inline" {
+    let s: Styled = build("<div id=a>x</div><span id=b>y</span>", "");
+    assert(style_of(&s, "a").display == computed.display_block());
+    assert(style_of(&s, "b").display == computed.display_inline());
+    destroy(&s);
+}
+
+test "the ua stylesheet makes b bold and i italic" {
+    let s: Styled = build("<b id=a>x</b><i id=b>y</i>", "");
+    assert(style_of(&s, "a").font_weight == 700 as u32);
+    assert(style_of(&s, "b").font_style == computed.font_style_italic());
+    destroy(&s);
+}
+
+test "the ua stylesheet hides head content" {
+    let s: Styled = build("<style id=a>p{}</style><p id=b>x</p>", "");
+    assert(style_of(&s, "a").display == computed.display_none());
+    destroy(&s);
+}
+
+test "author rules beat the ua stylesheet" {
+    let s: Styled = build("<div id=a>x</div>", "div { display: inline }");
+    assert(style_of(&s, "a").display == computed.display_inline());
+    destroy(&s);
+}
+
+test "higher specificity wins" {
+    let s: Styled = build("<p id=a class=x>t</p>",
+    "p { color: red } p.x { color: blue } .x { color: green }");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(style.color.r == 0 as u8);
+    assert(style.color.b == 255 as u8);
+    destroy(&s);
+}
+
+test "equal specificity resolves by document order" {
+    let s: Styled = build("<p id=a>t</p>", "p { color: red } p { color: blue }");
+    assert(style_of(&s, "a").color.b == 255 as u8);
+    destroy(&s);
+}
+
+test "important beats higher specificity" {
+    let s: Styled = build("<p id=a class=x>t</p>",
+    "p.x { color: blue } p { color: red !important }");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(style.color.r == 255 as u8);
+    assert(style.color.b == 0 as u8);
+    destroy(&s);
+}
+
+test "inherited properties reach descendants" {
+    let s: Styled = build("<div id=a><p id=b>t</p></div>",
+    "div { color: red }");
+    assert(style_of(&s, "b").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "non-inherited properties do not reach descendants" {
+    let s: Styled = build("<div id=a><p id=b>t</p></div>",
+    "div { border: 5px solid red }");
+    assert(near(style_of(&s, "a").border_top_width, 5.0));
+    assert(near(style_of(&s, "b").border_top_width, 0.0));
+    destroy(&s);
+}
+
+test "hex colors in three and six digit forms" {
+    let s: Styled = build("<p id=a>1</p><p id=b>2</p>",
+    "#a { color: #f00 } #b { color: #00ff80 }");
+    let short: ComputedStyle = style_of(&s, "a");
+    assert(short.color.r == 255 as u8 && short.color.g == 0 as u8);
+    let long: ComputedStyle = style_of(&s, "b");
+    assert(long.color.g == 255 as u8 && long.color.b == 128 as u8);
+    destroy(&s);
+}
+
+test "rgb and rgba functions" {
+    let s: Styled = build("<p id=a>1</p><p id=b>2</p>",
+    "#a { color: rgb(10, 20, 30) } #b { color: rgba(0, 0, 0, 0.5) }");
+    let plain: ComputedStyle = style_of(&s, "a");
+    assert(plain.color.r == 10 as u8 && plain.color.b == 30 as u8);
+    let alpha: ComputedStyle = style_of(&s, "b");
+    assert(alpha.color.a > 120 as u8 && alpha.color.a < 135 as u8);
+    destroy(&s);
+}
+
+test "named colors" {
+    let s: Styled = build("<p id=a>t</p>", "p { background-color: teal }");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(style.background_color.g == 128 as u8);
+    assert(style.background_color.b == 128 as u8);
+    destroy(&s);
+}
+
+test "em lengths resolve against the element's font size" {
+    let s: Styled = build("<p id=a>t</p>",
+    "p { font-size: 20px; margin-top: 2em }");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(near(style.font_size, 20.0));
+    assert(style.margin_top.kind == computed.length_px());
+    assert(near(style.margin_top.value, 40.0));
+    destroy(&s);
+}
+
+test "font-size in em resolves against the parent" {
+    let s: Styled = build("<div id=a><p id=b>t</p></div>",
+    "div { font-size: 20px } p { font-size: 1.5em }");
+    assert(near(style_of(&s, "b").font_size, 30.0));
+    destroy(&s);
+}
+
+test "absolute units convert to pixels" {
+    let s: Styled = build("<p id=a>t</p>", "p { margin-top: 12pt }");
+    assert(near(style_of(&s, "a").margin_top.value, 16.0));
+    destroy(&s);
+}
+
+test "percentages survive to layout" {
+    let s: Styled = build("<p id=a>t</p>", "p { width: 50% }");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(style.width.kind == computed.length_percent());
+    assert(near(style.width.value, 50.0));
+    destroy(&s);
+}
+
+test "auto is its own value" {
+    let s: Styled = build("<p id=a>t</p>", "p { width: auto; margin-left: auto }");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(style.width.kind == computed.length_auto());
+    assert(style.margin_left.kind == computed.length_auto());
+    destroy(&s);
+}
+
+test "margin shorthand follows the one-to-four value rule" {
+    let one: Styled = build("<p id=a>t</p>", "p { margin: 5px }");
+    let all: ComputedStyle = style_of(&one, "a");
+    assert(near(all.margin_top.value, 5.0) && near(all.margin_left.value, 5.0));
+    destroy(&one);
+
+    let two: Styled = build("<p id=a>t</p>", "p { margin: 1px 2px }");
+    let pair: ComputedStyle = style_of(&two, "a");
+    assert(near(pair.margin_top.value, 1.0));
+    assert(near(pair.margin_right.value, 2.0));
+    assert(near(pair.margin_bottom.value, 1.0));
+    assert(near(pair.margin_left.value, 2.0));
+    destroy(&two);
+
+    let four: Styled = build("<p id=a>t</p>", "p { margin: 1px 2px 3px 4px }");
+    let sides: ComputedStyle = style_of(&four, "a");
+    assert(near(sides.margin_top.value, 1.0));
+    assert(near(sides.margin_right.value, 2.0));
+    assert(near(sides.margin_bottom.value, 3.0));
+    assert(near(sides.margin_left.value, 4.0));
+    destroy(&four);
+}
+
+test "border shorthand in any order" {
+    let s: Styled = build("<p id=a>t</p>", "p { border: solid #00f 2px }");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(near(style.border_top_width, 2.0));
+    assert(style.border_top_style == computed.border_solid());
+    assert(style.border_left_color.b == 255 as u8);
+    destroy(&s);
+}
+
+test "longhand after shorthand wins" {
+    let s: Styled = build("<p id=a>t</p>",
+    "p { margin: 5px; margin-left: 9px }");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(near(style.margin_top.value, 5.0));
+    assert(near(style.margin_left.value, 9.0));
+    destroy(&s);
+}
+
+test "an invalid declaration leaves the property alone" {
+    let s: Styled = build("<p id=a>t</p>",
+    "p { color: red; color: notacolor }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "unitless non-zero lengths are invalid" {
+    let s: Styled = build("<p id=a>t</p>", "p { margin-top: 5 }");
+    assert(near(style_of(&s, "a").margin_top.value, 16.0));
+    destroy(&s);
+}
+
+test "line-height accepts a unitless multiplier" {
+    let s: Styled = build("<p id=a>t</p>",
+    "p { font-size: 10px; line-height: 1.5 }");
+    assert(near(style_of(&s, "a").line_height, 15.0));
+    destroy(&s);
+}
+
+test "ua heading styles apply" {
+    let s: Styled = build("<h1 id=a>t</h1>", "");
+    let style: ComputedStyle = style_of(&s, "a");
+    assert(near(style.font_size, 32.0));
+    assert(style.font_weight == 700 as u32);
+    assert(style.display == computed.display_block());
+    destroy(&s);
+}
+
+test "rules inside a media block still apply" {
+    let s: Styled = build("<p id=a>t</p>", "@media screen { p { color: red } }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    destroy(&s);
+}
+
+test "descendant selectors are matched during the cascade" {
+    let s: Styled = build("<div class=box><p id=a>t</p></div><p id=b>u</p>",
+    ".box p { color: red }");
+    assert(style_of(&s, "a").color.r == 255 as u8);
+    assert(style_of(&s, "b").color.r == 0 as u8);
+    destroy(&s);
+}

@@ -1,0 +1,348 @@
+// Selector matching against a real DOM (Selectors Level 4 §4, §14).
+//
+// Each test parses a document and a stylesheet, then asks which elements the
+// rule's selector matches, identified by their id attribute.
+
+import std.vec;
+import std.string;
+import engine.html.preprocess;
+import engine.html.treebuilder;
+import engine.html.tokens;
+import engine.dom.node;
+import engine.css.preprocess as css_preprocess;
+import engine.css.tokenizer as css_tokenizer;
+import engine.css.tokens as css_tokens;
+import engine.css.parser as css_parser;
+import engine.css.stylesheet;
+import engine.css.matching;
+
+resource struct Fixture {
+    html_normalized: Vec<u8>,
+    html_sink: HtmlTokenSink,
+    doc: DomDocument,
+    css_normalized: Vec<u8>,
+    css_sink: CssTokenSink,
+    sheet: CssStylesheet,
+}
+
+fn build(html: *u8, css: *u8) -> Fixture {
+    let html_sink: HtmlTokenSink = tokens.new_sink();
+    let html_normalized: Vec<u8> =
+    preprocess.normalize(html as *const u8, str_len(html), &html_sink);
+    let doc: DomDocument = node.new_document();
+    treebuilder.parse(html_normalized.data as *const u8,
+    html_normalized.length, &doc, &html_sink);
+
+    let css_normalized: Vec<u8> =
+    css_preprocess.normalize(css as *const u8, str_len(css));
+    let css_sink: CssTokenSink = css_tokens.new_sink();
+    let t: CssTokenizer = css_tokenizer.new(
+    css_normalized.data as *const u8, css_normalized.length);
+    css_tokenizer.run(&t, &css_sink);
+    let sheet: CssStylesheet = stylesheet.new_stylesheet();
+    css_parser.parse_stylesheet(&sheet, &css_sink);
+
+    return Fixture {
+        html_normalized: move html_normalized,
+        html_sink: move html_sink,
+        doc: move doc,
+        css_normalized: move css_normalized,
+        css_sink: move css_sink,
+        sheet: move sheet,
+    };
+}
+
+fn destroy(f: *Fixture) -> void {
+    stylesheet.destroy(&(*f).sheet);
+    css_tokens.destroy(&(*f).css_sink);
+    vec.destroy(&(*f).css_normalized);
+    node.destroy(&(*f).doc);
+    tokens.destroy(&(*f).html_sink);
+    vec.destroy(&(*f).html_normalized);
+}
+
+fn view_of(text: *u8) -> []const u8 {
+    return slice(text as *const u8, str_len(text));
+}
+
+// Find an element by its id attribute.
+fn by_id(f: *Fixture, id: *u8) -> u64 {
+    let wanted: []const u8 = view_of(id);
+    for index: u64 in 0..node.node_count(&(*f).doc) {
+        let candidate: DomNode = node.get(&(*f).doc, index);
+        if candidate.kind == node.kind_element() {
+            let lookup: DomAttrValue =
+            node.find_attr(&(*f).doc, index, view_of("id"));
+            if lookup.found {
+                let value: []const u8 =
+                node.bytes(&(*f).doc, lookup.value_off, lookup.value_len);
+                if len(value) == len(wanted) {
+                    let same: bool = true;
+                    for step: u64 in 0..len(value) {
+                        if value[step] != wanted[step] {
+                            same = false;
+                        }
+                    }
+                    if same {
+                        return index;
+                    }
+                }
+            }
+        }
+    }
+    return node.none();
+}
+
+// Does the first rule's first selector match the element with this id?
+fn hits(f: *Fixture, id: *u8) -> bool {
+    let element: u64 = by_id(f, id);
+    if element == node.none() {
+        return false;
+    }
+    let rule: CssRule = stylesheet.get_rule(&(*f).sheet,
+    stylesheet.top_level_rule(&(*f).sheet, 0));
+    for step: u64 in 0..rule.selector_count {
+        let selector: CssSelector =
+        stylesheet.get_selector(&(*f).sheet, rule.selector_first + step);
+        if matching.matches(&(*f).doc, element, &(*f).sheet, selector) {
+            return true;
+        }
+    }
+    return false;
+}
+
+test "type selector" {
+    let f: Fixture = build("<p id=a>x</p><div id=b>y</div>", "p { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "type selector is case-insensitive" {
+    let f: Fixture = build("<p id=a>x</p>", "P { color: red }");
+    assert(hits(&f, "a"));
+    destroy(&f);
+}
+
+test "universal selector matches every element" {
+    let f: Fixture = build("<p id=a>x</p>", "* { color: red }");
+    assert(hits(&f, "a"));
+    destroy(&f);
+}
+
+test "class selector picks one class out of several" {
+    let f: Fixture = build(
+    "<p id=a class='one two'>x</p><p id=b class=three>y</p>",
+    ".two { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "id selector" {
+    let f: Fixture = build("<p id=a>x</p><p id=b>y</p>", "#a { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "compound selector needs every part to match" {
+    let f: Fixture = build(
+    "<p id=a class=x>1</p><p id=b>2</p><div id=c class=x>3</div>",
+    "p.x { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    assert(!hits(&f, "c"));
+    destroy(&f);
+}
+
+test "descendant combinator reaches any ancestor" {
+    let f: Fixture = build(
+    "<div class=outer><section><p id=a>x</p></section></div><p id=b>y</p>",
+    ".outer p { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "descendant combinator backtracks past a nearer candidate" {
+    // The nearest <div> ancestor of #a has no .outer above it, but a
+    // further-out one does; a greedy walk would miss this.
+    let f: Fixture = build(
+    "<div class=outer><div><div><p id=a>x</p></div></div></div>",
+    ".outer div p { color: red }");
+    assert(hits(&f, "a"));
+    destroy(&f);
+}
+
+test "child combinator only matches a direct parent" {
+    let f: Fixture = build(
+    "<div class=outer><p id=a>x</p><section><p id=b>y</p></section></div>",
+    ".outer > p { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "next-sibling combinator" {
+    let f: Fixture = build(
+    "<h1>t</h1><p id=a>x</p><p id=b>y</p>",
+    "h1 + p { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "subsequent-sibling combinator reaches further" {
+    let f: Fixture = build(
+    "<h1>t</h1><p id=a>x</p><p id=b>y</p>",
+    "h1 ~ p { color: red }");
+    assert(hits(&f, "a"));
+    assert(hits(&f, "b"));
+    destroy(&f);
+}
+
+test "attribute presence" {
+    let f: Fixture = build(
+    "<input id=a disabled><input id=b>",
+    "[disabled] { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "attribute equality" {
+    let f: Fixture = build(
+    "<input id=a type=text><input id=b type=radio>",
+    "[type=text] { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "attribute case-insensitivity flag" {
+    let f: Fixture = build(
+    "<input id=a type=TEXT>",
+    "[type=text i] { color: red }");
+    assert(hits(&f, "a"));
+    destroy(&f);
+}
+
+test "attribute prefix, suffix and substring matchers" {
+    let prefix: Fixture = build(
+    "<a id=a href='https://x'>1</a><a id=b href='http://y'>2</a>",
+    "[href^=https] { color: red }");
+    assert(hits(&prefix, "a"));
+    assert(!hits(&prefix, "b"));
+    destroy(&prefix);
+
+    let suffix: Fixture = build(
+    "<a id=a href='x.png'>1</a><a id=b href='x.gif'>2</a>",
+    "[href$='.png'] { color: red }");
+    assert(hits(&suffix, "a"));
+    assert(!hits(&suffix, "b"));
+    destroy(&suffix);
+
+    let substring: Fixture = build(
+    "<a id=a href='/docs/x'>1</a><a id=b href='/img/y'>2</a>",
+    "[href*=docs] { color: red }");
+    assert(hits(&substring, "a"));
+    assert(!hits(&substring, "b"));
+    destroy(&substring);
+}
+
+test "attribute word matcher" {
+    let f: Fixture = build(
+    "<p id=a class='one two'>x</p><p id=b class='onetwo'>y</p>",
+    "[class~=two] { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "attribute dash matcher" {
+    let f: Fixture = build(
+    "<p id=a lang='en-GB'>x</p><p id=b lang='fr'>y</p><p id=c lang='en'>z</p>",
+    "[lang|=en] { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    assert(hits(&f, "c"));
+    destroy(&f);
+}
+
+test "first-child and last-child" {
+    let first: Fixture = build(
+    "<div><p id=a>1</p><p id=b>2</p></div>",
+    "p:first-child { color: red }");
+    assert(hits(&first, "a"));
+    assert(!hits(&first, "b"));
+    destroy(&first);
+
+    let last: Fixture = build(
+    "<div><p id=a>1</p><p id=b>2</p></div>",
+    "p:last-child { color: red }");
+    assert(!hits(&last, "a"));
+    assert(hits(&last, "b"));
+    destroy(&last);
+}
+
+test "only-child" {
+    let f: Fixture = build(
+    "<div><p id=a>1</p></div><div><p id=b>1</p><p id=c>2</p></div>",
+    "p:only-child { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "first-of-type ignores other element types" {
+    let f: Fixture = build(
+    "<div><span>s</span><p id=a>1</p><p id=b>2</p></div>",
+    "p:first-of-type { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    destroy(&f);
+}
+
+test "empty" {
+    let f: Fixture = build(
+    "<p id=a></p><p id=b>x</p><p id=c><span></span></p>",
+    "p:empty { color: red }");
+    assert(hits(&f, "a"));
+    assert(!hits(&f, "b"));
+    assert(!hits(&f, "c"));
+    destroy(&f);
+}
+
+test "root matches the html element only" {
+    let f: Fixture = build("<p id=a>x</p>", ":root { color: red }");
+    let html: u64 = node.get(&f.doc, 0).first_child;
+    let selector: CssSelector = stylesheet.get_selector(&f.sheet,
+    stylesheet.get_rule(&f.sheet,
+    stylesheet.top_level_rule(&f.sheet, 0)).selector_first);
+    assert(matching.matches(&f.doc, html, &f.sheet, selector));
+    assert(!hits(&f, "a"));
+    destroy(&f);
+}
+
+test "an unsupported pseudo-class never matches" {
+    let f: Fixture = build("<a id=a href=x>1</a>", "a:hover { color: red }");
+    assert(!hits(&f, "a"));
+    destroy(&f);
+}
+
+test "a pseudo-element selector does not match the element itself" {
+    let f: Fixture = build("<p id=a>x</p>", "p::before { color: red }");
+    assert(!hits(&f, "a"));
+    destroy(&f);
+}
+
+test "selector list matches if any selector matches" {
+    let f: Fixture = build(
+    "<h1 id=a>1</h1><h2 id=b>2</h2><h3 id=c>3</h3>",
+    "h1, h2 { color: red }");
+    assert(hits(&f, "a"));
+    assert(hits(&f, "b"));
+    assert(!hits(&f, "c"));
+    destroy(&f);
+}

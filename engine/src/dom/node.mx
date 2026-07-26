@@ -228,9 +228,20 @@ pub fn add_attr(
     set(doc, element, node);
 }
 
-// Does `element` already carry an attribute named `name`? Used by the tree
-// builder when merging attributes onto an existing <html> or <body>.
-pub fn has_attr(doc: *DomDocument, element: u64, name: []const u8) -> bool {
+// The result of looking an attribute up by name.
+struct DomAttrValue {
+    found: bool,
+    value_off: u64,
+    value_len: u64,
+}
+
+// Find `element`'s attribute named `name`. Attribute names arrive from the
+// tokenizer already ASCII-lowercased, so this compares them literally.
+pub fn find_attr(
+    doc: *DomDocument,
+    element: u64,
+    name: []const u8
+) -> DomAttrValue {
     let node: DomNode = get(doc, element);
     for index: u64 in 0..node.attr_count {
         let attr: DomAttr = get_attr(doc, node.attr_first + index);
@@ -243,11 +254,65 @@ pub fn has_attr(doc: *DomDocument, element: u64, name: []const u8) -> bool {
                 }
             }
             if same {
-                return true;
+                return DomAttrValue {
+                    found: true,
+                    value_off: attr.value_off,
+                    value_len: attr.value_len,
+                };
             }
         }
     }
-    return false;
+    return DomAttrValue { found: false, value_off: 0, value_len: 0 };
+}
+
+// Does `element` already carry an attribute named `name`? Used by the tree
+// builder when merging attributes onto an existing <html> or <body>.
+pub fn has_attr(doc: *DomDocument, element: u64, name: []const u8) -> bool {
+    return find_attr(doc, element, name).found;
+}
+
+// The element's previous sibling that is itself an element, or none().
+pub fn previous_element_sibling(doc: *DomDocument, element: u64) -> u64 {
+    let current: u64 = get(doc, element).prev_sibling;
+    while current != none() {
+        let candidate: DomNode = get(doc, current);
+        if candidate.kind == kind_element() {
+            return current;
+        }
+        current = candidate.prev_sibling;
+    }
+    return none();
+}
+
+// How many element children `parent` has, and which index `element` sits at.
+// Used by the structural pseudo-classes.
+struct DomChildPosition {
+    index: u64,
+    total: u64,
+}
+
+pub fn element_child_position(
+    doc: *DomDocument,
+    element: u64
+) -> DomChildPosition {
+    let parent: u64 = get(doc, element).parent;
+    if parent == none() {
+        return DomChildPosition { index: 0, total: 1 };
+    }
+    let position: u64 = 0;
+    let total: u64 = 0;
+    let child: u64 = get(doc, parent).first_child;
+    while child != none() {
+        let candidate: DomNode = get(doc, child);
+        if candidate.kind == kind_element() {
+            if child == element {
+                position = total;
+            }
+            total = total + 1;
+        }
+        child = candidate.next_sibling;
+    }
+    return DomChildPosition { index: position, total: total };
 }
 
 // --- Tree mutation ----------------------------------------------------------

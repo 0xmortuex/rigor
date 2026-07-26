@@ -1,0 +1,590 @@
+// The cascade — CSS Cascading and Inheritance §6, and value processing §4.
+//
+// For each element, in tree order:
+//   1. Start from the parent's inherited values (§7), or the initial values at
+//      the root.
+//   2. Collect every declaration whose selector matches, from every sheet.
+//   3. Sort those declarations by cascade order and apply them in sequence,
+//      so the winner is simply the last one applied.
+//   4. Recurse into children, which now see this element's computed values.
+//
+// Cascade order here is: origin and importance first (§6.2 — UA normal, then
+// author normal, then author important, then UA important), then specificity,
+// then document order. Sorting is an insertion sort over the matched
+// declarations, which is the right choice because the matched set per element
+// is small (usually under ten) and insertion sort is stable, so document order
+// falls out for free rather than needing a tiebreak key.
+//
+// Not implemented: `inherit`/`initial`/`unset`/`revert` keywords, custom
+// properties, `@media` evaluation (rules inside a media block are applied
+// unconditionally, as if the query matched), and shorthand expansion beyond
+// the ones listed in apply_declaration.
+module engine.style.cascade;
+
+import std.vec;
+import engine.css.tokens as css_tokens;
+import engine.css.stylesheet;
+import engine.css.matching;
+import engine.dom.node;
+import engine.style.computed;
+import engine.style.values;
+
+// Origins, ordered so a larger number wins (§6.2).
+pub fn origin_ua() -> u8 { return 0 as u8; }
+pub fn origin_author() -> u8 { return 1 as u8; }
+
+// One declaration that matched an element, with everything needed to order it.
+struct MatchedDeclaration {
+    sheet: u64,
+    declaration: u64,
+    specificity: u32,
+    order: u64,
+    // Sort key combining origin and importance, larger winning.
+    weight: u8,
+}
+
+// A stylesheet paired with the token sink holding its declaration values.
+struct StyleSource {
+    sheet: *CssStylesheet,
+    sink: *CssTokenSink,
+    origin: u8,
+}
+
+fn weight_of(origin: u8, important: bool) -> u8 {
+    // UA normal < author normal < author important < UA important.
+    if origin == origin_ua() {
+        if important {
+            return 3 as u8;
+        }
+        return 0 as u8;
+    }
+    if important {
+        return 2 as u8;
+    }
+    return 1 as u8;
+}
+
+// Collect the declarations of every rule in `source` matching `element`.
+// `order` counts declarations across all sources so document order survives.
+fn collect_from_rule(
+    doc: *DomDocument,
+    element: u64,
+    source: StyleSource,
+    source_index: u64,
+    rule_index: u64,
+    matched: *Vec<MatchedDeclaration>,
+    order: *u64
+) -> void {
+    let rule: CssRule = stylesheet.get_rule(source.sheet, rule_index);
+    if rule.kind == stylesheet.rule_at() {
+        // Rules nested in an at-rule are applied as though the condition
+        // matched; media query evaluation is not implemented.
+        for child: u64 in 0..rule.child_count {
+            collect_from_rule(doc, element, source, source_index,
+                rule.child_first + child, matched, order);
+        }
+        return;
+    }
+    let best: u32 = 0 as u32;
+    let hit: bool = false;
+    for step: u64 in 0..rule.selector_count {
+        let selector: CssSelector =
+            stylesheet.get_selector(source.sheet, rule.selector_first + step);
+        if matching.matches(doc, element, source.sheet, selector) {
+            hit = true;
+            if selector.specificity > best {
+                best = selector.specificity;
+            }
+        }
+    }
+    if !hit {
+        return;
+    }
+    for step: u64 in 0..rule.decl_count {
+        let declaration: CssDeclaration =
+            stylesheet.get_declaration(source.sheet, rule.decl_first + step);
+        vec.push(matched, MatchedDeclaration {
+            sheet: source_index,
+            declaration: rule.decl_first + step,
+            specificity: best,
+            order: (*order),
+            weight: weight_of(source.origin, declaration.important),
+        });
+        (*order) = (*order) + 1;
+    }
+}
+
+// Does `left` cascade before `right`? Equal keys keep document order.
+fn cascades_before(left: MatchedDeclaration, right: MatchedDeclaration) -> bool {
+    if left.weight != right.weight {
+        return left.weight < right.weight;
+    }
+    if left.specificity != right.specificity {
+        return left.specificity < right.specificity;
+    }
+    return left.order < right.order;
+}
+
+fn sort_matched(matched: *Vec<MatchedDeclaration>) -> void {
+    for index: u64 in 1..(*matched).length {
+        let current: MatchedDeclaration = (*matched).data[index];
+        let position: u64 = index;
+        while position > 0
+            && cascades_before(current, (*matched).data[position - 1]) {
+            (*matched).data[position] = (*matched).data[position - 1];
+            position = position - 1;
+        }
+        (*matched).data[position] = current;
+    }
+}
+
+fn name_is(sheet: *CssStylesheet, declaration: CssDeclaration, text: *u8) -> bool {
+    return values.equals_ci(
+        stylesheet.bytes(sheet, declaration.name_off, declaration.name_len), text);
+}
+
+// Apply one declaration to `style`. Invalid values leave the property alone,
+// which is what makes an unparseable declaration simply not apply.
+fn apply_declaration(
+    source: StyleSource,
+    declaration: CssDeclaration,
+    style: *ComputedStyle,
+    parent_font_size: f64,
+    root_font_size: f64
+) -> void {
+    let s: *CssTokenSink = source.sink;
+    let sheet: *CssStylesheet = source.sheet;
+    let first: u64 = declaration.value_first;
+    let limit: u64 = declaration.value_first + declaration.value_count;
+    let font_size: f64 = (*style).font_size;
+
+    if name_is(sheet, declaration, "display") {
+        let result: StyleKeywordResult = values.parse_display(s, first);
+        if result.ok { (*style).display = result.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "color") {
+        let result: StyleColorResult = values.parse_color(s, first, limit);
+        if result.ok { (*style).color = result.color; }
+        return;
+    }
+    if name_is(sheet, declaration, "background-color") {
+        let result: StyleColorResult = values.parse_color(s, first, limit);
+        if result.ok { (*style).background_color = result.color; }
+        return;
+    }
+    if name_is(sheet, declaration, "background") {
+        // Only the colour component of the shorthand is understood; the rest
+        // (images, position, repeat) is ignored rather than guessed at.
+        let result: StyleColorResult = values.parse_color(s, first, limit);
+        if result.ok { (*style).background_color = result.color; }
+        return;
+    }
+    if name_is(sheet, declaration, "font-size") {
+        let result: StyleNumberResult =
+            values.parse_font_size(s, first, parent_font_size, root_font_size);
+        if result.ok {
+            (*style).font_size = result.value;
+            // line-height tracks font-size unless it was set explicitly, and
+            // a later line-height declaration overwrites this.
+            (*style).line_height = result.value * 1.2;
+        }
+        return;
+    }
+    if name_is(sheet, declaration, "font-weight") {
+        let result: StyleNumberResult = values.parse_font_weight(s, first);
+        if result.ok { (*style).font_weight = result.value as u32; }
+        return;
+    }
+    if name_is(sheet, declaration, "font-style") {
+        let result: StyleKeywordResult = values.parse_font_style(s, first);
+        if result.ok { (*style).font_style = result.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "line-height") {
+        let result: StyleNumberResult =
+            values.parse_line_height(s, first, font_size, root_font_size);
+        if result.ok { (*style).line_height = result.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "text-align") {
+        let result: StyleKeywordResult = values.parse_text_align(s, first);
+        if result.ok { (*style).text_align = result.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "white-space") {
+        let result: StyleKeywordResult = values.parse_white_space(s, first);
+        if result.ok { (*style).white_space = result.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "width") {
+        let result: StyleLengthResult =
+            values.parse_length(s, first, font_size, root_font_size, true);
+        if result.ok { (*style).width = result.length; }
+        return;
+    }
+    if name_is(sheet, declaration, "height") {
+        let result: StyleLengthResult =
+            values.parse_length(s, first, font_size, root_font_size, true);
+        if result.ok { (*style).height = result.length; }
+        return;
+    }
+    if apply_box_edges(source, declaration, style, font_size, root_font_size) {
+        return;
+    }
+    apply_border(source, declaration, style, font_size, root_font_size);
+}
+
+// Read up to four length values from a declaration, which is the shape of the
+// margin and padding shorthands.
+struct EdgeValues {
+    count: u64,
+    top: StyleLength,
+    right: StyleLength,
+    bottom: StyleLength,
+    left: StyleLength,
+}
+
+fn read_edges(
+    s: *CssTokenSink,
+    first: u64,
+    limit: u64,
+    font_size: f64,
+    root_font_size: f64
+) -> EdgeValues {
+    let parsed: [StyleLength; 4] = [
+        computed.zero_length(), computed.zero_length(),
+        computed.zero_length(), computed.zero_length(),
+    ];
+    let count: u64 = 0;
+    let cursor: u64 = first;
+    while cursor < limit && count < 4 {
+        cursor = values.skip_ws(s, cursor, limit);
+        if cursor >= limit {
+            break;
+        }
+        let value: StyleLengthResult =
+            values.parse_length(s, cursor, font_size, root_font_size, true);
+        if !value.ok {
+            return EdgeValues {
+                count: 0,
+                top: computed.zero_length(), right: computed.zero_length(),
+                bottom: computed.zero_length(), left: computed.zero_length(),
+            };
+        }
+        parsed[count] = value.length;
+        count = count + 1;
+        cursor = cursor + 1;
+    }
+    if count == 0 {
+        return EdgeValues {
+            count: 0,
+            top: computed.zero_length(), right: computed.zero_length(),
+            bottom: computed.zero_length(), left: computed.zero_length(),
+        };
+    }
+    // The CSS one-to-four-value rule: 1 sets all, 2 sets vertical/horizontal,
+    // 3 sets top/horizontal/bottom, 4 sets each side clockwise from the top.
+    let top: StyleLength = parsed[0];
+    let right: StyleLength = parsed[0];
+    let bottom: StyleLength = parsed[0];
+    let left: StyleLength = parsed[0];
+    if count >= 2 {
+        right = parsed[1];
+        left = parsed[1];
+    }
+    if count >= 3 {
+        bottom = parsed[2];
+    }
+    if count >= 4 {
+        left = parsed[3];
+    }
+    return EdgeValues {
+        count: count, top: top, right: right, bottom: bottom, left: left,
+    };
+}
+
+fn apply_box_edges(
+    source: StyleSource,
+    declaration: CssDeclaration,
+    style: *ComputedStyle,
+    font_size: f64,
+    root_font_size: f64
+) -> bool {
+    let s: *CssTokenSink = source.sink;
+    let sheet: *CssStylesheet = source.sheet;
+    let first: u64 = declaration.value_first;
+    let limit: u64 = declaration.value_first + declaration.value_count;
+
+    if name_is(sheet, declaration, "margin") {
+        let edges: EdgeValues =
+            read_edges(s, first, limit, font_size, root_font_size);
+        if edges.count > 0 {
+            (*style).margin_top = edges.top;
+            (*style).margin_right = edges.right;
+            (*style).margin_bottom = edges.bottom;
+            (*style).margin_left = edges.left;
+        }
+        return true;
+    }
+    if name_is(sheet, declaration, "padding") {
+        let edges: EdgeValues =
+            read_edges(s, first, limit, font_size, root_font_size);
+        if edges.count > 0 {
+            (*style).padding_top = edges.top;
+            (*style).padding_right = edges.right;
+            (*style).padding_bottom = edges.bottom;
+            (*style).padding_left = edges.left;
+        }
+        return true;
+    }
+
+    let single: StyleLengthResult =
+        values.parse_length(s, first, font_size, root_font_size, true);
+    if name_is(sheet, declaration, "margin-top") {
+        if single.ok { (*style).margin_top = single.length; }
+        return true;
+    }
+    if name_is(sheet, declaration, "margin-right") {
+        if single.ok { (*style).margin_right = single.length; }
+        return true;
+    }
+    if name_is(sheet, declaration, "margin-bottom") {
+        if single.ok { (*style).margin_bottom = single.length; }
+        return true;
+    }
+    if name_is(sheet, declaration, "margin-left") {
+        if single.ok { (*style).margin_left = single.length; }
+        return true;
+    }
+    if name_is(sheet, declaration, "padding-top") {
+        if single.ok { (*style).padding_top = single.length; }
+        return true;
+    }
+    if name_is(sheet, declaration, "padding-right") {
+        if single.ok { (*style).padding_right = single.length; }
+        return true;
+    }
+    if name_is(sheet, declaration, "padding-bottom") {
+        if single.ok { (*style).padding_bottom = single.length; }
+        return true;
+    }
+    if name_is(sheet, declaration, "padding-left") {
+        if single.ok { (*style).padding_left = single.length; }
+        return true;
+    }
+    return false;
+}
+
+fn apply_border(
+    source: StyleSource,
+    declaration: CssDeclaration,
+    style: *ComputedStyle,
+    font_size: f64,
+    root_font_size: f64
+) -> void {
+    let s: *CssTokenSink = source.sink;
+    let sheet: *CssStylesheet = source.sheet;
+    let first: u64 = declaration.value_first;
+    let limit: u64 = declaration.value_first + declaration.value_count;
+
+    // The `border` shorthand in any order: width, style and colour.
+    if name_is(sheet, declaration, "border") {
+        let width: f64 = 3.0;
+        let border_style: u8 = computed.border_none();
+        let color: StyleColor = (*style).color;
+        let cursor: u64 = first;
+        while cursor < limit {
+            cursor = values.skip_ws(s, cursor, limit);
+            if cursor >= limit {
+                break;
+            }
+            let as_style: StyleKeywordResult = values.parse_border_style(s, cursor);
+            if as_style.ok {
+                border_style = as_style.value;
+            } else {
+                let as_width: StyleNumberResult =
+                    values.parse_border_width(s, cursor, font_size, root_font_size);
+                if as_width.ok {
+                    width = as_width.value;
+                } else {
+                    let as_color: StyleColorResult =
+                        values.parse_color(s, cursor, limit);
+                    if as_color.ok {
+                        color = as_color.color;
+                    }
+                }
+            }
+            cursor = cursor + 1;
+        }
+        (*style).border_top_width = width;
+        (*style).border_right_width = width;
+        (*style).border_bottom_width = width;
+        (*style).border_left_width = width;
+        (*style).border_top_style = border_style;
+        (*style).border_right_style = border_style;
+        (*style).border_bottom_style = border_style;
+        (*style).border_left_style = border_style;
+        (*style).border_top_color = color;
+        (*style).border_right_color = color;
+        (*style).border_bottom_color = color;
+        (*style).border_left_color = color;
+        return;
+    }
+
+    let width: StyleNumberResult =
+        values.parse_border_width(s, first, font_size, root_font_size);
+    if name_is(sheet, declaration, "border-top-width") {
+        if width.ok { (*style).border_top_width = width.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-right-width") {
+        if width.ok { (*style).border_right_width = width.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-bottom-width") {
+        if width.ok { (*style).border_bottom_width = width.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-left-width") {
+        if width.ok { (*style).border_left_width = width.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-width") {
+        if width.ok {
+            (*style).border_top_width = width.value;
+            (*style).border_right_width = width.value;
+            (*style).border_bottom_width = width.value;
+            (*style).border_left_width = width.value;
+        }
+        return;
+    }
+
+    let border_style: StyleKeywordResult = values.parse_border_style(s, first);
+    if name_is(sheet, declaration, "border-top-style") {
+        if border_style.ok { (*style).border_top_style = border_style.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-right-style") {
+        if border_style.ok { (*style).border_right_style = border_style.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-bottom-style") {
+        if border_style.ok { (*style).border_bottom_style = border_style.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-left-style") {
+        if border_style.ok { (*style).border_left_style = border_style.value; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-style") {
+        if border_style.ok {
+            (*style).border_top_style = border_style.value;
+            (*style).border_right_style = border_style.value;
+            (*style).border_bottom_style = border_style.value;
+            (*style).border_left_style = border_style.value;
+        }
+        return;
+    }
+
+    let color: StyleColorResult = values.parse_color(s, first, limit);
+    if name_is(sheet, declaration, "border-top-color") {
+        if color.ok { (*style).border_top_color = color.color; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-right-color") {
+        if color.ok { (*style).border_right_color = color.color; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-bottom-color") {
+        if color.ok { (*style).border_bottom_color = color.color; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-left-color") {
+        if color.ok { (*style).border_left_color = color.color; }
+        return;
+    }
+    if name_is(sheet, declaration, "border-color") {
+        if color.ok {
+            (*style).border_top_color = color.color;
+            (*style).border_right_color = color.color;
+            (*style).border_bottom_color = color.color;
+            (*style).border_left_color = color.color;
+        }
+    }
+}
+
+// Compute the style of one element and then of its descendants.
+fn style_element(
+    doc: *DomDocument,
+    element: u64,
+    ua: StyleSource,
+    author: StyleSource,
+    tree: *StyleTree,
+    parent_style: ComputedStyle,
+    root_font_size: f64
+) -> void {
+    let element_node: DomNode = node.get(doc, element);
+    if element_node.kind != node.kind_element() {
+        return;
+    }
+    let style: ComputedStyle = computed.inherit_from(parent_style);
+
+    let matched: Vec<MatchedDeclaration> = vec.new<MatchedDeclaration>();
+    let order: u64 = 0;
+    for index: u64 in 0..stylesheet.rule_count(ua.sheet) {
+        collect_from_rule(doc, element, ua, 0,
+            stylesheet.top_level_rule(ua.sheet, index), &matched, &order);
+    }
+    for index: u64 in 0..stylesheet.rule_count(author.sheet) {
+        collect_from_rule(doc, element, author, 1,
+            stylesheet.top_level_rule(author.sheet, index), &matched, &order);
+    }
+    sort_matched(&matched);
+
+    for index: u64 in 0..matched.length {
+        let entry: MatchedDeclaration = matched.data[index];
+        let source: StyleSource = ua;
+        if entry.sheet == 1 {
+            source = author;
+        }
+        apply_declaration(source,
+            stylesheet.get_declaration(source.sheet, entry.declaration),
+            &style, parent_style.font_size, root_font_size);
+    }
+    vec.destroy(&matched);
+
+    computed.set(tree, element, style);
+
+    let child: u64 = element_node.first_child;
+    while child != node.none() {
+        style_element(doc, child, ua, author, tree, style, root_font_size);
+        child = node.get(doc, child).next_sibling;
+    }
+}
+
+// Compute styles for the whole document. `ua` and `author` are the two
+// origins; both must outlive the returned tree's use, since declaration values
+// are read from their sinks.
+pub fn compute(
+    doc: *DomDocument,
+    ua_sheet: *CssStylesheet,
+    ua_sink: *CssTokenSink,
+    author_sheet: *CssStylesheet,
+    author_sink: *CssTokenSink,
+    tree: *StyleTree
+) -> void {
+    let ua: StyleSource = StyleSource {
+        sheet: ua_sheet, sink: ua_sink, origin: origin_ua(),
+    };
+    let author: StyleSource = StyleSource {
+        sheet: author_sheet, sink: author_sink, origin: origin_author(),
+    };
+    let root_style: ComputedStyle = computed.initial_style();
+    let child: u64 = node.get(doc, 0).first_child;
+    while child != node.none() {
+        style_element(doc, child, ua, author, tree, root_style,
+            root_style.font_size);
+        child = node.get(doc, child).next_sibling;
+    }
+}
