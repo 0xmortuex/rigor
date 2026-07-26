@@ -5,12 +5,12 @@
 // best-effort guessing: every malformed input takes exactly the recovery path
 // the spec defines, and every parse error is recorded under its spec name.
 //
-// Implemented: data, RCDATA, RAWTEXT, PLAINTEXT, tag/attribute states,
-// comments, the complete DOCTYPE family, bogus comment, and character
-// references (numeric fully; named via engine.html.entities).
-// Not yet implemented (tracked in docs/ROADMAP.md): the script-data states
-// (§13.2.5.15–31, wired up with tree construction, which owns the state
-// switch).
+// Implemented: data, RCDATA, RAWTEXT, PLAINTEXT, the script-data family,
+// tag/attribute states, comments, the complete DOCTYPE family, bogus comment,
+// CDATA sections, and character references (numeric fully; named via
+// engine.html.entities).
+// Every state in §13.2.5 is implemented, including the script-data family and
+// CDATA sections.
 //
 // The tokenizer is plain data over a normalized input buffer (the caller runs
 // engine.html.preprocess first); all output accumulates in an HtmlTokenSink.
@@ -28,6 +28,7 @@ import entities;
 const ST_DATA: u32 = 1;                    // §13.2.5.1
 const ST_RCDATA: u32 = 2;                  // §13.2.5.2
 const ST_RAWTEXT: u32 = 3;                 // §13.2.5.3
+const ST_SCRIPT_DATA: u32 = 4;             // §13.2.5.4
 const ST_PLAINTEXT: u32 = 5;               // §13.2.5.5
 const ST_TAG_OPEN: u32 = 6;                // §13.2.5.6
 const ST_END_TAG_OPEN: u32 = 7;            // §13.2.5.7
@@ -38,6 +39,23 @@ const ST_RCDATA_END_TAG_NAME: u32 = 11;    // §13.2.5.11
 const ST_RAWTEXT_LT: u32 = 12;             // §13.2.5.12
 const ST_RAWTEXT_END_TAG_OPEN: u32 = 13;   // §13.2.5.13
 const ST_RAWTEXT_END_TAG_NAME: u32 = 14;   // §13.2.5.14
+const ST_SCRIPT_LT: u32 = 15;              // §13.2.5.15
+const ST_SCRIPT_END_TAG_OPEN: u32 = 16;    // §13.2.5.16
+const ST_SCRIPT_END_TAG_NAME: u32 = 17;    // §13.2.5.17
+const ST_SCRIPT_ESCAPE_START: u32 = 18;    // §13.2.5.18
+const ST_SCRIPT_ESCAPE_START_DASH: u32 = 19;   // §13.2.5.19
+const ST_SCRIPT_ESCAPED: u32 = 20;         // §13.2.5.20
+const ST_SCRIPT_ESCAPED_DASH: u32 = 21;    // §13.2.5.21
+const ST_SCRIPT_ESCAPED_DASH_DASH: u32 = 22;   // §13.2.5.22
+const ST_SCRIPT_ESCAPED_LT: u32 = 23;      // §13.2.5.23
+const ST_SCRIPT_ESCAPED_END_TAG_OPEN: u32 = 24;    // §13.2.5.24
+const ST_SCRIPT_ESCAPED_END_TAG_NAME: u32 = 25;    // §13.2.5.25
+const ST_SCRIPT_DOUBLE_ESCAPE_START: u32 = 26;     // §13.2.5.26
+const ST_SCRIPT_DOUBLE_ESCAPED: u32 = 27;  // §13.2.5.27
+const ST_SCRIPT_DOUBLE_ESCAPED_DASH: u32 = 28;     // §13.2.5.28
+const ST_SCRIPT_DOUBLE_ESCAPED_DASH_DASH: u32 = 29;    // §13.2.5.29
+const ST_SCRIPT_DOUBLE_ESCAPED_LT: u32 = 30;       // §13.2.5.30
+const ST_SCRIPT_DOUBLE_ESCAPE_END: u32 = 31;       // §13.2.5.31
 const ST_BEFORE_ATTR_NAME: u32 = 32;       // §13.2.5.32
 const ST_ATTR_NAME: u32 = 33;              // §13.2.5.33
 const ST_AFTER_ATTR_NAME: u32 = 34;        // §13.2.5.34
@@ -177,6 +195,9 @@ pub fn new(input: *const u8, length: u64) -> HtmlTokenizer {
 pub fn set_rcdata(t: *HtmlTokenizer) -> void { (*t).state = ST_RCDATA; }
 pub fn set_rawtext(t: *HtmlTokenizer) -> void { (*t).state = ST_RAWTEXT; }
 pub fn set_plaintext(t: *HtmlTokenizer) -> void { (*t).state = ST_PLAINTEXT; }
+pub fn set_script_data(t: *HtmlTokenizer) -> void {
+    (*t).state = ST_SCRIPT_DATA;
+}
 pub fn set_data(t: *HtmlTokenizer) -> void { (*t).state = ST_DATA; }
 
 // Tree construction reports whether the adjusted current node is a foreign
@@ -623,6 +644,42 @@ fn step(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
     else if st == ST_RAWTEXT_LT { rawtext_lt_state(t, s); }
     else if st == ST_RAWTEXT_END_TAG_OPEN { rawtext_end_tag_open_state(t, s); }
     else if st == ST_RAWTEXT_END_TAG_NAME { rawtext_end_tag_name_state(t, s); }
+    else if st == ST_SCRIPT_DATA { script_data_state(t, s); }
+    else if st == ST_SCRIPT_LT { script_lt_state(t, s); }
+    else if st == ST_SCRIPT_END_TAG_OPEN { script_end_tag_open_state(t, s); }
+    else if st == ST_SCRIPT_END_TAG_NAME { script_end_tag_name_state(t, s); }
+    else if st == ST_SCRIPT_ESCAPE_START { script_escape_start_state(t, s); }
+    else if st == ST_SCRIPT_ESCAPE_START_DASH {
+        script_escape_start_dash_state(t, s);
+    }
+    else if st == ST_SCRIPT_ESCAPED { script_escaped_state(t, s); }
+    else if st == ST_SCRIPT_ESCAPED_DASH { script_escaped_dash_state(t, s); }
+    else if st == ST_SCRIPT_ESCAPED_DASH_DASH {
+        script_escaped_dash_dash_state(t, s);
+    }
+    else if st == ST_SCRIPT_ESCAPED_LT { script_escaped_lt_state(t, s); }
+    else if st == ST_SCRIPT_ESCAPED_END_TAG_OPEN {
+        script_escaped_end_tag_open_state(t, s);
+    }
+    else if st == ST_SCRIPT_ESCAPED_END_TAG_NAME {
+        script_escaped_end_tag_name_state(t, s);
+    }
+    else if st == ST_SCRIPT_DOUBLE_ESCAPE_START {
+        script_double_escape_start_state(t, s);
+    }
+    else if st == ST_SCRIPT_DOUBLE_ESCAPED { script_double_escaped_state(t, s); }
+    else if st == ST_SCRIPT_DOUBLE_ESCAPED_DASH {
+        script_double_escaped_dash_state(t, s);
+    }
+    else if st == ST_SCRIPT_DOUBLE_ESCAPED_DASH_DASH {
+        script_double_escaped_dash_dash_state(t, s);
+    }
+    else if st == ST_SCRIPT_DOUBLE_ESCAPED_LT {
+        script_double_escaped_lt_state(t, s);
+    }
+    else if st == ST_SCRIPT_DOUBLE_ESCAPE_END {
+        script_double_escape_end_state(t, s);
+    }
     else if st == ST_BEFORE_ATTR_NAME { before_attr_name_state(t, s); }
     else if st == ST_ATTR_NAME { attr_name_state(t, s); }
     else if st == ST_AFTER_ATTR_NAME { after_attr_name_state(t, s); }
@@ -921,6 +978,360 @@ fn rawtext_end_tag_open_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
 // §13.2.5.14
 fn rawtext_end_tag_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
     raw_end_tag_name_state(t, s, ST_RAWTEXT);
+}
+
+// --- Script data (§13.2.5.4, §13.2.5.15–31) ---------------------------------
+//
+// Script content is raw text with one complication: an HTML comment inside it
+// suspends the `</script>` check. That is what makes
+//
+//     <script>document.write("<!--<script>")</script>
+//
+// parse the way browsers parse it. The spec models this with three nested
+// levels — plain script data, "escaped" (inside `<!--`), and "double escaped"
+// (inside `<!--` and then `<script`) — and the states below are those levels
+// with their dash-counting sub-states.
+
+// §13.2.5.4
+fn script_data_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) { emit_eof(t, s); return; }
+    let c: u8 = take(t);
+    if c == '<' {
+        (*t).state = ST_SCRIPT_LT;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+    } else {
+        text_push(t, s, c);
+    }
+}
+
+// §13.2.5.15
+fn script_lt_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = take(t);
+        if c == '/' {
+            scratch_clear(s);
+            (*t).state = ST_SCRIPT_END_TAG_OPEN;
+            return;
+        }
+        if c == '!' {
+            text_push(t, s, '<');
+            text_push(t, s, '!');
+            (*t).state = ST_SCRIPT_ESCAPE_START;
+            return;
+        }
+        (*t).pos = (*t).pos - 1;
+    }
+    text_push(t, s, '<');
+    (*t).state = ST_SCRIPT_DATA;
+}
+
+// §13.2.5.16
+fn script_end_tag_open_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        if is_alpha((*t).input[(*t).pos]) {
+            (*t).state = ST_SCRIPT_END_TAG_NAME;
+            return;
+        }
+    }
+    text_push(t, s, '<');
+    text_push(t, s, '/');
+    (*t).state = ST_SCRIPT_DATA;
+}
+
+// §13.2.5.17
+fn script_end_tag_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    raw_end_tag_name_state(t, s, ST_SCRIPT_DATA);
+}
+
+// §13.2.5.18
+fn script_escape_start_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) && (*t).input[(*t).pos] == '-' {
+        (*t).pos = (*t).pos + 1;
+        text_push(t, s, '-');
+        (*t).state = ST_SCRIPT_ESCAPE_START_DASH;
+        return;
+    }
+    (*t).state = ST_SCRIPT_DATA;
+}
+
+// §13.2.5.19
+fn script_escape_start_dash_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) && (*t).input[(*t).pos] == '-' {
+        (*t).pos = (*t).pos + 1;
+        text_push(t, s, '-');
+        (*t).state = ST_SCRIPT_ESCAPED_DASH_DASH;
+        return;
+    }
+    (*t).state = ST_SCRIPT_DATA;
+}
+
+// §13.2.5.20
+fn script_escaped_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_script_html_comment_like_text());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        text_push(t, s, '-');
+        (*t).state = ST_SCRIPT_ESCAPED_DASH;
+    } else if c == '<' {
+        (*t).state = ST_SCRIPT_ESCAPED_LT;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+    } else {
+        text_push(t, s, c);
+    }
+}
+
+// §13.2.5.21
+fn script_escaped_dash_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_script_html_comment_like_text());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        text_push(t, s, '-');
+        (*t).state = ST_SCRIPT_ESCAPED_DASH_DASH;
+    } else if c == '<' {
+        (*t).state = ST_SCRIPT_ESCAPED_LT;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+        (*t).state = ST_SCRIPT_ESCAPED;
+    } else {
+        text_push(t, s, c);
+        (*t).state = ST_SCRIPT_ESCAPED;
+    }
+}
+
+// §13.2.5.22
+fn script_escaped_dash_dash_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_script_html_comment_like_text());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        text_push(t, s, '-');
+    } else if c == '<' {
+        (*t).state = ST_SCRIPT_ESCAPED_LT;
+    } else if c == '>' {
+        // The comment closed, so the `</script>` check resumes.
+        text_push(t, s, '>');
+        (*t).state = ST_SCRIPT_DATA;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+        (*t).state = ST_SCRIPT_ESCAPED;
+    } else {
+        text_push(t, s, c);
+        (*t).state = ST_SCRIPT_ESCAPED;
+    }
+}
+
+// §13.2.5.23
+fn script_escaped_lt_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        let c: u8 = (*t).input[(*t).pos];
+        if c == '/' {
+            (*t).pos = (*t).pos + 1;
+            scratch_clear(s);
+            (*t).state = ST_SCRIPT_ESCAPED_END_TAG_OPEN;
+            return;
+        }
+        if is_alpha(c) {
+            scratch_clear(s);
+            text_push(t, s, '<');
+            (*t).state = ST_SCRIPT_DOUBLE_ESCAPE_START;
+            return;
+        }
+    }
+    text_push(t, s, '<');
+    (*t).state = ST_SCRIPT_ESCAPED;
+}
+
+// §13.2.5.24
+fn script_escaped_end_tag_open_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) {
+        if is_alpha((*t).input[(*t).pos]) {
+            (*t).state = ST_SCRIPT_ESCAPED_END_TAG_NAME;
+            return;
+        }
+    }
+    text_push(t, s, '<');
+    text_push(t, s, '/');
+    (*t).state = ST_SCRIPT_ESCAPED;
+}
+
+// §13.2.5.25
+fn script_escaped_end_tag_name_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    raw_end_tag_name_state(t, s, ST_SCRIPT_ESCAPED);
+}
+
+// §13.2.5.26. The scratch buffer accumulates the word after `<`; if it spells
+// "script", the content is doubly escaped and `</script>` stops closing.
+fn script_double_escape_start_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        (*t).state = ST_SCRIPT_ESCAPED;
+        return;
+    }
+    let c: u8 = (*t).input[(*t).pos];
+    if is_ws(c) || c == '/' || c == '>' {
+        (*t).pos = (*t).pos + 1;
+        if scratch_is(s, "script") {
+            (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+        } else {
+            (*t).state = ST_SCRIPT_ESCAPED;
+        }
+        text_push(t, s, c);
+        return;
+    }
+    if is_alpha(c) {
+        (*t).pos = (*t).pos + 1;
+        scratch_push(s, to_lower(c));
+        text_push(t, s, c);
+        return;
+    }
+    (*t).state = ST_SCRIPT_ESCAPED;
+}
+
+// §13.2.5.27
+fn script_double_escaped_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_script_html_comment_like_text());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        text_push(t, s, '-');
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED_DASH;
+    } else if c == '<' {
+        text_push(t, s, '<');
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED_LT;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+    } else {
+        text_push(t, s, c);
+    }
+}
+
+// §13.2.5.28
+fn script_double_escaped_dash_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_script_html_comment_like_text());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        text_push(t, s, '-');
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED_DASH_DASH;
+    } else if c == '<' {
+        text_push(t, s, '<');
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED_LT;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+    } else {
+        text_push(t, s, c);
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+    }
+}
+
+// §13.2.5.29
+fn script_double_escaped_dash_dash_state(
+    t: *HtmlTokenizer,
+    s: *HtmlTokenSink
+) -> void {
+    if at_eof(t) {
+        error(t, s, tokens.err_eof_in_script_html_comment_like_text());
+        emit_eof(t, s);
+        return;
+    }
+    let c: u8 = take(t);
+    if c == '-' {
+        text_push(t, s, '-');
+    } else if c == '<' {
+        text_push(t, s, '<');
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED_LT;
+    } else if c == '>' {
+        text_push(t, s, '>');
+        (*t).state = ST_SCRIPT_DATA;
+    } else if c == 0 as u8 {
+        error(t, s, tokens.err_unexpected_null_character());
+        text_push_repl(t, s);
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+    } else {
+        text_push(t, s, c);
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+    }
+}
+
+// §13.2.5.30
+fn script_double_escaped_lt_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if !at_eof(t) && (*t).input[(*t).pos] == '/' {
+        (*t).pos = (*t).pos + 1;
+        scratch_clear(s);
+        text_push(t, s, '/');
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPE_END;
+        return;
+    }
+    (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+}
+
+// §13.2.5.31 — the mirror of the double escape start: a closing `</script`
+// drops back one level rather than ending the element.
+fn script_double_escape_end_state(t: *HtmlTokenizer, s: *HtmlTokenSink) -> void {
+    if at_eof(t) {
+        (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+        return;
+    }
+    let c: u8 = (*t).input[(*t).pos];
+    if is_ws(c) || c == '/' || c == '>' {
+        (*t).pos = (*t).pos + 1;
+        if scratch_is(s, "script") {
+            (*t).state = ST_SCRIPT_ESCAPED;
+        } else {
+            (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+        }
+        text_push(t, s, c);
+        return;
+    }
+    if is_alpha(c) {
+        (*t).pos = (*t).pos + 1;
+        scratch_push(s, to_lower(c));
+        text_push(t, s, c);
+        return;
+    }
+    (*t).state = ST_SCRIPT_DOUBLE_ESCAPED;
+}
+
+// Does the scratch buffer hold exactly this (lowercase) word?
+fn scratch_is(s: *HtmlTokenSink, text: *u8) -> bool {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if (*s).scratch.length != length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        if (*s).scratch.data[index] != text[index] {
+            return false;
+        }
+    }
+    return true;
 }
 
 // "Appropriate end tag token": its name matches the most recent start tag.

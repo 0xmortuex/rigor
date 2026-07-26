@@ -344,6 +344,89 @@ test "rcdata flushes non-matching end tags as text" {
     assert(data_is(&sink, 2, "title"));
 }
 
+// Script data is raw text until `</script>`, except that an HTML comment
+// inside it suspends that check — and a `<script` inside the comment suspends
+// it again. These pin down all three levels.
+fn tokenize_script(source: *u8, sink: *HtmlTokenSink) -> Vec<u8> {
+    let normalized: Vec<u8> =
+    preprocess.normalize(source as *const u8, str_len(source), sink);
+    let t: HtmlTokenizer =
+    tokenizer.new(normalized.data as *const u8, normalized.length);
+    // Consume the <script> start tag, then switch as tree construction does.
+    tokenizer.pump(&t, sink);
+    tokenizer.set_script_data(&t);
+    tokenizer.run(&t, sink);
+    return move normalized;
+}
+
+test "script data ends at its end tag" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let held: Vec<u8> = tokenize_script("<script>var x = 1;</script>", &sink);
+    assert(nth_kind(&sink, 0) == tokens.kind_start_tag());
+    assert(data_is(&sink, 1, "var x = 1;"));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    assert(data_is(&sink, 2, "script"));
+    vec.destroy(&held);
+}
+
+test "a less-than sign in script data is just text" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let held: Vec<u8> = tokenize_script("<script>if (a<b) {}</script>", &sink);
+    assert(data_is(&sink, 1, "if (a<b) {}"));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    vec.destroy(&held);
+}
+
+test "an end tag for another element is text" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let held: Vec<u8> = tokenize_script("<script>a</div>b</script>", &sink);
+    assert(data_is(&sink, 1, "a</div>b"));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    vec.destroy(&held);
+}
+
+test "an end tag still closes the element inside a script comment" {
+    // A single level of escaping — plain <!-- — does not suppress the end tag
+    // check, so this </script> really does close the element and the trailing
+    // "-->" becomes ordinary text.
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let held: Vec<u8> =
+    tokenize_script("<script><!-- </script> --></script>", &sink);
+    assert(data_is(&sink, 1, "<!-- "));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    assert(data_is(&sink, 2, "script"));
+    vec.destroy(&held);
+}
+
+test "double escaping does suppress the end tag" {
+    // After <!--<script the content is doubly escaped, and </script> only
+    // drops back one level; the second one closes the element. This is what
+    // makes document.write(\"<script>...\") inside a comment parse correctly.
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let held: Vec<u8> =
+    tokenize_script("<script><!--<script>a</script>b--></script>", &sink);
+    assert(data_is(&sink, 1, "<!--<script>a</script>b-->"));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    assert(data_is(&sink, 2, "script"));
+    vec.destroy(&held);
+}
+
+test "a comment closed with dash-dash-gt resumes the end tag check" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let held: Vec<u8> = tokenize_script("<script><!--a--></script>", &sink);
+    assert(data_is(&sink, 1, "<!--a-->"));
+    assert(nth_kind(&sink, 2) == tokens.kind_end_tag());
+    vec.destroy(&held);
+}
+
+test "eof inside a script comment is a parse error" {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let held: Vec<u8> = tokenize_script("<script><!--a", &sink);
+    assert(has_error(&sink,
+    tokens.err_eof_in_script_html_comment_like_text()));
+    vec.destroy(&held);
+}
+
 test "rawtext ignores markup until its end tag" {
     let sink: HtmlTokenSink = tokens.new_sink();
     let source: *u8 = "<style>p<b{}</style>";

@@ -11,26 +11,25 @@ HTML + CSS in, pixels in a window out. No JavaScript.
 
 - [x] Repo + package layout (engine as an embeddable Mort package)
 - [x] Input preprocessing (§13.2.3.5: BOM, newlines)
-- [x] HTML tokenizer (§13.2.5) — tags, attributes, comments, doctypes,
-      RCDATA/RAWTEXT/PLAINTEXT, numeric + named character references,
-      spec-named parse errors
+- [x] HTML tokenizer — **every state in §13.2.5**: tags, attributes, comments,
+      doctypes, RCDATA/RAWTEXT/PLAINTEXT, script data, CDATA, numeric + named
+      character references, spec-named parse errors
 - [x] Full named-entity table generated from entities.json (2231 names,
       `tools/gen_entities.py` → `engine/src/html/entities.mx`)
-- [x] html5lib-tests tokenizer conformance harness — **6943/6943 tokens and
-      1789/1789 parse-error codes**; 89 cases skipped pending script-data
-      states
+- [x] html5lib-tests tokenizer conformance harness — **7032/7032 tokens and
+      1799/1799 parse-error codes, nothing skipped**
 - [x] Tree construction → DOM (§13.2.6): document-structure modes, "in body",
       text modes, frameset modes, scopes, implied end tags, active formatting
       elements, adoption agency
 - [x] Table insertion modes (in table / in caption / in column group / in
       table body / in row / in cell) with foster parenting
 - [x] Foreign content: SVG and MathML namespaces, name adjustment tables,
-      integration points, breakout rules, and CDATA sections — tree
-      construction **1205/1304 (92%)**, tokenizer **6943/6943**
-- [ ] The script-data tokenizer states (§13.2.5.15–31), which is what tests16
-      still needs — the largest single remaining parsing gap
+      integration points, breakout rules, and CDATA sections
+- [x] The script-data tokenizer states (§13.2.5.15–31), including double
+      escaping — tree construction **1241/1304 (95%)**
 - [ ] `select` insertion modes, `template` contents, fragment parsing
-      (`innerHTML`)
+      (`innerHTML`) — the largest remaining parsing gap, and what tests26 and
+      the 26 skipped tree cases need
 - [x] CSS tokenizer (css-syntax-3 §4) and parser (§5): rules, at-rules,
       declarations, `!important`
 - [x] Selectors (selectors-4): type/universal/class/id/attribute/pseudo,

@@ -41,7 +41,7 @@ formatting markup.
 ### Tree construction
 
 `python tools/run_tree_conformance.py` against the html5lib-tests
-tree-construction suites: **1205/1304 (92%)**, 26 skipped. 24 of the 41 suites
+tree-construction suites: **1241/1304 (95%)**, 26 skipped. 27 of the 41 suites
 pass completely.
 
 The driver prints per-suite numbers so the gap stays visible:
@@ -51,9 +51,10 @@ The driver prints per-suite numbers so the gap stays visible:
 | blocks, comments01, doctype01, entities01/02 | 100% | core parsing |
 | tables01, tests8, tests21–tests25 | 100% | tables, CDATA, misc |
 | tests11, ruby, html5test-com | 100% | foreign content, ruby |
+| tests16 | 97% | script data |
 | tests9, tests10 | 85% | SVG/MathML corner cases |
-| tests16 | 79% | **script-data tokenizer states** |
 | adoption01 | 15/17 | misnested formatting |
+| tests26 | 75% | **`select` insertion modes** |
 
 ### Tokenizer
 
@@ -71,23 +72,23 @@ tokenizer suites (vendored, pinned), via `python tools/run_conformance.py`:
 | pendingSpecChanges | 1 | 100% |
 | test1–test4 | 1874 | 100% |
 | unicodeChars (+ problematic) | 328 | 100% |
-| **total** | **6943** | **100%** |
-| parse-error codes | 1789 | 100% |
+| **total** | **7032** | **100%** |
+| parse-error codes | 1799 | 100% |
 
-89 cases are **skipped, not passed**: they need the script-data tokenizer
-states, which are driven by the tree builder and are not implemented. The
-harness prints the skip count on every run.
+Nothing is skipped: every state the suites exercise is implemented.
 
 ## What works today
 
 - **Byte stream decoding** (§13.2.3.3) and **input preprocessing** (§13.2.3.5):
   BOM removal, newline normalization, and the surrogate / noncharacter /
   control input-stream parse errors.
-- **HTML tokenizer** (§13.2.5): data / RCDATA / RAWTEXT / PLAINTEXT, tags and
+- **HTML tokenizer** (§13.2.5), every state: data / RCDATA / RAWTEXT /
+  PLAINTEXT, the script-data family including double escaping, tags and
   attributes (duplicate dropping, ASCII lowercasing), comments including the
-  `<!` corner cases, the complete DOCTYPE state family, bogus comment, and
-  character references — numeric fully (C1 remapping table included) and all
-  2231 named references, generated from the spec's `entities.json`.
+  `<!` corner cases, the complete DOCTYPE state family, bogus comment, CDATA
+  sections, and character references — numeric fully (C1 remapping table
+  included) and all 2231 named references, generated from the spec's
+  `entities.json`.
 - **Parse errors** carry the spec's own identifiers
   (`unexpected-null-character`, `abrupt-doctype-public-identifier`, …) plus a
   byte offset.

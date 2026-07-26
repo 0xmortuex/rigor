@@ -31,17 +31,18 @@ HARNESS_BIN = os.path.join(
     "rigor_conformance.exe" if os.name == "nt" else "rigor_conformance")
 
 # html5lib names states the way the spec titles them; rigor's harness takes the
-# bare name. Script data and CDATA are not implemented yet (they arrive with
-# tree construction), so cases needing them are reported as skipped, never as
-# silent passes.
+# bare name. Every state the suites use is implemented; UNSUPPORTED_STATES
+# stays as the hook for reporting any future gap as a skip rather than a
+# silent pass.
 STATE_MAP = {
     "Data state": "Data",
     "PLAINTEXT state": "PLAINTEXT",
     "RCDATA state": "RCDATA",
     "RAWTEXT state": "RAWTEXT",
     "CDATA section state": "CDATA",
+    "Script data state": "Script",
 }
-UNSUPPORTED_STATES = {"Script data state"}
+UNSUPPORTED_STATES = set()
 
 ESCAPE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})")
 
@@ -184,7 +185,7 @@ def main():
               f"{epct:6.2f}%  (codes only; rigor records byte offsets, not line/col)")
     if skipped:
         print(f"  {'skipped':<{width}}  {len(skipped):>5}        "
-              f"(script-data states, not implemented yet)")
+              f"(states rigor does not implement)")
 
     if args.errors and error_failures:
         from collections import Counter

@@ -206,6 +206,7 @@ pub fn err_control_character_in_input_stream() -> u32 { return 44 as u32; }
 pub fn err_noncharacter_in_input_stream() -> u32 { return 45 as u32; }
 pub fn err_surrogate_in_input_stream() -> u32 { return 46 as u32; }
 pub fn err_eof_in_cdata() -> u32 { return 47 as u32; }
+pub fn err_eof_in_script_html_comment_like_text() -> u32 { return 48 as u32; }
 
 pub fn error_name(code: u32) -> *u8 {
     if code == 1 as u32 { return "unexpected-null-character"; }
@@ -255,5 +256,8 @@ pub fn error_name(code: u32) -> *u8 {
     if code == 45 as u32 { return "noncharacter-in-input-stream"; }
     if code == 46 as u32 { return "surrogate-in-input-stream"; }
     if code == 47 as u32 { return "eof-in-cdata"; }
+    if code == 48 as u32 {
+        return "eof-in-script-html-comment-like-text";
+    }
     return "unknown-parse-error";
 }

@@ -52,6 +52,7 @@ const TEXT_NONE: u32 = 0;
 const TEXT_RCDATA: u32 = 1;
 const TEXT_RAWTEXT: u32 = 2;
 const TEXT_PLAINTEXT: u32 = 3;
+const TEXT_SCRIPT: u32 = 4;
 
 resource struct HtmlTreeBuilder {
     doc: *DomDocument,
@@ -1017,6 +1018,8 @@ pub fn process(
             tokenizer.set_rcdata(t);
         } else if (*b).pending_text_state == TEXT_RAWTEXT {
             tokenizer.set_rawtext(t);
+        } else if (*b).pending_text_state == TEXT_SCRIPT {
+            tokenizer.set_script_data(t);
         } else {
             tokenizer.set_plaintext(t);
         }
@@ -2173,10 +2176,14 @@ fn mode_in_head(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
             parse_text_element(b, s, token, TEXT_RCDATA);
             return;
         }
+        if tag == tagnames.tag_script() {
+            parse_text_element(b, s, token, TEXT_SCRIPT);
+            return;
+        }
         if tag == tagnames.tag_noframes() || tag == tagnames.tag_style()
-            || tag == tagnames.tag_noscript() || tag == tagnames.tag_script() {
+            || tag == tagnames.tag_noscript() {
             // Without a scripting engine, <noscript> content is parsed as
-            // ordinary markup; the other three are raw text.
+            // ordinary markup; the other two are raw text.
             if tag == tagnames.tag_noscript() {
                 insert_element(b, s, token);
                 (*b).mode = MODE_IN_HEAD_NOSCRIPT;
@@ -2655,8 +2662,11 @@ fn in_head_start_tag(
         parse_text_element(b, s, token, TEXT_RCDATA);
         return;
     }
-    if tag == tagnames.tag_noframes() || tag == tagnames.tag_style()
-        || tag == tagnames.tag_script() {
+    if tag == tagnames.tag_script() {
+        parse_text_element(b, s, token, TEXT_SCRIPT);
+        return;
+    }
+    if tag == tagnames.tag_noframes() || tag == tagnames.tag_style() {
         parse_text_element(b, s, token, TEXT_RAWTEXT);
         return;
     }
