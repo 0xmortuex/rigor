@@ -74,6 +74,10 @@ resource struct HtmlTreeBuilder {
     pending_text_state: u32,
     ignore_next_lf: bool,
     stopped: bool,
+    // §13.4: the context element when this parser was created by the fragment
+    // parsing algorithm, node.none() otherwise. It is not on the stack of open
+    // elements; it stands in for the element the fragment will be dropped into.
+    context: u64,
     // While set, nodes that would land inside a table go beside it instead
     // (§13.2.6.1 "foster parenting").
     foster_parenting: bool,
@@ -93,6 +97,7 @@ pub fn new(doc: *DomDocument) -> HtmlTreeBuilder {
         pending_text_state: TEXT_NONE,
         ignore_next_lf: false,
         stopped: false,
+        context: node.none(),
         foster_parenting: false,
     };
 }
@@ -122,6 +127,17 @@ fn current(b: *HtmlTreeBuilder) -> u64 {
         return node.none();
     }
     return at(b, depth(b) - 1);
+}
+
+// §13.2.4.2 "the adjusted current node": in a fragment parse, while nothing but
+// the synthetic root is open, the context element stands in for the current
+// node — which is how a fragment parsed inside <svg> starts out in foreign
+// content even though its root element is HTML.
+fn adjusted_current(b: *HtmlTreeBuilder) -> u64 {
+    if (*b).context != node.none() && depth(b) == 1 {
+        return (*b).context;
+    }
+    return current(b);
 }
 
 fn push_open(b: *HtmlTreeBuilder, element: u64) -> void {
@@ -243,6 +259,27 @@ fn is_special(tag: u32) -> bool {
         || tag == tagnames.tag_tr() || tag == tagnames.tag_track()
         || tag == tagnames.tag_ul() || tag == tagnames.tag_wbr()
         || tag == tagnames.tag_xmp();
+}
+
+// The "special" category is a list of HTML elements plus a short list of
+// foreign ones; a foreign element that merely shares a name with an HTML
+// special (an <svg tr>, say) is ordinary.
+fn is_special_element(b: *HtmlTreeBuilder, element: u64) -> bool {
+    if element == node.none() {
+        return false;
+    }
+    if namespace_of(b, element) == node.ns_html() {
+        return is_special(tag_of(b, element));
+    }
+    if is_mathml_text_integration_point(b, element) {
+        return true;
+    }
+    if namespace_of(b, element) == node.ns_mathml() {
+        return name_equals(b, element, "annotation-xml");
+    }
+    return name_equals(b, element, "foreignObject")
+        || name_equals(b, element, "desc")
+        || name_equals(b, element, "title");
 }
 
 fn is_formatting_tag(tag: u32) -> bool {
@@ -738,7 +775,9 @@ fn reconstruct_formatting(b: *HtmlTreeBuilder) -> void {
     while position < formatting_len(b) {
         let original: u64 = formatting_at(b, position);
         let clone: u64 = clone_element(b, original);
-        node.append_child((*b).doc, insertion_parent(b), clone);
+        // A reconstructed element is inserted like any other: one rebuilt
+        // while foster parenting is on belongs beside the table, not in it.
+        insert_at(b, appropriate_place(b), clone);
         push_open(b, clone);
         vec.set(&(*b).formatting, position, clone);
         position = position + 1;
@@ -787,7 +826,8 @@ fn adoption_agency(b: *HtmlTreeBuilder, tag: u32) -> bool {
         // element on the stack.
         let furthest_block: u64 = node.none();
         for probe: u64 in (stack_index + 1)..depth(b) {
-            if furthest_block == node.none() && is_special(tag_of(b, at(b, probe))) {
+            if furthest_block == node.none()
+                && is_special_element(b, at(b, probe)) {
                 furthest_block = at(b, probe);
             }
         }
@@ -930,6 +970,24 @@ fn head_view(view: []const u8, count: u64) -> []const u8 {
 
 fn all_whitespace(view: []const u8) -> bool {
     return leading_ws(view) == len(view);
+}
+
+// The frameset modes take whitespace wherever it appears in a run and drop
+// everything else, so " te st" contributes both of its spaces — not just the
+// leading one. Adjacent runs merge into a single text node on insertion.
+fn insert_whitespace_only(b: *HtmlTreeBuilder, view: []const u8) -> void {
+    let index: u64 = 0;
+    while index < len(view) {
+        if !is_ws_byte(view[index]) {
+            index = index + 1;
+        } else {
+            let start: u64 = index;
+            while index < len(view) && is_ws_byte(view[index]) {
+                index = index + 1;
+            }
+            insert_text(b, slice((&view[start]) as *const u8, index - start));
+        }
+    }
 }
 
 // --- Quirks mode (§13.2.6.1, "the initial insertion mode") ------------------
@@ -1089,7 +1147,8 @@ pub fn process(
     dispatch(b, s, index);
     // The tokenizer needs to know whether it is inside foreign content, so
     // that <![CDATA[ opens a CDATA section rather than a bogus comment.
-    tokenizer.set_foreign(t, namespace_of(b, current(b)) != node.ns_html());
+    tokenizer.set_foreign(t,
+    namespace_of(b, adjusted_current(b)) != node.ns_html());
     if (*b).pending_text_state != TEXT_NONE {
         if (*b).pending_text_state == TEXT_RCDATA {
             tokenizer.set_rcdata(t);
@@ -1178,7 +1237,7 @@ fn use_foreign_rules(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> bool
     if depth(b) == 0 {
         return false;
     }
-    let current_element: u64 = current(b);
+    let current_element: u64 = adjusted_current(b);
     if namespace_of(b, current_element) == node.ns_html() {
         return false;
     }
@@ -1315,8 +1374,8 @@ fn foreign_content(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
     if token.kind == tokens.kind_doctype() {
         return;
     }
+    let tag: u32 = token_tag(b, s, token);
     if token.kind == tokens.kind_start_tag() {
-        let tag: u32 = token_tag(b, s, token);
         let breaks_out: bool = breaks_out_of_foreign(tag);
         if !breaks_out && tag == tagnames.tag_font() {
             // <font> only breaks out when it carries a presentational
@@ -1326,28 +1385,22 @@ fn foreign_content(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
                 || has_attr_named(s, token, "size");
         }
         if breaks_out {
-            // Pop back to HTML content and reprocess in the current mode.
-            loop {
-                if depth(b) == 0 {
-                    break;
-                }
-                let element: u64 = current(b);
-                if namespace_of(b, element) == node.ns_html()
-                    || is_mathml_text_integration_point(b, element)
-                    || is_html_integration_point(b, element) {
-                    break;
-                }
-                pop_open(b);
-            }
-            dispatch_html(b, s, index);
+            break_out_of_foreign(b, s, index);
             return;
         }
-        let namespace: u8 = namespace_of(b, current(b));
+        let namespace: u8 = namespace_of(b, adjusted_current(b));
         insert_foreign_element(b, s, token, namespace);
         if token.self_closing {
             // In XML a self-closing tag really does close, unlike in HTML.
             pop_open(b);
         }
+        return;
+    }
+
+    // </br> and </p> break out too, alongside the start tags above: they are
+    // the two end tags that mean HTML content whatever the current node is.
+    if tag == tagnames.tag_br() || tag == tagnames.tag_p() {
+        break_out_of_foreign(b, s, index);
         return;
     }
 
@@ -1378,6 +1431,28 @@ fn foreign_content(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
             return;
         }
     }
+}
+
+// Pop back to HTML content — the nearest HTML element or integration point —
+// and reprocess the token in the current insertion mode.
+fn break_out_of_foreign(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    index: u64
+) -> void {
+    loop {
+        if depth(b) == 0 {
+            break;
+        }
+        let element: u64 = current(b);
+        if namespace_of(b, element) == node.ns_html()
+            || is_mathml_text_integration_point(b, element)
+            || is_html_integration_point(b, element) {
+            break;
+        }
+        pop_open(b);
+    }
+    dispatch_html(b, s, index);
 }
 
 fn names_equal_ci(left: []const u8, right: []const u8) -> bool {
@@ -1454,8 +1529,14 @@ fn reset_insertion_mode(b: *HtmlTreeBuilder) -> void {
     let index: u64 = depth(b);
     while index > 0 {
         index = index - 1;
-        let tag: u32 = tag_of(b, at(b, index));
         let last: bool = index == 0;
+        let subject: u64 = at(b, index);
+        if last && (*b).context != node.none() {
+            // §13.2.6.2 step 3, the fragment case: the bottom of the stack is
+            // the synthetic root, so the context element answers for it.
+            subject = (*b).context;
+        }
+        let tag: u32 = tag_of(b, subject);
         if tag == tagnames.tag_template() {
             (*b).mode = current_template_mode(b);
             return;
@@ -2285,10 +2366,20 @@ fn process_chars(b: *HtmlTreeBuilder, s: *HtmlTokenSink, view: []const u8) -> vo
         process_chars(b, s, view);
     } else if mode == MODE_IN_FRAMESET || mode == MODE_AFTER_FRAMESET
         || mode == MODE_AFTER_AFTER_FRAMESET {
-        // Only whitespace is allowed in the frameset modes; anything else is
-        // a parse error and is dropped.
-        let ws: u64 = leading_ws(view);
-        insert_text(b, head_view(view, ws));
+        insert_whitespace_only(b, view);
+    } else if mode == MODE_IN_TABLE || mode == MODE_IN_TABLE_BODY
+        || mode == MODE_IN_ROW {
+        // §13.2.6.4.9: whitespace may stay inside the table structure, but
+        // anything else is fostered out in front of the table.
+        if all_whitespace(view) && is_table_context(tag_of(b, current(b))) {
+            insert_text(b, view);
+        } else {
+            (*b).foster_parenting = true;
+            reconstruct_formatting(b);
+            (*b).frameset_ok = false;
+            insert_text(b, view);
+            (*b).foster_parenting = false;
+        }
     } else {
         // "in body" and "text".
         if mode == MODE_IN_BODY {
@@ -2883,7 +2974,7 @@ fn in_body_start_tag(
         let element: u64 =
             node.create_element((*b).doc, view_of("img"), node.ns_html());
         copy_attributes(b, s, token, element);
-        node.append_child((*b).doc, insertion_parent(b), element);
+        insert_at(b, appropriate_place(b), element);
         (*b).frameset_ok = false;
         return;
     }
@@ -3162,7 +3253,7 @@ fn in_body_end_tag(
             // Recover by opening an empty <p> first, per the spec.
             let element: u64 =
                 node.create_element((*b).doc, view_of("p"), node.ns_html());
-            node.append_child((*b).doc, insertion_parent(b), element);
+            insert_at(b, appropriate_place(b), element);
             push_open(b, element);
         }
         close_p_element(b);
@@ -3218,7 +3309,7 @@ fn in_body_end_tag(
         reconstruct_formatting(b);
         let element: u64 =
             node.create_element((*b).doc, view_of("br"), node.ns_html());
-        node.append_child((*b).doc, insertion_parent(b), element);
+        insert_at(b, appropriate_place(b), element);
         (*b).frameset_ok = false;
         return;
     }
@@ -3238,7 +3329,7 @@ fn any_other_end_tag(b: *HtmlTreeBuilder, tag: u32) -> void {
             }
             return;
         }
-        if is_special(tag_of(b, element)) {
+        if is_special_element(b, element) {
             return;
         }
     }
@@ -3255,7 +3346,8 @@ fn close_list_item(b: *HtmlTreeBuilder) -> void {
             pop_until_tag(b, tagnames.tag_li());
             return;
         }
-        if is_special(element_tag) && element_tag != tagnames.tag_address()
+        if is_special_element(b, at(b, index))
+            && element_tag != tagnames.tag_address()
             && element_tag != tagnames.tag_div()
             && element_tag != tagnames.tag_p() {
             return;
@@ -3273,7 +3365,8 @@ fn close_definition_item(b: *HtmlTreeBuilder) -> void {
             pop_until_tag(b, element_tag);
             return;
         }
-        if is_special(element_tag) && element_tag != tagnames.tag_address()
+        if is_special_element(b, at(b, index))
+            && element_tag != tagnames.tag_address()
             && element_tag != tagnames.tag_div()
             && element_tag != tagnames.tag_p() {
             return;
@@ -3401,8 +3494,7 @@ fn mode_after_body(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
 fn mode_in_frameset(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
     let token: HtmlToken = tokens.get_token(s, index);
     if token.kind == tokens.kind_chars() {
-        let view: []const u8 = token_data(s, token);
-        insert_text(b, head_view(view, leading_ws(view)));
+        insert_whitespace_only(b, token_data(s, token));
         return;
     }
     if token.kind == tokens.kind_comment() {
@@ -3428,10 +3520,14 @@ fn mode_in_frameset(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void 
     }
     if token.kind == tokens.kind_end_tag()
         && token_tag(b, s, token) == tagnames.tag_frameset() {
-        if !is_html_element(b, current(b), tagnames.tag_html()) {
-            pop_open(b);
+        if depth(b) == 1 {
+            // The current node is the root html element: a stray end tag with
+            // nothing to close. (fragment case)
+            return;
         }
-        if !is_html_element(b, current(b), tagnames.tag_frameset()) {
+        pop_open(b);
+        if (*b).context == node.none()
+            && !is_html_element(b, current(b), tagnames.tag_frameset()) {
             (*b).mode = MODE_AFTER_FRAMESET;
         }
     }
@@ -3441,8 +3537,7 @@ fn mode_in_frameset(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void 
 fn mode_after_frameset(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
     let token: HtmlToken = tokens.get_token(s, index);
     if token.kind == tokens.kind_chars() {
-        let view: []const u8 = token_data(s, token);
-        insert_text(b, head_view(view, leading_ws(view)));
+        insert_whitespace_only(b, token_data(s, token));
         return;
     }
     if token.kind == tokens.kind_comment() {
@@ -3555,4 +3650,77 @@ pub fn parse(
         tokenizer.pump(&t, s);
     }
     destroy(&b);
+}
+
+// §13.4 "parsing HTML fragments" — what innerHTML does. The markup is parsed
+// as though it appeared inside `context_name` (in `context_ns`), so that
+// "<td>x" inside a <tr> makes a cell rather than being discarded.
+//
+// The fragment's nodes end up as the children of a fresh html root element,
+// whose index is returned; the caller reads them from there.
+pub fn parse_fragment(
+    source: *const u8,
+    length: u64,
+    doc: *DomDocument,
+    s: *HtmlTokenSink,
+    context_name: []const u8,
+    context_ns: u8
+) -> u64 {
+    // The context element is never inserted anywhere: it exists only to be
+    // consulted for its name and namespace.
+    let context: u64 = node.create_element(doc, context_name, context_ns);
+    let root: u64 = node.create_element(doc, view_of("html"), node.ns_html());
+    node.append_child(doc, 0, root);
+
+    let t: HtmlTokenizer = tokenizer.new(source, length);
+    let b: HtmlTreeBuilder = new(doc);
+    (*(&b)).context = context;
+    push_open(&b, root);
+
+    // The tokenizer starts in whatever state the context element implies, and
+    // knows that element's name so its own end tag is recognised as one.
+    if context_ns == node.ns_html() {
+        let tag: u32 = tag_of(&b, context);
+        if tag == tagnames.tag_title() || tag == tagnames.tag_textarea() {
+            tokenizer.set_rcdata(&t);
+        } else if tag == tagnames.tag_style() || tag == tagnames.tag_xmp()
+            || tag == tagnames.tag_iframe() || tag == tagnames.tag_noembed()
+            || tag == tagnames.tag_noframes() {
+            tokenizer.set_rawtext(&t);
+        } else if tag == tagnames.tag_script() {
+            tokenizer.set_script_data(&t);
+        } else if tag == tagnames.tag_plaintext() {
+            tokenizer.set_plaintext(&t);
+        }
+        // <noscript> would be RAWTEXT with scripting enabled; rigor has no
+        // scripting, so it stays in the data state.
+        if tag == tagnames.tag_template() {
+            vec.push(&(*(&b)).template_modes, MODE_IN_TEMPLATE);
+        }
+    }
+    tokenizer.set_last_start_tag(&t, s, slice_start(context_name),
+    len(context_name));
+
+    reset_insertion_mode(&b);
+    let next: u64 = 0;
+    loop {
+        while next < tokens.token_count(s) {
+            process(&b, s, next, &t);
+            next = next + 1;
+        }
+        if tokenizer.done(&t) {
+            break;
+        }
+        tokenizer.pump(&t, s);
+    }
+    destroy(&b);
+    return root;
+}
+
+// Taking &view[0] is bounds-checked, so an empty name would trap.
+fn slice_start(view: []const u8) -> *const u8 {
+    if len(view) == 0 {
+        return 0 as *const u8;
+    }
+    return &view[0];
 }

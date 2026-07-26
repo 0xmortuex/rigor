@@ -178,6 +178,18 @@ fn write_node(out: *Vec<u8>, doc: *DomDocument, index: u64, depth: u64) -> void 
     }
 }
 
+// Serialize the children of `root` — the result of a fragment parse, which
+// html5lib prints without the synthetic root element around it.
+pub fn fragment(doc: *DomDocument, root: u64) -> Vec<u8> {
+    let out: Vec<u8> = vec.new<u8>();
+    let child: u64 = node.get(doc, root).first_child;
+    while child != node.none() {
+        write_node(&out, doc, child, 0);
+        child = node.get(doc, child).next_sibling;
+    }
+    return move out;
+}
+
 // Serialize the whole document into a fresh owned buffer, which the caller
 // must eventually vec.destroy.
 pub fn document(doc: *DomDocument) -> Vec<u8> {

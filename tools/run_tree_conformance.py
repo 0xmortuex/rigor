@@ -11,9 +11,9 @@ line-for-line diff.
     python tools/run_tree_conformance.py -v --failures 5
     python tools/run_tree_conformance.py --file adoption01.dat
 
-Fragment cases (#document-fragment) and script-on cases are skipped and
-counted, never silently passed: fragment parsing and scripting are not
-implemented.
+Fragment cases (#document-fragment) name a context element and are parsed
+with the fragment parsing algorithm. Script-on cases are skipped and counted,
+never silently passed: rigor has no scripting.
 """
 
 import argparse
@@ -44,9 +44,11 @@ def parse_dat(path):
         buckets = {"data": [], "errors": [], "document": [],
                    "document-fragment": [], "script-on": [], "script-off": [],
                    "new-errors": []}
+        seen = set()
         for line in chunk.split("\n"):
             if line.startswith("#") and line[1:] in buckets:
                 section = line[1:]
+                seen.add(section)
                 continue
             if line.startswith("#") and line[1:] in (
                     "data", "errors", "document", "document-fragment",
@@ -62,7 +64,9 @@ def parse_dat(path):
             "input": "\n".join(buckets["data"]),
             "document": "\n".join(document),
             "fragment": "\n".join(buckets["document-fragment"]).strip(),
-            "script_on": bool([l for l in buckets["script-on"] if l.strip()]),
+            # #script-on / #script-off are bare markers with no content,
+            # so the header itself is the signal.
+            "script_on": "script-on" in seen,
         })
     return cases
 
@@ -77,7 +81,7 @@ def load_cases(only_file=None):
             raise SystemExit(f"no vendored suite named {only_file!r}")
     for name in names:
         for index, case in enumerate(parse_dat(os.path.join(SUITE_DIR, name))):
-            if case["fragment"] or case["script_on"]:
+            if case["script_on"]:
                 skipped += 1
                 continue
             if not case["input"] and not case["document"]:
@@ -93,7 +97,9 @@ def run_harness(cases):
         raise SystemExit(
             f"missing {HARNESS_BIN}\nbuild it first: cd conformance && mortc build")
     job = json.dumps(
-        {"mode": "tree", "cases": [{"input": c["input"]} for c in cases]},
+        {"mode": "tree",
+         "cases": [{"input": c["input"], "context": c["fragment"]}
+                   for c in cases]},
         ensure_ascii=True)
     process = subprocess.run(
         [HARNESS_BIN], input=job.encode("ascii"),
@@ -142,7 +148,7 @@ def main():
           f"{100.0 * passed / total if total else 0:6.2f}%")
     if skipped:
         print(f"  {'skipped':<{width}}  {skipped:>4}       "
-              f"(fragment parsing / scripting, not implemented)")
+              f"(#script-on cases; rigor has no scripting)")
 
     if args.verbose and failures:
         print(f"\nfirst {min(args.failures, len(failures))} failures:\n")

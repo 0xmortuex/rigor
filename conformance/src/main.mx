@@ -314,6 +314,17 @@ fn run_case(doc: *Document, case_index: u64) -> void {
     vec.destroy(&normalized);
 }
 
+// A fragment parse is serialized from its root element; a whole-document parse
+// from the document.
+fn tree_text(tree: *DomDocument, root: u64) -> Vec<u8> {
+    if root == node.none() {
+        let whole: Vec<u8> = serialize.document(tree);
+        return move whole;
+    }
+    let part: Vec<u8> = serialize.fragment(tree, root);
+    return move part;
+}
+
 // Tree-construction mode: parse the case's input into a DOM and emit the
 // html5lib tree serialization as a single JSON string, so the Python driver
 // can compare it line for line against the .dat file's #document section.
@@ -323,13 +334,45 @@ fn run_tree_case(doc: *Document, case_index: u64) -> void {
         Option<u64>.Some(entry) => { source = json.as_string(doc, entry); },
         Option<u64>.None => {},
     }
+    // A fragment case names its context element, optionally namespaced:
+    // "div", "svg path", "math ms".
+    let context: []const u8 = slice(0 as *const u8, 0);
+    match json.object_get(doc, case_index, "context") {
+        Option<u64>.Some(entry) => { context = json.as_string(doc, entry); },
+        Option<u64>.None => {},
+    }
     let sink: HtmlTokenSink = tokens.new_sink();
     let normalized: Vec<u8> =
     preprocess.normalize(slice_ptr(source), len(source), &sink);
     let tree: DomDocument = node.new_document();
-    treebuilder.parse(
-    normalized.data as *const u8, normalized.length, &tree, &sink);
-    let text: Vec<u8> = serialize.document(&tree);
+    // node.none() means "not a fragment": the whole document is serialized.
+    let root: u64 = 0;
+    if len(context) > 0 {
+        let space: u64 = len(context);
+        for index: u64 in 0..len(context) {
+            if context[index] == ' ' && space == len(context) {
+                space = index;
+            }
+        }
+        let namespace: u8 = node.ns_html();
+        let name: []const u8 = context;
+        if space < len(context) {
+            if context[0] == 's' {
+                namespace = node.ns_svg();
+            } else if context[0] == 'm' {
+                namespace = node.ns_mathml();
+            }
+            name = slice(&context[space + 1] as *const u8,
+            len(context) - space - 1);
+        }
+        root = treebuilder.parse_fragment(
+        normalized.data as *const u8, normalized.length, &tree, &sink,
+        name, namespace);
+    } else {
+        treebuilder.parse(
+        normalized.data as *const u8, normalized.length, &tree, &sink);
+    }
+    let text: Vec<u8> = tree_text(&tree, root);
 
     put("{\"tree\":");
     put_json_string(vec.as_const_slice(&text));

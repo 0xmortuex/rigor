@@ -334,3 +334,65 @@ test "a template inside a select is not flattened" {
     assert(tree_is("<select><template><option></option></template></select>",
     "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       <template>\n|         content\n|           <option>\n"));
 }
+
+// §13.4: parse `source` as though it appeared inside `context`, and serialize
+// the result the way html5lib prints a fragment — without a root element.
+fn fragment_is(source: *u8, context: *u8, namespace: u8, expected: *u8) -> bool {
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let normalized: Vec<u8> =
+    preprocess.normalize(source as *const u8, str_len(source), &sink);
+    let doc: DomDocument = node.new_document();
+    let root: u64 = treebuilder.parse_fragment(
+    normalized.data as *const u8, normalized.length, &doc, &sink,
+    slice(context as *const u8, str_len(context)), namespace);
+    let text: Vec<u8> = serialize.fragment(&doc, root);
+    let want: u64 = str_len(expected);
+    let ok: bool = text.length == want;
+    if ok {
+        for index: u64 in 0..want {
+            if text.data[index] != expected[index] {
+                ok = false;
+            }
+        }
+    }
+    vec.destroy(&text);
+    node.destroy(&doc);
+    tokens.destroy(&sink);
+    vec.destroy(&normalized);
+    return ok;
+}
+
+test "a fragment has no implied html, head or body" {
+    assert(fragment_is("<p>x", "div", node.ns_html(),
+    "| <p>\n|   \"x\"\n"));
+}
+
+test "a fragment is parsed in its context element" {
+    // A bare <td> is dropped in a document, but inside a <tr> it is a cell.
+    assert(fragment_is("<td>a", "tr", node.ns_html(),
+    "| <td>\n|   \"a\"\n"));
+    assert(tree_is("<td>a",
+    "| <html>\n|   <head>\n|   <body>\n|     \"a\"\n"));
+}
+
+test "a fragment in a foreign context starts in foreign content" {
+    assert(fragment_is("<circle>", "svg", node.ns_svg(),
+    "| <svg circle>\n"));
+}
+
+test "the context element sets the tokenizer state" {
+    // Inside <title> the markup is RCDATA, so <b> is text rather than a tag.
+    assert(fragment_is("<b>x", "title", node.ns_html(), "| \"<b>x\"\n"));
+    assert(fragment_is("<b>x", "div", node.ns_html(),
+    "| <b>\n|   \"x\"\n"));
+}
+
+test "a fragment in a template context is in template contents" {
+    assert(fragment_is("<td>a", "template", node.ns_html(),
+    "| <td>\n|   \"a\"\n"));
+}
+
+test "an end tag with nothing to close is dropped in a fragment" {
+    assert(fragment_is("</frameset><frame>", "frameset", node.ns_html(),
+    "| <frame>\n"));
+}

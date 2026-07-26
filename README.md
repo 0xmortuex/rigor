@@ -41,21 +41,12 @@ formatting markup.
 ### Tree construction
 
 `python tools/run_tree_conformance.py` against the html5lib-tests
-tree-construction suites: **1390/1415 (98.2%)**, 27 skipped. 31 of the 42
-suites pass completely.
+tree-construction suites: **1434/1434 (100%)**, all 42 suites.
 
-The driver prints per-suite numbers so the gap stays visible:
-
-| suite | passing | what it covers |
-| --- | ---: | --- |
-| blocks, comments01, doctype01, entities01/02 | 100% | core parsing |
-| tables01, tests8, tests21–tests25 | 100% | tables, CDATA, misc |
-| tests11, ruby, html5test-com | 100% | foreign content, ruby |
-| tests9, tests10, tests21 | 100% | foreign content, CDATA |
-| template | 111/111 | `<template>` contents |
-| tests16 | 97% | script data |
-| tests26 | 75% | **fragment parsing** |
-| adoption01 | 15/17 | misnested formatting |
+Eight cases are skipped and reported, never silently counted as passes: they
+are the suites' `#script-on` cases, and rigor has no scripting engine, so the
+behaviour they test does not exist here. Fragment cases (`#document-fragment`)
+are run, with the fragment parsing algorithm and the case's context element.
 
 ### Tokenizer
 

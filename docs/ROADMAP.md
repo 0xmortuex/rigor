@@ -30,10 +30,11 @@ HTML + CSS in, pixels in a window out. No JavaScript.
 - [x] The `select` insertion modes (§13.2.6.4.16–17) and select scope
 - [x] `template` contents: the separate contents fragment, the "in template"
       mode and the stack of template insertion modes, and the template arms of
-      the insertion-location and adoption agency algorithms — tree
-      construction **1390/1415 (98.2%)**, 31 of 42 suites perfect
-- [ ] Fragment parsing (`innerHTML`) — the last parsing gap, and what tests26
-      and the 27 skipped tree cases need
+      the insertion-location and adoption agency algorithms
+- [x] Fragment parsing (§13.4, what `innerHTML` does): the context element,
+      the adjusted current node, and the fragment cases scattered through tree
+      construction — **html5lib tree construction 1434/1434 (100%)**, all 42
+      suites, with only the 8 `#script-on` cases skipped and reported
 - [x] CSS tokenizer (css-syntax-3 §4) and parser (§5): rules, at-rules,
       declarations, `!important`
 - [x] Selectors (selectors-4): type/universal/class/id/attribute/pseudo,
