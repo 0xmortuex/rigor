@@ -23,13 +23,15 @@
 // Byte-encoding note: rigor works on UTF-8 bytes directly, and normalize
 // copies bytes through unchanged — it decodes only to inspect each character.
 // Every character the tokenizer dispatches on is ASCII, so multi-byte
-// sequences flow through text, names, and attribute values untouched.
-// Charset sniffing and decoding of non-UTF-8 documents (§13.2.3.2) is a later
-// stage that will sit in front of strip_bom.
+// sequences flow through text, names, and attribute values untouched. Getting
+// to UTF-8 in the first place — sniffing the encoding and decoding whatever
+// the document turned out to be — is engine.html.decode, which runs in front
+// of this stage.
 module engine.html.preprocess;
 
 import std.vec;
 import tokens;
+import decode;
 
 // Byte length of a leading UTF-8 byte order mark: 3 when present, else 0.
 // §13.2.3.3 — the decoder consumes it.
@@ -52,7 +54,7 @@ struct PreprocessChar {
 // Decode the UTF-8 sequence at `pos`. Malformed input yields the lead byte as
 // a single-byte character; encoding errors belong to the byte stream decoder,
 // and this stage must not stall on them.
-fn decode(input: *const u8, length: u64, pos: u64) -> PreprocessChar {
+fn decode_char(input: *const u8, length: u64, pos: u64) -> PreprocessChar {
     let lead: u8 = input[pos];
     if lead < 0x80 as u8 {
         return PreprocessChar { cp: lead as u32, size: 1 };
@@ -142,7 +144,7 @@ pub fn normalize(input: *const u8, length: u64, sink: *HtmlTokenSink) -> Vec<u8>
             vec.push(&out, c);
             pos = pos + 1;
         } else {
-            let decoded: PreprocessChar = decode(input, length, pos);
+            let decoded: PreprocessChar = decode_char(input, length, pos);
             check(sink, decoded.cp, out.length);
             for step: u64 in 0..decoded.size {
                 vec.push(&out, input[pos + step]);
@@ -154,13 +156,41 @@ pub fn normalize(input: *const u8, length: u64, sink: *HtmlTokenSink) -> Vec<u8>
 }
 
 // Convenience for callers that hold raw document bytes (a file, a response
-// body): decode then preprocess, in that order.
+// body): sniff the encoding, decode to UTF-8, then preprocess — §13.2.3 in
+// order. The sniffing and decoding live in engine.html.decode; what remains
+// here is the character-stream half.
 pub fn decode_and_normalize(
     input: *const u8,
     length: u64,
     sink: *HtmlTokenSink
 ) -> Vec<u8> {
-    let start: u64 = strip_bom(input, length);
-    let decoded: Vec<u8> = normalize(&input[start], length - start, sink);
-    return move decoded;
+    let utf8: Vec<u8> = decode.sniff_and_decode(input, length);
+    let normalized: Vec<u8> =
+        normalize(utf8.data as *const u8, utf8.length, sink);
+    vec.destroy(&utf8);
+    return move normalized;
+}
+
+// The same, with a transport-layer charset (an HTTP Content-Type) to honour.
+pub fn decode_and_normalize_as(
+    input: *const u8,
+    length: u64,
+    transport: []const u8,
+    sink: *HtmlTokenSink
+) -> Vec<u8> {
+    let sniffed: SniffResult =
+        decode.sniff_with_transport(input, length, transport);
+    let start: u64 = sniffed.bom_length;
+    if start > length {
+        start = length;
+    }
+    let body: *const u8 = input;
+    if start > 0 {
+        body = &input[start];
+    }
+    let utf8: Vec<u8> = decode.decode(body, length - start, sniffed.encoding);
+    let normalized: Vec<u8> =
+        normalize(utf8.data as *const u8, utf8.length, sink);
+    vec.destroy(&utf8);
+    return move normalized;
 }

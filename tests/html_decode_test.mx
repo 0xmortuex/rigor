@@ -1,0 +1,300 @@
+// The input byte stream: encoding sniffing (HTML §13.2.3) and the decoders
+// the WHATWG Encoding Standard defines.
+//
+// Byte sequences are written as escapes rather than as literal text, so the
+// test file itself stays ASCII and cannot be broken by an editor helpfully
+// re-encoding it.
+
+import std.vec;
+import std.string;
+import engine.html.decode;
+import engine.html.encodings;
+
+fn view_of(text: *u8) -> []const u8 {
+    return slice(text as *const u8, str_len(text));
+}
+
+// Decode `input` in `encoding` and compare the UTF-8 result byte for byte.
+fn decodes_to(input: *u8, length: u64, encoding: u32, expected: *u8) -> bool {
+    let out: Vec<u8> = decode.decode(input as *const u8, length, encoding);
+    let want: u64 = str_len(expected);
+    let ok: bool = out.length == want;
+    if ok {
+        for index: u64 in 0..want {
+            if out.data[index] != expected[index] {
+                ok = false;
+            }
+        }
+    }
+    vec.destroy(&out);
+    return ok;
+}
+
+// Sniff `input` and decode it, which is what a document load does.
+fn sniffs_to(input: *u8, length: u64, expected: *u8) -> bool {
+    let out: Vec<u8> = decode.sniff_and_decode(input as *const u8, length);
+    let want: u64 = str_len(expected);
+    let ok: bool = out.length == want;
+    if ok {
+        for index: u64 in 0..want {
+            if out.data[index] != expected[index] {
+                ok = false;
+            }
+        }
+    }
+    vec.destroy(&out);
+    return ok;
+}
+
+fn label_id(label: *u8) -> u32 {
+    let found: EncodingLookup = encodings.lookup_label(view_of(label));
+    if !found.found {
+        return encodings.encoding_count();
+    }
+    return found.id;
+}
+
+// --- Labels (§4.2) -----------------------------------------------------------
+
+test "labels resolve case-insensitively and with whitespace" {
+    assert(label_id("UTF-8") == encodings.enc_utf_8());
+    assert(label_id("utf8") == encodings.enc_utf_8());
+    assert(label_id("  UtF-8  ") == encodings.enc_utf_8());
+}
+
+test "the latin1 labels all mean windows-1252" {
+    // This is the single most consequential line of the label table: a page
+    // declaring ISO-8859-1 is decoded as windows-1252, because that is what
+    // its author's editor actually produced.
+    assert(label_id("iso-8859-1") == encodings.enc_windows_1252());
+    assert(label_id("latin1") == encodings.enc_windows_1252());
+    assert(label_id("ascii") == encodings.enc_windows_1252());
+    assert(label_id("iso88591") == encodings.enc_windows_1252());
+}
+
+test "legacy aliases resolve to their encoding" {
+    assert(label_id("sjis") == encodings.enc_shift_jis());
+    assert(label_id("x-sjis") == encodings.enc_shift_jis());
+    assert(label_id("gb2312") == encodings.enc_gbk());
+    assert(label_id("chinese") == encodings.enc_gbk());
+    assert(label_id("windows-949") == encodings.enc_euc_kr());
+    assert(label_id("csbig5") == encodings.enc_big5());
+    assert(label_id("korean") == encodings.enc_euc_kr());
+    assert(label_id("cyrillic") == encodings.enc_iso_8859_5());
+}
+
+test "an unlisted label is not an encoding" {
+    let found: EncodingLookup = encodings.lookup_label(view_of("utf-9"));
+    assert(!found.found);
+}
+
+test "the dangerous labels map to replacement" {
+    // §4.2 routes these to an encoding that decodes to a single U+FFFD,
+    // because decoding them faithfully is an XSS vector.
+    assert(label_id("iso-2022-cn") == encodings.enc_replacement());
+    assert(label_id("hz-gb-2312") == encodings.enc_replacement());
+}
+
+// --- Single-byte decoders (§9.1) ---------------------------------------------
+
+test "windows-1252 decodes the C1 range as punctuation" {
+    // 0x80 and 0x93/0x94 are the euro sign and curly quotes, which is exactly
+    // where windows-1252 differs from ISO-8859-1 and why the label table
+    // sends ISO-8859-1 here.
+    assert(decodes_to("\x80\x93\x94", 3, encodings.enc_windows_1252(),
+    "€“”"));
+}
+
+test "iso-8859-5 decodes cyrillic" {
+    assert(decodes_to("\xc0\xc1\xc2", 3, encodings.enc_iso_8859_5(),
+    "РСТ"));
+}
+
+test "koi8-r decodes cyrillic in its own order" {
+    assert(decodes_to("\xd0\xd2\xd3", 3, encodings.enc_koi8_r(),
+    "прс"));
+}
+
+test "a single-byte encoding passes ascii through" {
+    assert(decodes_to("hello", 5, encodings.enc_windows_1252(), "hello"));
+}
+
+// --- UTF-8 (§4.2) ------------------------------------------------------------
+
+test "utf-8 round trips" {
+    assert(decodes_to("caf\xc3\xa9", 5, encodings.enc_utf_8(), "caf\xc3\xa9"));
+}
+
+test "a truncated utf-8 sequence becomes one replacement character" {
+    // The standard's error handling resumes at the byte that broke the
+    // sequence, so the '(' survives rather than being eaten with it.
+    assert(decodes_to("a\xc3(b", 4, encodings.enc_utf_8(), "a\xef\xbf\xbd(b"));
+}
+
+test "an overlong utf-8 sequence is rejected" {
+    // C0 80 would be a two-byte encoding of U+0000, which §4.2 excludes by
+    // starting the lead range at C2.
+    assert(decodes_to("\xc0\x80", 2, encodings.enc_utf_8(),
+    "\xef\xbf\xbd\xef\xbf\xbd"));
+}
+
+test "a utf-8 encoded surrogate is rejected" {
+    assert(decodes_to("\xed\xa0\x80", 3, encodings.enc_utf_8(),
+    "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd"));
+}
+
+// --- UTF-16 (§11.1) ----------------------------------------------------------
+
+test "utf-16le decodes, surrogate pairs included" {
+    // 'h', U+00E9, then U+1D11E as a surrogate pair.
+    assert(decodes_to("h\x00\xe9\x00\x34\xd8\x1e\xdd", 8,
+    encodings.enc_utf_16le(), "h\xc3\xa9\xf0\x9d\x84\x9e"));
+}
+
+test "utf-16be decodes" {
+    assert(decodes_to("\x00h\x00\xe9", 4, encodings.enc_utf_16be(), "h\xc3\xa9"));
+}
+
+test "an unpaired utf-16 surrogate becomes a replacement character" {
+    assert(decodes_to("\x34\xd8\x21\x00", 4, encodings.enc_utf_16le(),
+    "\xef\xbf\xbd!"));
+}
+
+// --- Legacy multi-byte encodings (§10) ---------------------------------------
+
+test "shift_jis decodes kana and the half-width range" {
+    // 0x82 0xA0 is HIRAGANA A; 0xB1 alone is the half-width katakana A.
+    assert(decodes_to("\x82\xa0\xb1", 3, encodings.enc_shift_jis(),
+    "\xe3\x81\x82\xef\xbd\xb1"));
+}
+
+test "big5 decodes" {
+    assert(decodes_to("\xa4\xa4", 2, encodings.enc_big5(), "\xe4\xb8\xad"));
+}
+
+test "big5 has four pointers that decode to two code points" {
+    // Pointer 1133 is U+00CA U+0304, the only place in the standard where one
+    // index entry produces a pair.
+    assert(decodes_to("\x88\x62", 2, encodings.enc_big5(),
+    "\xc3\x8a\xcc\x84"));
+}
+
+test "gbk decodes" {
+    assert(decodes_to("\xd6\xd0", 2, encodings.enc_gbk(), "\xe4\xb8\xad"));
+}
+
+test "gb18030 decodes a four-byte sequence through the range table" {
+    // 0x94 0x32 0xBE 0x34 is U+1D11E, which only the range table can reach.
+    assert(decodes_to("\x94\x32\xbe\x34", 4, encodings.enc_gb18030(),
+    "\xf0\x9d\x84\x9e"));
+}
+
+test "gb18030 maps the lone 0x80 to the euro sign" {
+    assert(decodes_to("\x80", 1, encodings.enc_gb18030(), "\xe2\x82\xac"));
+}
+
+test "euc-jp decodes, including the jis0212 plane" {
+    assert(decodes_to("\xc6\xfc", 2, encodings.enc_euc_jp(), "\xe6\x97\xa5"));
+    assert(decodes_to("\x8e\xb1", 2, encodings.enc_euc_jp(), "\xef\xbd\xb1"));
+}
+
+test "euc-kr decodes hangul" {
+    assert(decodes_to("\xc7\xd1", 2, encodings.enc_euc_kr(), "\xed\x95\x9c"));
+}
+
+test "iso-2022-jp switches modes on escape sequences" {
+    // ESC ( J selects Roman, where 0x5C is the yen sign rather than a
+    // backslash; ESC ( B returns to ASCII.
+    assert(decodes_to("\x1b\x28\x4a\x5c\x1b\x28\x42\x5c", 8,
+    encodings.enc_iso_2022_jp(), "\xc2\xa5\x5c"));
+}
+
+test "iso-2022-jp decodes double-byte mode" {
+    assert(decodes_to("\x1b\x24\x42\x46\x7c\x1b\x28\x42", 8,
+    encodings.enc_iso_2022_jp(), "\xe6\x97\xa5"));
+}
+
+// --- The miscellaneous encodings (§11.2, §11.3) ------------------------------
+
+test "x-user-defined maps high bytes into the private use area" {
+    assert(decodes_to("\xe9", 1, encodings.enc_x_user_defined(),
+    "\xef\x9f\xa9"));
+}
+
+test "replacement decodes a whole stream to one replacement character" {
+    assert(decodes_to("anything at all", 15, encodings.enc_replacement(),
+    "\xef\xbf\xbd"));
+}
+
+// --- Sniffing (§13.2.3.2) ----------------------------------------------------
+
+test "a utf-8 bom is authoritative and is consumed" {
+    assert(sniffs_to("\xef\xbb\xbfhi", 5, "hi"));
+}
+
+test "a utf-16 bom is authoritative" {
+    assert(sniffs_to("\xff\xfeh\x00i\x00", 6, "hi"));
+    assert(sniffs_to("\xfe\xff\x00h\x00i", 6, "hi"));
+}
+
+test "with no declaration at all, windows-1252 is the guess" {
+    assert(sniffs_to("caf\xe9", 4, "caf\xc3\xa9"));
+}
+
+test "a meta charset is found by the prescan" {
+    assert(sniffs_to("<meta charset=\"iso-8859-5\">\xc0", 28,
+    "<meta charset=\"iso-8859-5\">\xd0\xa0"));
+}
+
+test "a meta http-equiv content-type is found too" {
+    assert(sniffs_to(
+    "<meta http-equiv=content-type content='text/html; charset=koi8-r'>\xd0",
+    67,
+    "<meta http-equiv=content-type content='text/html; charset=koi8-r'>\xd0\xbf"));
+}
+
+test "a content attribute without the pragma is ignored" {
+    // §13.2.3.2: the charset in a `content` attribute only counts when an
+    // http-equiv marks the element as a Content-Type pragma.
+    assert(sniffs_to("<meta content='text/html; charset=koi8-r'>\xd0", 43,
+    "<meta content='text/html; charset=koi8-r'>\xc3\x90"));
+}
+
+test "the prescan skips comments" {
+    assert(sniffs_to("<!-- <meta charset=big5> --><meta charset=koi8-r>\xd0", 50,
+    "<!-- <meta charset=big5> --><meta charset=koi8-r>\xd0\xbf"));
+}
+
+test "a meta declaring utf-16 is treated as utf-8" {
+    // A document whose bytes spell out `<meta charset=utf-16>` in ASCII
+    // cannot be UTF-16, so §13.2.3.3 overrides the declaration.
+    assert(sniffs_to("<meta charset=utf-16>\xc3\xa9", 23,
+    "<meta charset=utf-16>\xc3\xa9"));
+}
+
+test "the prescan stops after 1024 bytes" {
+    // A meta past the limit is not found, so the fallback stands. The padding
+    // is a comment long enough to push the meta out of range.
+    let padded: Vec<u8> = vec.new<u8>();
+    let opening: *u8 = "<!--";
+    for index: u64 in 0..4 {
+        vec.push(&padded, opening[index]);
+    }
+    for index: u64 in 0..1100 {
+        vec.push(&padded, 'x' as u8);
+    }
+    let rest: *u8 = "--><meta charset=koi8-r>\xd0";
+    for index: u64 in 0..str_len(rest) {
+        vec.push(&padded, rest[index]);
+    }
+    let out: Vec<u8> =
+    decode.sniff_and_decode(padded.data as *const u8, padded.length);
+    // windows-1252 would render the trailing 0xD0 as U+00D0, two UTF-8 bytes;
+    // koi8-r would render it as U+043F, also two bytes — so compare the last
+    // two bytes rather than the length.
+    let tail_a: u8 = out.data[out.length - 2];
+    let tail_b: u8 = out.data[out.length - 1];
+    assert(tail_a == 0xC3 as u8 && tail_b == 0x90 as u8);
+    vec.destroy(&out);
+    vec.destroy(&padded);
+}

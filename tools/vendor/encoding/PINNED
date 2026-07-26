@@ -1,0 +1,12 @@
+Vendored from https://encoding.spec.whatwg.org/
+files:  encodings.json  (§4.2, the label table)
+        indexes.json    (§5, the index tables)
+date:   fetched 2026-07-27
+
+These are the Encoding Standard's own published tables, served from the spec
+itself rather than from a mirror, so there is no commit to pin — the fetch date
+is the version. Both are regenerated into engine/src/html/encodings.mx by
+tools/gen_encodings.py; nothing reads the JSON at run time.
+
+Refresh by re-downloading both files and re-running the generator in the same
+change, so the table and its source never drift apart.

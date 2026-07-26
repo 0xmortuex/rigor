@@ -1,0 +1,1182 @@
+// The input byte stream — WHATWG HTML §13.2.3, and the decoders the WHATWG
+// Encoding Standard defines for what it finds.
+//
+// A document arrives as bytes. Before the tokenizer can see characters,
+// something has to decide which encoding those bytes are in, and turn them
+// into one. §13.2.3.2 "determining the character encoding" is that decision:
+//
+//   1. a byte order mark, which is authoritative
+//   2. a transport-layer declaration (an HTTP Content-Type charset)
+//   3. a prescan of the first 1024 bytes for a <meta> that declares one
+//   4. failing all of that, an implementation-defined guess — which for rigor
+//      is windows-1252, the guess every browser makes, because a page with no
+//      declaration is overwhelmingly likely to be legacy Western European
+//
+// rigor decodes everything to UTF-8 and hands that to the preprocessor, so the
+// rest of the engine only ever sees UTF-8 — which is why HtmlTokenizer can
+// treat a byte over 0x7F as an opaque continuation.
+//
+// Every decoder here is the Encoding Standard's, error handling included: a
+// malformed sequence produces U+FFFD and the decoder carries on at the right
+// place, which is what stops one bad byte from shifting the rest of a page.
+module engine.html.decode;
+
+import std.vec;
+import engine.html.encodings;
+
+// --- UTF-8 output ------------------------------------------------------------
+
+pub fn push_utf8(out: *Vec<u8>, cp: u32) -> void {
+    if cp < 0x80 as u32 {
+        vec.push(out, cp as u8);
+        return;
+    }
+    if cp < 0x800 as u32 {
+        vec.push(out, (0xC0 as u32 | (cp >> 6)) as u8);
+        vec.push(out, (0x80 as u32 | (cp & (0x3F as u32))) as u8);
+        return;
+    }
+    if cp < 0x10000 as u32 {
+        vec.push(out, (0xE0 as u32 | (cp >> 12)) as u8);
+        vec.push(out, (0x80 as u32 | ((cp >> 6) & (0x3F as u32))) as u8);
+        vec.push(out, (0x80 as u32 | (cp & (0x3F as u32))) as u8);
+        return;
+    }
+    vec.push(out, (0xF0 as u32 | (cp >> 18)) as u8);
+    vec.push(out, (0x80 as u32 | ((cp >> 12) & (0x3F as u32))) as u8);
+    vec.push(out, (0x80 as u32 | ((cp >> 6) & (0x3F as u32))) as u8);
+    vec.push(out, (0x80 as u32 | (cp & (0x3F as u32))) as u8);
+}
+
+fn push_replacement(out: *Vec<u8>) -> void {
+    push_utf8(out, 0xFFFD as u32);
+}
+
+// --- Encoding sniffing (§13.2.3.2) -------------------------------------------
+
+// What the sniffing algorithm decided, and how confident it is. `certain` is
+// the spec's confidence flag: a BOM or a transport declaration is certain, a
+// prescan or the fallback is tentative, and only a tentative encoding may be
+// overridden by a late <meta> during parsing.
+struct SniffResult {
+    encoding: u32,
+    certain: bool,
+    // Bytes of BOM to skip before decoding.
+    bom_length: u64,
+}
+
+// §13.2.3.3 step 1: a byte order mark names the encoding outright and is not
+// part of the content.
+fn sniff_bom(input: *const u8, length: u64) -> SniffResult {
+    if length >= 3 && input[0] == 0xEF as u8 && input[1] == 0xBB as u8
+        && input[2] == 0xBF as u8 {
+        return SniffResult {
+            encoding: encodings.enc_utf_8(), certain: true, bom_length: 3,
+        };
+    }
+    if length >= 2 && input[0] == 0xFE as u8 && input[1] == 0xFF as u8 {
+        return SniffResult {
+            encoding: encodings.enc_utf_16be(), certain: true, bom_length: 2,
+        };
+    }
+    if length >= 2 && input[0] == 0xFF as u8 && input[1] == 0xFE as u8 {
+        return SniffResult {
+            encoding: encodings.enc_utf_16le(), certain: true, bom_length: 2,
+        };
+    }
+    return SniffResult {
+        encoding: 0 as u32, certain: false, bom_length: 0,
+    };
+}
+
+fn ascii_lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32 as u8;
+    }
+    return c;
+}
+
+fn is_ws(c: u8) -> bool {
+    return c == 9 as u8 || c == 10 as u8 || c == 12 as u8
+        || c == 13 as u8 || c == 32 as u8;
+}
+
+fn is_alpha(c: u8) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+// Case-insensitive match of `text` at `pos`.
+fn matches_at(input: *const u8, length: u64, pos: u64, text: *u8) -> bool {
+    let index: u64 = 0;
+    while text[index] != 0 as u8 {
+        if pos + index >= length {
+            return false;
+        }
+        if ascii_lower(input[pos + index]) != ascii_lower(text[index]) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+// One attribute found by the prescan's "get an attribute" step. `ok` is false
+// when there are no more attributes before the end of the tag.
+struct PrescanAttr {
+    ok: bool,
+    name_off: u64,
+    name_len: u64,
+    value_off: u64,
+    value_len: u64,
+    next: u64,
+}
+
+fn no_attr(next: u64) -> PrescanAttr {
+    return PrescanAttr {
+        ok: false, name_off: 0, name_len: 0, value_off: 0, value_len: 0,
+        next: next,
+    };
+}
+
+// §13.2.3.2 "get an attribute". Names are compared lowercased by the caller;
+// values are returned as raw ranges. This is deliberately not the tokenizer's
+// attribute parsing: the prescan runs on undecoded bytes, before there is a
+// tokenizer at all.
+fn get_attribute(input: *const u8, length: u64, start: u64) -> PrescanAttr {
+    let pos: u64 = start;
+    while pos < length && (is_ws(input[pos]) || input[pos] == '/') {
+        pos = pos + 1;
+    }
+    if pos >= length {
+        return no_attr(pos);
+    }
+    if input[pos] == '>' {
+        return no_attr(pos);
+    }
+    let name_off: u64 = pos;
+    loop {
+        if pos >= length {
+            return no_attr(pos);
+        }
+        let c: u8 = input[pos];
+        if c == '=' && pos > name_off {
+            break;
+        }
+        if is_ws(c) {
+            break;
+        }
+        if c == '/' || c == '>' {
+            return PrescanAttr {
+                ok: true, name_off: name_off, name_len: pos - name_off,
+                value_off: 0, value_len: 0, next: pos,
+            };
+        }
+        pos = pos + 1;
+    }
+    let name_len: u64 = pos - name_off;
+    while pos < length && is_ws(input[pos]) {
+        pos = pos + 1;
+    }
+    if pos >= length || input[pos] != '=' {
+        // An attribute with no value.
+        return PrescanAttr {
+            ok: true, name_off: name_off, name_len: name_len,
+            value_off: 0, value_len: 0, next: pos,
+        };
+    }
+    pos = pos + 1;
+    while pos < length && is_ws(input[pos]) {
+        pos = pos + 1;
+    }
+    if pos >= length {
+        return no_attr(pos);
+    }
+    let quote: u8 = input[pos];
+    if quote == '"' || quote == 39 as u8 {
+        pos = pos + 1;
+        let value_off: u64 = pos;
+        while pos < length && input[pos] != quote {
+            pos = pos + 1;
+        }
+        return PrescanAttr {
+            ok: true, name_off: name_off, name_len: name_len,
+            value_off: value_off, value_len: pos - value_off, next: pos + 1,
+        };
+    }
+    if quote == '>' {
+        return PrescanAttr {
+            ok: true, name_off: name_off, name_len: name_len,
+            value_off: 0, value_len: 0, next: pos,
+        };
+    }
+    let value_off: u64 = pos;
+    while pos < length && !is_ws(input[pos]) && input[pos] != '>' {
+        pos = pos + 1;
+    }
+    return PrescanAttr {
+        ok: true, name_off: name_off, name_len: name_len,
+        value_off: value_off, value_len: pos - value_off, next: pos,
+    };
+}
+
+fn name_is(input: *const u8, attr: PrescanAttr, text: *u8) -> bool {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if attr.name_len != length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        if ascii_lower(input[attr.name_off + index]) != text[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn value_is(input: *const u8, attr: PrescanAttr, text: *u8) -> bool {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if attr.value_len != length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        if ascii_lower(input[attr.value_off + index]) != text[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// §13.2.3.3 "extract a character encoding from a meta element": find
+// "charset", skip to its value, and read the label. Returns a zero length when
+// there is none.
+struct MetaCharset {
+    found: bool,
+    off: u64,
+    length: u64,
+}
+
+fn extract_charset(input: *const u8, start: u64, limit: u64) -> MetaCharset {
+    let pos: u64 = start;
+    loop {
+        // Find "charset" followed by optional space and an "=".
+        loop {
+            if pos + 7 > limit {
+                return MetaCharset { found: false, off: 0, length: 0 };
+            }
+            if matches_at(input, limit, pos, "charset") {
+                break;
+            }
+            pos = pos + 1;
+        }
+        pos = pos + 7;
+        while pos < limit && is_ws(input[pos]) {
+            pos = pos + 1;
+        }
+        if pos < limit && input[pos] == '=' {
+            pos = pos + 1;
+            break;
+        }
+    }
+    while pos < limit && is_ws(input[pos]) {
+        pos = pos + 1;
+    }
+    if pos >= limit {
+        return MetaCharset { found: false, off: 0, length: 0 };
+    }
+    let quote: u8 = input[pos];
+    if quote == '"' || quote == 39 as u8 {
+        pos = pos + 1;
+        let value_off: u64 = pos;
+        while pos < limit && input[pos] != quote {
+            pos = pos + 1;
+        }
+        if pos >= limit {
+            return MetaCharset { found: false, off: 0, length: 0 };
+        }
+        return MetaCharset {
+            found: true, off: value_off, length: pos - value_off,
+        };
+    }
+    let value_off: u64 = pos;
+    while pos < limit && !is_ws(input[pos]) && input[pos] != ';' {
+        pos = pos + 1;
+    }
+    if pos == value_off {
+        return MetaCharset { found: false, off: 0, length: 0 };
+    }
+    return MetaCharset { found: true, off: value_off, length: pos - value_off };
+}
+
+fn view_at(input: *const u8, off: u64, length: u64) -> []const u8 {
+    if length == 0 {
+        return slice(0 as *const u8, 0);
+    }
+    return slice((&input[off]) as *const u8, length);
+}
+
+// A <meta> the prescan reached. Returns the encoding it declares, or found
+// false when the element declares nothing usable.
+fn scan_meta(input: *const u8, limit: u64, start: u64, next: *u64) -> EncodingLookup {
+    let pos: u64 = start;
+    let got_pragma: bool = false;
+    // 0 = no declaration yet, 1 = needs a pragma, 2 = does not.
+    let need_pragma: u64 = 0;
+    let charset: EncodingLookup = EncodingLookup { found: false, id: 0 as u32 };
+    // The spec keeps a list of seen attribute names so a repeated one is
+    // ignored; only these three matter, so three flags say the same thing.
+    let seen_http_equiv: bool = false;
+    let seen_content: bool = false;
+    let seen_charset: bool = false;
+
+    loop {
+        let attr: PrescanAttr = get_attribute(input, limit, pos);
+        pos = attr.next;
+        if !attr.ok {
+            break;
+        }
+        if name_is(input, attr, "http-equiv") {
+            if !seen_http_equiv {
+                seen_http_equiv = true;
+                if value_is(input, attr, "content-type") {
+                    got_pragma = true;
+                }
+            }
+        } else if name_is(input, attr, "content") {
+            if !seen_content {
+                seen_content = true;
+                let meta: MetaCharset = extract_charset(input,
+                    attr.value_off, attr.value_off + attr.value_len);
+                if meta.found && !charset.found {
+                    charset = encodings.lookup_label(
+                        view_at(input, meta.off, meta.length));
+                    if charset.found {
+                        need_pragma = 1;
+                    }
+                }
+            }
+        } else if name_is(input, attr, "charset") {
+            if !seen_charset {
+                seen_charset = true;
+                charset = encodings.lookup_label(
+                    view_at(input, attr.value_off, attr.value_len));
+                need_pragma = 2;
+            }
+        }
+    }
+    (*next) = pos;
+
+    if need_pragma == 0 {
+        return EncodingLookup { found: false, id: 0 as u32 };
+    }
+    if need_pragma == 1 && !got_pragma {
+        return EncodingLookup { found: false, id: 0 as u32 };
+    }
+    if !charset.found {
+        return EncodingLookup { found: false, id: 0 as u32 };
+    }
+    // §13.2.3.3: a document that declares UTF-16 in ASCII-compatible bytes
+    // cannot really be UTF-16, and x-user-defined would hide the content.
+    if charset.id == encodings.enc_utf_16be()
+        || charset.id == encodings.enc_utf_16le() {
+        return EncodingLookup { found: true, id: encodings.enc_utf_8() };
+    }
+    if charset.id == encodings.enc_x_user_defined() {
+        return EncodingLookup { found: true, id: encodings.enc_windows_1252() };
+    }
+    return charset;
+}
+
+// Skip a tag whose name has already been recognised: past the name, then
+// through its attributes.
+fn skip_tag(input: *const u8, limit: u64, start: u64) -> u64 {
+    let pos: u64 = start;
+    while pos < limit && !is_ws(input[pos]) && input[pos] != '>' {
+        pos = pos + 1;
+    }
+    loop {
+        let attr: PrescanAttr = get_attribute(input, limit, pos);
+        pos = attr.next;
+        if !attr.ok {
+            return pos;
+        }
+    }
+}
+
+// §13.2.3.2 "prescan a byte stream to determine its encoding". Only the first
+// 1024 bytes are examined, which is what makes this cheap enough to run on
+// every document before parsing it.
+pub fn prescan(input: *const u8, length: u64) -> EncodingLookup {
+    let limit: u64 = length;
+    if limit > 1024 {
+        limit = 1024;
+    }
+    let pos: u64 = 0;
+    while pos < limit {
+        if matches_at(input, limit, pos, "<!--") {
+            // Comments are skipped whole; the "-->" may overlap the "<!--" by
+            // two bytes, so the search starts two bytes in.
+            pos = pos + 2;
+            while pos < limit && !matches_at(input, limit, pos, "-->") {
+                pos = pos + 1;
+            }
+            pos = pos + 3;
+            continue;
+        }
+        if matches_at(input, limit, pos, "<meta")
+            && pos + 5 < limit
+            && (is_ws(input[pos + 5]) || input[pos + 5] == '/') {
+            let next: u64 = pos + 5;
+            let found: EncodingLookup = scan_meta(input, limit, pos + 5, &next);
+            if found.found {
+                return found;
+            }
+            pos = next;
+            continue;
+        }
+        if pos + 1 < limit && input[pos] == '<' {
+            let after: u64 = pos + 1;
+            let closing: bool = input[after] == '/';
+            if closing {
+                after = after + 1;
+            }
+            if after < limit && is_alpha(input[after]) {
+                pos = skip_tag(input, limit, after);
+                continue;
+            }
+            let c: u8 = input[after];
+            if c == '!' || c == '/' || c == '?' {
+                while pos < limit && input[pos] != '>' {
+                    pos = pos + 1;
+                }
+                pos = pos + 1;
+                continue;
+            }
+        }
+        pos = pos + 1;
+    }
+    return EncodingLookup { found: false, id: 0 as u32 };
+}
+
+// The whole of §13.2.3.2 for a document with no transport-layer declaration.
+pub fn sniff(input: *const u8, length: u64) -> SniffResult {
+    let bom: SniffResult = sniff_bom(input, length);
+    if bom.bom_length > 0 {
+        return bom;
+    }
+    let meta: EncodingLookup = prescan(input, length);
+    if meta.found {
+        return SniffResult {
+            encoding: meta.id, certain: false, bom_length: 0,
+        };
+    }
+    // The fallback. Every major browser guesses a locale-dependent legacy
+    // encoding here; windows-1252 is the one for a Western European locale and
+    // the one the standard's own "if all else fails" example names.
+    return SniffResult {
+        encoding: encodings.enc_windows_1252(), certain: false, bom_length: 0,
+    };
+}
+
+// The same, honouring a transport-layer charset when there is one — which
+// outranks the prescan but not a BOM (§13.2.3.2 steps 1 and 3).
+pub fn sniff_with_transport(
+    input: *const u8,
+    length: u64,
+    transport: []const u8
+) -> SniffResult {
+    let bom: SniffResult = sniff_bom(input, length);
+    if bom.bom_length > 0 {
+        return bom;
+    }
+    if len(transport) > 0 {
+        let declared: EncodingLookup = encodings.lookup_label(transport);
+        if declared.found {
+            return SniffResult {
+                encoding: declared.id, certain: true, bom_length: 0,
+            };
+        }
+    }
+    return sniff(input, length);
+}
+
+// --- Decoders ----------------------------------------------------------------
+
+// §4.2: the UTF-8 decoder, with the standard's error handling — a malformed
+// sequence becomes one U+FFFD and decoding resumes at the byte that broke it,
+// rather than consuming it.
+fn decode_utf8(input: *const u8, length: u64, out: *Vec<u8>) -> void {
+    let pos: u64 = 0;
+    while pos < length {
+        let lead: u8 = input[pos];
+        if lead < 0x80 as u8 {
+            vec.push(out, lead);
+            pos = pos + 1;
+            continue;
+        }
+        let needed: u64 = 0;
+        let cp: u32 = 0 as u32;
+        let lower: u8 = 0x80 as u8;
+        let upper: u8 = 0xBF as u8;
+        if lead >= 0xC2 as u8 && lead <= 0xDF as u8 {
+            needed = 1;
+            cp = (lead & (0x1F as u8)) as u32;
+        } else if lead >= 0xE0 as u8 && lead <= 0xEF as u8 {
+            needed = 2;
+            cp = (lead & (0x0F as u8)) as u32;
+            if lead == 0xE0 as u8 { lower = 0xA0 as u8; }
+            if lead == 0xED as u8 { upper = 0x9F as u8; }
+        } else if lead >= 0xF0 as u8 && lead <= 0xF4 as u8 {
+            needed = 3;
+            cp = (lead & (0x07 as u8)) as u32;
+            if lead == 0xF0 as u8 { lower = 0x90 as u8; }
+            if lead == 0xF4 as u8 { upper = 0x8F as u8; }
+        } else {
+            push_replacement(out);
+            pos = pos + 1;
+            continue;
+        }
+        let index: u64 = 1;
+        let ok: bool = true;
+        while index <= needed {
+            if pos + index >= length {
+                ok = false;
+                break;
+            }
+            let cont: u8 = input[pos + index];
+            if cont < lower || cont > upper {
+                ok = false;
+                break;
+            }
+            cp = (cp << 6) | ((cont & (0x3F as u8)) as u32);
+            // Only the first continuation byte has a restricted range.
+            lower = 0x80 as u8;
+            upper = 0xBF as u8;
+            index = index + 1;
+        }
+        if !ok {
+            push_replacement(out);
+            // Resume at the byte that failed, so a truncated sequence does not
+            // swallow the character after it.
+            pos = pos + index;
+            continue;
+        }
+        push_utf8(out, cp);
+        pos = pos + needed + 1;
+    }
+}
+
+// §9.1 "single-byte decoder".
+fn decode_single_byte(
+    input: *const u8,
+    length: u64,
+    id: u32,
+    out: *Vec<u8>
+) -> void {
+    for pos: u64 in 0..length {
+        let cp: u32 = encodings.single_byte(id, input[pos]);
+        if cp == 0 as u32 && input[pos] != 0 as u8 {
+            push_replacement(out);
+        } else {
+            push_utf8(out, cp);
+        }
+    }
+}
+
+// §11.3.1: the bytes above 0x7F map into a private use area, so a document in
+// an encoding rigor has no table for still round-trips.
+fn decode_x_user_defined(input: *const u8, length: u64, out: *Vec<u8>) -> void {
+    for pos: u64 in 0..length {
+        let byte: u8 = input[pos];
+        if byte < 0x80 as u8 {
+            vec.push(out, byte);
+        } else {
+            push_utf8(out, (0xF780 as u32) + ((byte as u32) - (0x80 as u32)));
+        }
+    }
+}
+
+// §11.1.1 / §11.1.2: UTF-16, with the surrogate pairing the format needs.
+fn decode_utf16(
+    input: *const u8,
+    length: u64,
+    big_endian: bool,
+    out: *Vec<u8>
+) -> void {
+    let pos: u64 = 0;
+    let lead: u32 = 0 as u32;
+    let have_lead: bool = false;
+    while pos + 1 < length {
+        let unit: u32 = 0 as u32;
+        if big_endian {
+            unit = ((input[pos] as u32) << 8) | (input[pos + 1] as u32);
+        } else {
+            unit = ((input[pos + 1] as u32) << 8) | (input[pos] as u32);
+        }
+        pos = pos + 2;
+        if have_lead {
+            if unit >= 0xDC00 as u32 && unit <= 0xDFFF as u32 {
+                push_utf8(out, (0x10000 as u32)
+                    + ((lead - (0xD800 as u32)) << 10)
+                    + (unit - (0xDC00 as u32)));
+                have_lead = false;
+                continue;
+            }
+            // A lead with no trail: report it and reprocess this unit.
+            push_replacement(out);
+            have_lead = false;
+            pos = pos - 2;
+            continue;
+        }
+        if unit >= 0xD800 as u32 && unit <= 0xDBFF as u32 {
+            lead = unit;
+            have_lead = true;
+            continue;
+        }
+        if unit >= 0xDC00 as u32 && unit <= 0xDFFF as u32 {
+            // A trail with no lead.
+            push_replacement(out);
+            continue;
+        }
+        push_utf8(out, unit);
+    }
+    if have_lead || pos < length {
+        // A dangling lead surrogate, or an odd trailing byte.
+        push_replacement(out);
+    }
+}
+
+// §10.1.1 "gb18030 decoder". GBK shares it: the two differ only in encoding.
+fn decode_gb18030(input: *const u8, length: u64, out: *Vec<u8>) -> void {
+    let pos: u64 = 0;
+    let first: u32 = 0 as u32;
+    let second: u32 = 0 as u32;
+    let third: u32 = 0 as u32;
+    while pos < length {
+        let byte: u32 = input[pos] as u32;
+        pos = pos + 1;
+        if third != 0 as u32 {
+            if byte < 0x30 as u32 || byte > 0x39 as u32 {
+                push_replacement(out);
+                // The spec prepends second, third and this byte; rewinding
+                // three places re-reads all of them as fresh input.
+                pos = pos - 3;
+                first = 0 as u32;
+                second = 0 as u32;
+                third = 0 as u32;
+                continue;
+            }
+            let pointer: u32 = (first - (0x81 as u32)) * (12600 as u32)
+                + (second - (0x30 as u32)) * (1260 as u32)
+                + (third - (0x81 as u32)) * (10 as u32)
+                + (byte - (0x30 as u32));
+            first = 0 as u32;
+            second = 0 as u32;
+            third = 0 as u32;
+            let cp: u32 = encodings.gb18030_ranges(pointer);
+            if cp == 0 as u32 {
+                push_replacement(out);
+            } else {
+                push_utf8(out, cp);
+            }
+            continue;
+        }
+        if second != 0 as u32 {
+            if byte >= 0x81 as u32 && byte <= 0xFE as u32 {
+                third = byte;
+                continue;
+            }
+            push_replacement(out);
+            pos = pos - 2;
+            first = 0 as u32;
+            second = 0 as u32;
+            continue;
+        }
+        if first != 0 as u32 {
+            if byte >= 0x30 as u32 && byte <= 0x39 as u32 {
+                second = byte;
+                continue;
+            }
+            let lead: u32 = first;
+            first = 0 as u32;
+            let offset: u32 = 0x41 as u32;
+            if byte < 0x7F as u32 {
+                offset = 0x40 as u32;
+            }
+            let cp: u32 = 0 as u32;
+            if (byte >= 0x40 as u32 && byte <= 0x7E as u32)
+                || (byte >= 0x80 as u32 && byte <= 0xFE as u32) {
+                cp = encodings.gb18030(
+                    ((lead - (0x81 as u32)) * (190 as u32)
+                        + (byte - offset)) as u64);
+            }
+            if cp != 0 as u32 {
+                push_utf8(out, cp);
+                continue;
+            }
+            push_replacement(out);
+            if byte < 0x80 as u32 {
+                pos = pos - 1;
+            }
+            continue;
+        }
+        if byte < 0x80 as u32 {
+            vec.push(out, byte as u8);
+            continue;
+        }
+        if byte == 0x80 as u32 {
+            push_utf8(out, 0x20AC as u32);
+            continue;
+        }
+        if byte >= 0x81 as u32 && byte <= 0xFE as u32 {
+            first = byte;
+            continue;
+        }
+        push_replacement(out);
+    }
+    if first != 0 as u32 || second != 0 as u32 || third != 0 as u32 {
+        push_replacement(out);
+    }
+}
+
+// §10.3.1 "Big5 decoder".
+fn decode_big5(input: *const u8, length: u64, out: *Vec<u8>) -> void {
+    let pos: u64 = 0;
+    let lead: u32 = 0 as u32;
+    while pos < length {
+        let byte: u32 = input[pos] as u32;
+        pos = pos + 1;
+        if lead != 0 as u32 {
+            let lead_copy: u32 = lead;
+            lead = 0 as u32;
+            let offset: u32 = 0x62 as u32;
+            if byte < 0x7F as u32 {
+                offset = 0x40 as u32;
+            }
+            let has_pointer: bool =
+                (byte >= 0x40 as u32 && byte <= 0x7E as u32)
+                || (byte >= 0xA1 as u32 && byte <= 0xFE as u32);
+            if has_pointer {
+                let pointer: u32 = (lead_copy - (0x81 as u32)) * (157 as u32)
+                    + (byte - offset);
+                // Four pointers decode to two code points each — the only
+                // place in the standard where one index entry is a pair.
+                if pointer == 1133 as u32 {
+                    push_utf8(out, 0x00CA as u32);
+                    push_utf8(out, 0x0304 as u32);
+                    continue;
+                }
+                if pointer == 1135 as u32 {
+                    push_utf8(out, 0x00CA as u32);
+                    push_utf8(out, 0x030C as u32);
+                    continue;
+                }
+                if pointer == 1164 as u32 {
+                    push_utf8(out, 0x00EA as u32);
+                    push_utf8(out, 0x0304 as u32);
+                    continue;
+                }
+                if pointer == 1166 as u32 {
+                    push_utf8(out, 0x00EA as u32);
+                    push_utf8(out, 0x030C as u32);
+                    continue;
+                }
+                let cp: u32 = encodings.big5(pointer as u64);
+                if cp != 0 as u32 {
+                    push_utf8(out, cp);
+                    continue;
+                }
+            }
+            push_replacement(out);
+            if byte < 0x80 as u32 {
+                pos = pos - 1;
+            }
+            continue;
+        }
+        if byte < 0x80 as u32 {
+            vec.push(out, byte as u8);
+            continue;
+        }
+        if byte >= 0x81 as u32 && byte <= 0xFE as u32 {
+            lead = byte;
+            continue;
+        }
+        push_replacement(out);
+    }
+    if lead != 0 as u32 {
+        push_replacement(out);
+    }
+}
+
+// §10.2.1 "EUC-JP decoder".
+fn decode_euc_jp(input: *const u8, length: u64, out: *Vec<u8>) -> void {
+    let pos: u64 = 0;
+    let lead: u32 = 0 as u32;
+    let is_jis0212: bool = false;
+    while pos < length {
+        let byte: u32 = input[pos] as u32;
+        pos = pos + 1;
+        if lead == 0x8E as u32 && byte >= 0xA1 as u32 && byte <= 0xDF as u32 {
+            lead = 0 as u32;
+            push_utf8(out, (0xFF61 as u32) - (0xA1 as u32) + byte);
+            continue;
+        }
+        if lead == 0x8F as u32 && byte >= 0xA1 as u32 && byte <= 0xFE as u32 {
+            is_jis0212 = true;
+            lead = byte;
+            continue;
+        }
+        if lead != 0 as u32 {
+            let lead_copy: u32 = lead;
+            lead = 0 as u32;
+            let cp: u32 = 0 as u32;
+            if lead_copy >= 0xA1 as u32 && lead_copy <= 0xFE as u32
+                && byte >= 0xA1 as u32 && byte <= 0xFE as u32 {
+                let pointer: u64 = ((lead_copy - (0xA1 as u32)) * (94 as u32)
+                    + byte - (0xA1 as u32)) as u64;
+                if is_jis0212 {
+                    cp = encodings.jis0212(pointer);
+                } else {
+                    cp = encodings.jis0208(pointer);
+                }
+            }
+            is_jis0212 = false;
+            if cp != 0 as u32 {
+                push_utf8(out, cp);
+                continue;
+            }
+            push_replacement(out);
+            if byte < 0xA1 as u32 {
+                pos = pos - 1;
+            }
+            continue;
+        }
+        if byte < 0x80 as u32 {
+            vec.push(out, byte as u8);
+            continue;
+        }
+        if byte == 0x8E as u32 || byte == 0x8F as u32
+            || (byte >= 0xA1 as u32 && byte <= 0xFE as u32) {
+            lead = byte;
+            continue;
+        }
+        push_replacement(out);
+    }
+    if lead != 0 as u32 {
+        push_replacement(out);
+    }
+}
+
+// §10.2.3 "Shift_JIS decoder".
+fn decode_shift_jis(input: *const u8, length: u64, out: *Vec<u8>) -> void {
+    let pos: u64 = 0;
+    let lead: u32 = 0 as u32;
+    while pos < length {
+        let byte: u32 = input[pos] as u32;
+        pos = pos + 1;
+        if lead != 0 as u32 {
+            let lead_copy: u32 = lead;
+            lead = 0 as u32;
+            let offset: u32 = 0x41 as u32;
+            if byte < 0x7F as u32 {
+                offset = 0x40 as u32;
+            }
+            let lead_offset: u32 = 0xC1 as u32;
+            if lead_copy < 0xA0 as u32 {
+                lead_offset = 0x81 as u32;
+            }
+            let has_pointer: bool =
+                (byte >= 0x40 as u32 && byte <= 0x7E as u32)
+                || (byte >= 0x80 as u32 && byte <= 0xFC as u32);
+            if has_pointer {
+                let pointer: u32 = (lead_copy - lead_offset) * (188 as u32)
+                    + byte - offset;
+                // §10.2.3: this range is the interoperable private use area.
+                if pointer >= 8836 as u32 && pointer <= 10715 as u32 {
+                    push_utf8(out, (0xE000 as u32) - (8836 as u32) + pointer);
+                    continue;
+                }
+                let cp: u32 = encodings.jis0208(pointer as u64);
+                if cp != 0 as u32 {
+                    push_utf8(out, cp);
+                    continue;
+                }
+            }
+            push_replacement(out);
+            if byte < 0x80 as u32 {
+                pos = pos - 1;
+            }
+            continue;
+        }
+        if byte < 0x80 as u32 || byte == 0x80 as u32 {
+            vec.push(out, byte as u8);
+            continue;
+        }
+        if byte >= 0xA1 as u32 && byte <= 0xDF as u32 {
+            push_utf8(out, (0xFF61 as u32) - (0xA1 as u32) + byte);
+            continue;
+        }
+        if (byte >= 0x81 as u32 && byte <= 0x9F as u32)
+            || (byte >= 0xE0 as u32 && byte <= 0xFC as u32) {
+            lead = byte;
+            continue;
+        }
+        push_replacement(out);
+    }
+    if lead != 0 as u32 {
+        push_replacement(out);
+    }
+}
+
+// §10.4.1 "EUC-KR decoder".
+fn decode_euc_kr(input: *const u8, length: u64, out: *Vec<u8>) -> void {
+    let pos: u64 = 0;
+    let lead: u32 = 0 as u32;
+    while pos < length {
+        let byte: u32 = input[pos] as u32;
+        pos = pos + 1;
+        if lead != 0 as u32 {
+            let lead_copy: u32 = lead;
+            lead = 0 as u32;
+            let cp: u32 = 0 as u32;
+            if byte >= 0x41 as u32 && byte <= 0xFE as u32 {
+                cp = encodings.euc_kr(
+                    ((lead_copy - (0x81 as u32)) * (190 as u32)
+                        + (byte - (0x41 as u32))) as u64);
+            }
+            if cp != 0 as u32 {
+                push_utf8(out, cp);
+                continue;
+            }
+            push_replacement(out);
+            if byte < 0x80 as u32 {
+                pos = pos - 1;
+            }
+            continue;
+        }
+        if byte < 0x80 as u32 {
+            vec.push(out, byte as u8);
+            continue;
+        }
+        if byte >= 0x81 as u32 && byte <= 0xFE as u32 {
+            lead = byte;
+            continue;
+        }
+        push_replacement(out);
+    }
+    if lead != 0 as u32 {
+        push_replacement(out);
+    }
+}
+
+// §10.2.5 "ISO-2022-JP decoder". The only stateful encoding here: escape
+// sequences switch between ASCII, Roman, katakana and two double-byte modes,
+// and the decoder has to remember which one it is in.
+const JIS_ASCII: u32 = 0;
+const JIS_ROMAN: u32 = 1;
+const JIS_KATAKANA: u32 = 2;
+const JIS_LEAD: u32 = 3;
+const JIS_TRAIL: u32 = 4;
+const JIS_ESCAPE_START: u32 = 5;
+const JIS_ESCAPE: u32 = 6;
+
+fn decode_iso_2022_jp(input: *const u8, length: u64, out: *Vec<u8>) -> void {
+    let state: u32 = JIS_ASCII;
+    let output_state: u32 = JIS_ASCII;
+    let lead: u32 = 0 as u32;
+    let output_flag: bool = false;
+    let pos: u64 = 0;
+    while pos <= length {
+        let at_eof: bool = pos >= length;
+        let byte: u32 = 0 as u32;
+        if !at_eof {
+            byte = input[pos] as u32;
+        }
+        pos = pos + 1;
+
+        if state == JIS_ESCAPE_START {
+            if !at_eof && (byte == 0x24 as u32 || byte == 0x28 as u32) {
+                lead = byte;
+                state = JIS_ESCAPE;
+                continue;
+            }
+            output_flag = false;
+            state = output_state;
+            pos = pos - 1;
+            push_replacement(out);
+            continue;
+        }
+        if state == JIS_ESCAPE {
+            let target: u32 = 99 as u32;
+            if !at_eof {
+                if lead == 0x28 as u32 && byte == 0x42 as u32 {
+                    target = JIS_ASCII;
+                } else if lead == 0x28 as u32 && byte == 0x4A as u32 {
+                    target = JIS_ROMAN;
+                } else if lead == 0x28 as u32 && byte == 0x49 as u32 {
+                    target = JIS_KATAKANA;
+                } else if lead == 0x24 as u32
+                    && (byte == 0x40 as u32 || byte == 0x42 as u32) {
+                    target = JIS_LEAD;
+                }
+            }
+            if target != 99 as u32 {
+                state = target;
+                output_state = target;
+                // Two escape sequences in a row with nothing between them is
+                // an error, which is what the output flag records.
+                if output_flag {
+                    push_replacement(out);
+                }
+                output_flag = true;
+                lead = 0 as u32;
+                continue;
+            }
+            // Not a recognised escape: re-read both bytes as content.
+            pos = pos - 2;
+            if at_eof {
+                pos = pos - 1;
+            }
+            output_flag = false;
+            state = output_state;
+            push_replacement(out);
+            continue;
+        }
+        if at_eof {
+            if state == JIS_TRAIL {
+                push_replacement(out);
+            }
+            return;
+        }
+        if state == JIS_ASCII {
+            if byte == 0x1B as u32 {
+                state = JIS_ESCAPE_START;
+                continue;
+            }
+            output_flag = false;
+            if byte < 0x80 as u32 {
+                vec.push(out, byte as u8);
+            } else {
+                push_replacement(out);
+            }
+            continue;
+        }
+        if state == JIS_ROMAN {
+            if byte == 0x1B as u32 {
+                state = JIS_ESCAPE_START;
+                continue;
+            }
+            output_flag = false;
+            // Roman is ASCII with two substitutions (§10.2.5).
+            if byte == 0x5C as u32 {
+                push_utf8(out, 0x00A5 as u32);
+            } else if byte == 0x7E as u32 {
+                push_utf8(out, 0x203E as u32);
+            } else if byte < 0x80 as u32 {
+                vec.push(out, byte as u8);
+            } else {
+                push_replacement(out);
+            }
+            continue;
+        }
+        if state == JIS_KATAKANA {
+            if byte == 0x1B as u32 {
+                state = JIS_ESCAPE_START;
+                continue;
+            }
+            output_flag = false;
+            if byte >= 0x21 as u32 && byte <= 0x5F as u32 {
+                push_utf8(out, (0xFF61 as u32) - (0x21 as u32) + byte);
+            } else {
+                push_replacement(out);
+            }
+            continue;
+        }
+        if state == JIS_LEAD {
+            if byte == 0x1B as u32 {
+                state = JIS_ESCAPE_START;
+                continue;
+            }
+            output_flag = false;
+            if byte >= 0x21 as u32 && byte <= 0x7E as u32 {
+                lead = byte;
+                state = JIS_TRAIL;
+                continue;
+            }
+            push_replacement(out);
+            continue;
+        }
+        // JIS_TRAIL
+        if byte == 0x1B as u32 {
+            state = JIS_ESCAPE_START;
+            push_replacement(out);
+            continue;
+        }
+        state = JIS_LEAD;
+        if byte >= 0x21 as u32 && byte <= 0x7E as u32 {
+            let cp: u32 = encodings.jis0208(
+                ((lead - (0x21 as u32)) * (94 as u32)
+                    + (byte - (0x21 as u32))) as u64);
+            if cp != 0 as u32 {
+                push_utf8(out, cp);
+                continue;
+            }
+        }
+        push_replacement(out);
+    }
+}
+
+// Decode `length` bytes in `encoding` into a fresh UTF-8 buffer the caller
+// owns. Skipping a BOM is the caller's job, via SniffResult.bom_length.
+pub fn decode(input: *const u8, length: u64, encoding: u32) -> Vec<u8> {
+    let out: Vec<u8> = vec.with_capacity<u8>(length + 1);
+    if encoding == encodings.enc_utf_8() {
+        decode_utf8(input, length, &out);
+    } else if encodings.is_single_byte(encoding) {
+        decode_single_byte(input, length, encoding, &out);
+    } else if encoding == encodings.enc_utf_16be() {
+        decode_utf16(input, length, true, &out);
+    } else if encoding == encodings.enc_utf_16le() {
+        decode_utf16(input, length, false, &out);
+    } else if encoding == encodings.enc_x_user_defined() {
+        decode_x_user_defined(input, length, &out);
+    } else if encoding == encodings.enc_gbk()
+        || encoding == encodings.enc_gb18030() {
+        decode_gb18030(input, length, &out);
+    } else if encoding == encodings.enc_big5() {
+        decode_big5(input, length, &out);
+    } else if encoding == encodings.enc_euc_jp() {
+        decode_euc_jp(input, length, &out);
+    } else if encoding == encodings.enc_shift_jis() {
+        decode_shift_jis(input, length, &out);
+    } else if encoding == encodings.enc_euc_kr() {
+        decode_euc_kr(input, length, &out);
+    } else if encoding == encodings.enc_iso_2022_jp() {
+        decode_iso_2022_jp(input, length, &out);
+    } else {
+        // §11.2.1 "replacement": a whole class of encodings the standard
+        // refuses to decode, because doing so would be a security hazard.
+        // The stream becomes exactly one U+FFFD.
+        push_replacement(&out);
+    }
+    return move out;
+}
+
+// Sniff and decode in one step, which is what a document load does.
+pub fn sniff_and_decode(input: *const u8, length: u64) -> Vec<u8> {
+    let sniffed: SniffResult = sniff(input, length);
+    let start: u64 = sniffed.bom_length;
+    if start > length {
+        start = length;
+    }
+    let body: *const u8 = input;
+    if start > 0 {
+        body = &input[start];
+    }
+    let decoded: Vec<u8> = decode(body, length - start, sniffed.encoding);
+    return move decoded;
+}
