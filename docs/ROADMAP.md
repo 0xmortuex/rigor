@@ -21,13 +21,15 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       and CDATA states
 - [x] Tree construction → DOM (§13.2.6): document-structure modes, "in body",
       text modes, frameset modes, scopes, implied end tags, active formatting
-      elements, adoption agency — **848/1304 (65%)** of the html5lib
-      tree-construction suites
-- [ ] Table insertion modes (in table / in table text / in caption / in column
-      group / in table body / in row / in cell) with foster parenting — the
-      single biggest remaining conformance win
-- [ ] Foreign content: SVG and MathML integration points, CDATA sections
-- [ ] `select`, `template` contents, fragment parsing (`innerHTML`)
+      elements, adoption agency
+- [x] Table insertion modes (in table / in caption / in column group / in
+      table body / in row / in cell) with foster parenting — **1058/1304
+      (81%)** of the html5lib tree-construction suites
+- [ ] Foreign content: SVG and MathML integration points, CDATA sections, and
+      the script-data tokenizer states — the biggest remaining conformance win
+      (tests9–tests12 and tests21, ~120 cases)
+- [ ] `select` insertion modes, `template` contents, fragment parsing
+      (`innerHTML`)
 - [ ] CSS tokenizer + parser (css-syntax-3), selectors (selectors-4 subset)
 - [ ] Style cascade: matching, specificity, inheritance, computed values
 - [ ] Layout: block + inline formatting, box model

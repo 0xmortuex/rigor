@@ -10,7 +10,7 @@ specification it cites, error recovery included, and progress is measured in
 passing conformance tests, not vibes.
 
 > **Status: pre-alpha.** HTML parses end to end — tokenizer at 100% and tree
-> construction at 65% of the html5lib conformance suites. CSS, layout and
+> construction at 81% of the html5lib conformance suites. CSS, layout and
 > paint are roadmap. See [docs/ROADMAP.md](docs/ROADMAP.md) for the honest
 > ledger.
 
@@ -35,18 +35,19 @@ formatting markup.
 ### Tree construction
 
 `python tools/run_tree_conformance.py` against the html5lib-tests
-tree-construction suites: **848/1304 (65%)**, 26 skipped.
+tree-construction suites: **1058/1304 (81%)**, 26 skipped.
 
-Everything below is the current shape of the gap, and it is concentrated
-exactly where the unimplemented modes are — the table mode family, foreign
-content (SVG/MathML), select, and template contents:
+The remaining gap is concentrated in features that are not implemented yet,
+and the driver prints the per-suite numbers so it stays visible:
 
-| suite | passing | |
+| suite | passing | what it covers |
 | --- | ---: | --- |
 | blocks, comments01, doctype01, entities01/02 | 100% | core parsing |
-| adoption01/02 | 15/19 | misnested formatting |
-| tests1–tests5, tests19–tests25 | 78–100% | general |
-| tables01, tests9–tests12, tests21 | 0–8% | tables, foreign content, CDATA |
+| tables01, tests6–tests8 | 94–100% | tables and foster parenting |
+| adoption01/02 | 16/19 | misnested formatting |
+| tests1–tests5, tests14–tests25 | 73–100% | general |
+| tests9–tests12 | 0–7% | **foreign content (SVG/MathML)** |
+| tests21 | 4% | **CDATA sections** |
 
 ### Tokenizer
 
@@ -85,9 +86,9 @@ by the tree builder). The harness prints the skip count on every run.
   (`unexpected-null-character`, `abrupt-doctype-public-identifier`, …) plus a
   byte offset.
 - **Tree construction** (§13.2.6): the document-structure insertion modes,
-  "in body", raw-text/RCDATA handling, the frameset modes, the scope
-  algorithms, implied end tags, active formatting elements, and the adoption
-  agency algorithm.
+  "in body", raw-text/RCDATA handling, the full table mode family with foster
+  parenting, the frameset modes, the scope algorithms, implied end tags,
+  active formatting elements, and the adoption agency algorithm.
 - **DOM**: a flat-arena tree with elements, text, comments, doctypes and
   attributes, plus a serializer that emits the html5lib tree format.
 - **`rigor` CLI**: pipe HTML in, get the token stream and the parsed tree out.

@@ -160,6 +160,38 @@ test "a newline immediately after pre is dropped" {
     "| <html>\n|   <head>\n|   <body>\n|     <pre>\n|       \"x\"\n"));
 }
 
+test "table rows get an implied tbody" {
+    assert(tree_is("<table><tr><td>a</table>",
+    "| <html>\n|   <head>\n|   <body>\n|     <table>\n|       <tbody>\n|         <tr>\n|           <td>\n|             \"a\"\n"));
+}
+
+test "explicit table sections are kept" {
+    assert(tree_is("<table><thead><tr><th>h</table>",
+    "| <html>\n|   <head>\n|   <body>\n|     <table>\n|       <thead>\n|         <tr>\n|           <th>\n|             \"h\"\n"));
+}
+
+test "text inside a table is foster parented before it" {
+    // Stray character data cannot live in a table, so it is placed
+    // immediately before the table rather than dropped.
+    assert(tree_is("<table>stray<tr><td>a</table>",
+    "| <html>\n|   <head>\n|   <body>\n|     \"stray\"\n|     <table>\n|       <tbody>\n|         <tr>\n|           <td>\n|             \"a\"\n"));
+}
+
+test "a nested table start tag closes the outer table" {
+    assert(tree_is("<table><tr><td>a<table><tr><td>b",
+    "| <html>\n|   <head>\n|   <body>\n|     <table>\n|       <tbody>\n|         <tr>\n|           <td>\n|             \"a\"\n|             <table>\n|               <tbody>\n|                 <tr>\n|                   <td>\n|                     \"b\"\n"));
+}
+
+test "caption content stays inside the caption" {
+    assert(tree_is("<table><caption>c</caption><tr><td>a</table>",
+    "| <html>\n|   <head>\n|   <body>\n|     <table>\n|       <caption>\n|         \"c\"\n|       <tbody>\n|         <tr>\n|           <td>\n|             \"a\"\n"));
+}
+
+test "a document ending inside script still gets a body" {
+    assert(tree_is("<script>a",
+    "| <html>\n|   <head>\n|     <script>\n|       \"a\"\n|   <body>\n"));
+}
+
 test "unknown elements are ordinary elements" {
     assert(tree_is("<my-widget>x</my-widget>",
     "| <html>\n|   <head>\n|   <body>\n|     <my-widget>\n|       \"x\"\n"));

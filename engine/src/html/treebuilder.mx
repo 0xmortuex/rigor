@@ -7,14 +7,15 @@
 //
 // Implemented: the document-structure modes (initial, before html, before
 // head, in head, in head noscript, after head, after body, after after body),
-// "in body", "text", and the frameset modes, plus the scope algorithms,
-// implied end tags, formatting-element reconstruction and adoption. This is
-// the path every ordinary document takes.
+// "in body", "text", the frameset modes, and the table mode family with
+// foster parenting — plus the scope algorithms, implied end tags,
+// formatting-element reconstruction and adoption.
 //
-// Not yet implemented (see docs/ROADMAP.md): the table mode family, select,
-// template, and foreign content (SVG/MathML). Tokens that would enter those
-// modes are handled by "in body" instead, which is wrong for table markup but
-// keeps the parser total; conformance/ reports exactly what that costs.
+// Not yet implemented (see docs/ROADMAP.md): foreign content (SVG/MathML and
+// its integration points), CDATA sections, `select`, template contents, and
+// fragment parsing. Tokens that would enter those modes are handled by "in
+// body" instead, which keeps the parser total; conformance/ reports exactly
+// what that costs.
 module engine.html.treebuilder;
 
 import std.vec;
@@ -38,6 +39,12 @@ const MODE_IN_FRAMESET: u32 = 10;
 const MODE_AFTER_FRAMESET: u32 = 11;
 const MODE_AFTER_AFTER_BODY: u32 = 12;
 const MODE_AFTER_AFTER_FRAMESET: u32 = 13;
+const MODE_IN_TABLE: u32 = 14;
+const MODE_IN_CAPTION: u32 = 15;
+const MODE_IN_COLUMN_GROUP: u32 = 16;
+const MODE_IN_TABLE_BODY: u32 = 17;
+const MODE_IN_ROW: u32 = 18;
+const MODE_IN_CELL: u32 = 19;
 
 // Tokenizer states the tree builder switches into for text content.
 const TEXT_NONE: u32 = 0;
@@ -59,6 +66,9 @@ resource struct HtmlTreeBuilder {
     pending_text_state: u32,
     ignore_next_lf: bool,
     stopped: bool,
+    // While set, nodes that would land inside a table go beside it instead
+    // (§13.2.6.1 "foster parenting").
+    foster_parenting: bool,
 }
 
 pub fn new(doc: *DomDocument) -> HtmlTreeBuilder {
@@ -74,6 +84,7 @@ pub fn new(doc: *DomDocument) -> HtmlTreeBuilder {
         pending_text_state: TEXT_NONE,
         ignore_next_lf: false,
         stopped: false,
+        foster_parenting: false,
     };
 }
 
@@ -341,22 +352,90 @@ fn insertion_parent(b: *HtmlTreeBuilder) -> u64 {
     return current(b);
 }
 
+// Where a new node goes. `before` is node.none() for "append to parent",
+// otherwise the sibling to insert in front of.
+struct InsertionPoint {
+    parent: u64,
+    before: u64,
+}
+
+fn is_table_context(tag: u32) -> bool {
+    return tag == tagnames.tag_table() || tag == tagnames.tag_tbody()
+        || tag == tagnames.tag_tfoot() || tag == tagnames.tag_thead()
+        || tag == tagnames.tag_tr();
+}
+
+// §13.2.6.1 "appropriate place for inserting a node". Normally that is simply
+// the end of the current node, but while foster parenting is on and the
+// current node is table-ish, content that has no business inside a table is
+// placed immediately before the table instead — which is how browsers keep
+// stray markup visible rather than swallowed.
+fn appropriate_place(b: *HtmlTreeBuilder) -> InsertionPoint {
+    let target: u64 = insertion_parent(b);
+    if !(*b).foster_parenting || !is_table_context(tag_of(b, target)) {
+        return InsertionPoint { parent: target, before: node.none() };
+    }
+    let table_index: u64 = depth(b);
+    let index: u64 = depth(b);
+    while index > 0 {
+        index = index - 1;
+        if is_html_element(b, at(b, index), tagnames.tag_table()) {
+            table_index = index;
+            index = 0;
+        }
+    }
+    if table_index == depth(b) {
+        // No table on the stack: fall back to the root element.
+        return InsertionPoint { parent: at(b, 0), before: node.none() };
+    }
+    let table: u64 = at(b, table_index);
+    let table_node: DomNode = node.get((*b).doc, table);
+    if table_node.parent != node.none() {
+        return InsertionPoint { parent: table_node.parent, before: table };
+    }
+    // A table that is not yet in the tree: use whatever holds it on the stack.
+    return InsertionPoint { parent: at(b, table_index - 1), before: node.none() };
+}
+
+fn insert_at(b: *HtmlTreeBuilder, point: InsertionPoint, child: u64) -> void {
+    if point.before == node.none() {
+        node.append_child((*b).doc, point.parent, child);
+    } else {
+        node.insert_before((*b).doc, point.before, child);
+    }
+}
+
+// The text node a run should extend, or node.none() when a new one is needed.
+fn text_node_at(b: *HtmlTreeBuilder, point: InsertionPoint) -> u64 {
+    let candidate: u64 = node.none();
+    if point.before == node.none() {
+        let parent_node: DomNode = node.get((*b).doc, point.parent);
+        candidate = parent_node.last_child;
+    } else {
+        let before_node: DomNode = node.get((*b).doc, point.before);
+        candidate = before_node.prev_sibling;
+    }
+    if candidate == node.none() {
+        return node.none();
+    }
+    let candidate_node: DomNode = node.get((*b).doc, candidate);
+    if candidate_node.kind != node.kind_text() {
+        return node.none();
+    }
+    return candidate;
+}
+
 fn insert_text(b: *HtmlTreeBuilder, view: []const u8) -> void {
     if len(view) == 0 {
         return;
     }
-    let parent: u64 = insertion_parent(b);
-    let parent_node: DomNode = node.get((*b).doc, parent);
-    let last: u64 = parent_node.last_child;
-    if last != node.none() {
-        let last_node: DomNode = node.get((*b).doc, last);
-        if last_node.kind == node.kind_text() {
-            node.extend_text((*b).doc, last, view);
-            return;
-        }
+    let point: InsertionPoint = appropriate_place(b);
+    let existing: u64 = text_node_at(b, point);
+    if existing != node.none() {
+        node.extend_text((*b).doc, existing, view);
+        return;
     }
-    let text: u64 = node.create_text((*b).doc, view);
-    node.append_child((*b).doc, parent, text);
+    insert_at(b, point, node.create_text((*b).doc, view));
 }
 
 fn insert_comment_at(b: *HtmlTreeBuilder, parent: u64, view: []const u8) -> void {
@@ -384,7 +463,7 @@ fn element_for_token(
 
 fn insert_element(b: *HtmlTreeBuilder, s: *HtmlTokenSink, token: HtmlToken) -> u64 {
     let element: u64 = element_for_token(b, s, token);
-    node.append_child((*b).doc, insertion_parent(b), element);
+    insert_at(b, appropriate_place(b), element);
     push_open(b, element);
     return element;
 }
@@ -955,7 +1034,573 @@ fn dispatch(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
     else if mode == MODE_IN_FRAMESET { mode_in_frameset(b, s, index); }
     else if mode == MODE_AFTER_FRAMESET { mode_after_frameset(b, s, index); }
     else if mode == MODE_AFTER_AFTER_BODY { mode_after_after_body(b, s, index); }
+    else if mode == MODE_IN_TABLE { mode_in_table(b, s, index); }
+    else if mode == MODE_IN_CAPTION { mode_in_caption(b, s, index); }
+    else if mode == MODE_IN_COLUMN_GROUP { mode_in_column_group(b, s, index); }
+    else if mode == MODE_IN_TABLE_BODY { mode_in_table_body(b, s, index); }
+    else if mode == MODE_IN_ROW { mode_in_row(b, s, index); }
+    else if mode == MODE_IN_CELL { mode_in_cell(b, s, index); }
     else { mode_after_after_frameset(b, s, index); }
+}
+
+// §13.2.6.2 "reset the insertion mode appropriately" — used whenever the
+// parser leaves a table-ish context and has to work out where it now is from
+// the stack of open elements alone.
+fn reset_insertion_mode(b: *HtmlTreeBuilder) -> void {
+    let index: u64 = depth(b);
+    while index > 0 {
+        index = index - 1;
+        let tag: u32 = tag_of(b, at(b, index));
+        let last: bool = index == 0;
+        if tag == tagnames.tag_td() || tag == tagnames.tag_th() {
+            if !last {
+                (*b).mode = MODE_IN_CELL;
+                return;
+            }
+        }
+        if tag == tagnames.tag_tr() {
+            (*b).mode = MODE_IN_ROW;
+            return;
+        }
+        if tag == tagnames.tag_tbody() || tag == tagnames.tag_thead()
+            || tag == tagnames.tag_tfoot() {
+            (*b).mode = MODE_IN_TABLE_BODY;
+            return;
+        }
+        if tag == tagnames.tag_caption() {
+            (*b).mode = MODE_IN_CAPTION;
+            return;
+        }
+        if tag == tagnames.tag_colgroup() {
+            (*b).mode = MODE_IN_COLUMN_GROUP;
+            return;
+        }
+        if tag == tagnames.tag_table() {
+            (*b).mode = MODE_IN_TABLE;
+            return;
+        }
+        if tag == tagnames.tag_head() || tag == tagnames.tag_body() {
+            (*b).mode = MODE_IN_BODY;
+            return;
+        }
+        if tag == tagnames.tag_frameset() {
+            (*b).mode = MODE_IN_FRAMESET;
+            return;
+        }
+        if tag == tagnames.tag_html() {
+            if (*b).head == node.none() {
+                (*b).mode = MODE_BEFORE_HEAD;
+            } else {
+                (*b).mode = MODE_AFTER_HEAD;
+            }
+            return;
+        }
+        if last {
+            (*b).mode = MODE_IN_BODY;
+            return;
+        }
+    }
+    (*b).mode = MODE_IN_BODY;
+}
+
+// "Clear the stack back to a table / table body / table row context"
+// (§13.2.6.4.9–.16): pop until the current node is one of the given anchors.
+fn clear_to_table_context(b: *HtmlTreeBuilder) -> void {
+    loop {
+        let tag: u32 = tag_of(b, current(b));
+        if tag == tagnames.tag_table() || tag == tagnames.tag_html()
+            || tag == tagnames.tag_template() || depth(b) == 0 {
+            break;
+        }
+        pop_open(b);
+    }
+}
+
+fn clear_to_table_body_context(b: *HtmlTreeBuilder) -> void {
+    loop {
+        let tag: u32 = tag_of(b, current(b));
+        if tag == tagnames.tag_tbody() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_thead() || tag == tagnames.tag_html()
+            || tag == tagnames.tag_template() || depth(b) == 0 {
+            break;
+        }
+        pop_open(b);
+    }
+}
+
+fn clear_to_table_row_context(b: *HtmlTreeBuilder) -> void {
+    loop {
+        let tag: u32 = tag_of(b, current(b));
+        if tag == tagnames.tag_tr() || tag == tagnames.tag_html()
+            || tag == tagnames.tag_template() || depth(b) == 0 {
+            break;
+        }
+        pop_open(b);
+    }
+}
+
+// §13.2.6.4.9
+fn mode_in_table(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        // The spec buffers characters in an "in table text" mode to decide
+        // whitespace-only in one go. rigor's tokenizer already coalesces each
+        // maximal run into one token, so the decision can be made directly
+        // and that mode is unnecessary.
+        let view: []const u8 = token_data(s, token);
+        if all_whitespace(view) && is_table_context(tag_of(b, current(b))) {
+            insert_text(b, view);
+            return;
+        }
+        foster_in_body(b, s, index);
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        (*b).stopped = true;
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_caption() {
+            clear_to_table_context(b);
+            push_formatting_marker(b);
+            insert_element(b, s, token);
+            (*b).mode = MODE_IN_CAPTION;
+            return;
+        }
+        if tag == tagnames.tag_colgroup() {
+            clear_to_table_context(b);
+            insert_element(b, s, token);
+            (*b).mode = MODE_IN_COLUMN_GROUP;
+            return;
+        }
+        if tag == tagnames.tag_col() {
+            clear_to_table_context(b);
+            insert_implied(b, "colgroup");
+            (*b).mode = MODE_IN_COLUMN_GROUP;
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_tbody() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_thead() {
+            clear_to_table_context(b);
+            insert_element(b, s, token);
+            (*b).mode = MODE_IN_TABLE_BODY;
+            return;
+        }
+        if tag == tagnames.tag_td() || tag == tagnames.tag_th()
+            || tag == tagnames.tag_tr() {
+            clear_to_table_context(b);
+            insert_implied(b, "tbody");
+            (*b).mode = MODE_IN_TABLE_BODY;
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_table() {
+            // A nested <table> closes the outer one.
+            if !has_element_in_scope(b, tagnames.tag_table(), 3 as u32) {
+                return;
+            }
+            pop_until_tag(b, tagnames.tag_table());
+            reset_insertion_mode(b);
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_style() || tag == tagnames.tag_script()
+            || tag == tagnames.tag_template() {
+            in_head_start_tag(b, s, token, tag);
+            return;
+        }
+        if tag == tagnames.tag_input()
+            && attr_value_is(b, s, token, "type", "hidden") {
+            insert_void_element(b, s, token);
+            return;
+        }
+        if tag == tagnames.tag_form() {
+            if (*b).form == node.none() {
+                (*b).form = insert_element(b, s, token);
+                pop_open(b);
+            }
+            return;
+        }
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_table() {
+            if !has_element_in_scope(b, tagnames.tag_table(), 3 as u32) {
+                return;
+            }
+            pop_until_tag(b, tagnames.tag_table());
+            reset_insertion_mode(b);
+            return;
+        }
+        if tag == tagnames.tag_body() || tag == tagnames.tag_caption()
+            || tag == tagnames.tag_col() || tag == tagnames.tag_colgroup()
+            || tag == tagnames.tag_html() || tag == tagnames.tag_tbody()
+            || tag == tagnames.tag_td() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_th() || tag == tagnames.tag_thead()
+            || tag == tagnames.tag_tr() {
+            return;
+        }
+    }
+    foster_in_body(b, s, index);
+}
+
+// "Anything else" in the table modes: a parse error that is recovered by
+// running the token through "in body" with foster parenting enabled.
+fn foster_in_body(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    (*b).foster_parenting = true;
+    mode_in_body(b, s, index);
+    (*b).foster_parenting = false;
+}
+
+// Insert an element the document implied rather than wrote, e.g. the <tbody>
+// around a bare <tr>.
+fn insert_implied(b: *HtmlTreeBuilder, name: *u8) -> void {
+    let element: u64 =
+        node.create_element((*b).doc, view_of(name), node.ns_html());
+    insert_at(b, appropriate_place(b), element);
+    push_open(b, element);
+}
+
+// §13.2.6.4.11
+fn mode_in_caption(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_caption() {
+            if !has_element_in_scope(b, tagnames.tag_caption(), 3 as u32) {
+                return;
+            }
+            generate_implied_end_tags(b, tagnames.tag_unknown());
+            pop_until_tag(b, tagnames.tag_caption());
+            clear_formatting_to_marker(b);
+            (*b).mode = MODE_IN_TABLE;
+            return;
+        }
+        if tag == tagnames.tag_table() {
+            if !has_element_in_scope(b, tagnames.tag_caption(), 3 as u32) {
+                return;
+            }
+            generate_implied_end_tags(b, tagnames.tag_unknown());
+            pop_until_tag(b, tagnames.tag_caption());
+            clear_formatting_to_marker(b);
+            (*b).mode = MODE_IN_TABLE;
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_body() || tag == tagnames.tag_col()
+            || tag == tagnames.tag_colgroup() || tag == tagnames.tag_html()
+            || tag == tagnames.tag_tbody() || tag == tagnames.tag_td()
+            || tag == tagnames.tag_tfoot() || tag == tagnames.tag_th()
+            || tag == tagnames.tag_thead() || tag == tagnames.tag_tr() {
+            return;
+        }
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_caption() || tag == tagnames.tag_col()
+            || tag == tagnames.tag_colgroup() || tag == tagnames.tag_tbody()
+            || tag == tagnames.tag_td() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_th() || tag == tagnames.tag_thead()
+            || tag == tagnames.tag_tr() {
+            if !has_element_in_scope(b, tagnames.tag_caption(), 3 as u32) {
+                return;
+            }
+            generate_implied_end_tags(b, tagnames.tag_unknown());
+            pop_until_tag(b, tagnames.tag_caption());
+            clear_formatting_to_marker(b);
+            (*b).mode = MODE_IN_TABLE;
+            dispatch(b, s, index);
+            return;
+        }
+    }
+    mode_in_body(b, s, index);
+}
+
+// §13.2.6.4.12
+fn mode_in_column_group(
+    b: *HtmlTreeBuilder,
+    s: *HtmlTokenSink,
+    index: u64
+) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_chars() {
+        let view: []const u8 = token_data(s, token);
+        let ws: u64 = leading_ws(view);
+        if ws > 0 {
+            insert_text(b, head_view(view, ws));
+        }
+        if ws == len(view) {
+            return;
+        }
+        if !is_html_element(b, current(b), tagnames.tag_colgroup()) {
+            return;
+        }
+        pop_open(b);
+        (*b).mode = MODE_IN_TABLE;
+        dispatch_chars_rest(b, s, token, ws);
+        return;
+    }
+    if token.kind == tokens.kind_comment() {
+        insert_comment_at(b, insertion_parent(b), token_data(s, token));
+        return;
+    }
+    if token.kind == tokens.kind_doctype() {
+        return;
+    }
+    if token.kind == tokens.kind_eof() {
+        mode_in_body(b, s, index);
+        return;
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_html() {
+            mode_in_body(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_col() {
+            insert_void_element(b, s, token);
+            return;
+        }
+        if tag == tagnames.tag_template() {
+            in_head_start_tag(b, s, token, tag);
+            return;
+        }
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_colgroup() {
+            if !is_html_element(b, current(b), tagnames.tag_colgroup()) {
+                return;
+            }
+            pop_open(b);
+            (*b).mode = MODE_IN_TABLE;
+            return;
+        }
+        if tag == tagnames.tag_col() {
+            return;
+        }
+    }
+    if !is_html_element(b, current(b), tagnames.tag_colgroup()) {
+        return;
+    }
+    pop_open(b);
+    (*b).mode = MODE_IN_TABLE;
+    dispatch(b, s, index);
+}
+
+// §13.2.6.4.13
+fn mode_in_table_body(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_tr() {
+            clear_to_table_body_context(b);
+            insert_element(b, s, token);
+            (*b).mode = MODE_IN_ROW;
+            return;
+        }
+        if tag == tagnames.tag_th() || tag == tagnames.tag_td() {
+            clear_to_table_body_context(b);
+            insert_implied(b, "tr");
+            (*b).mode = MODE_IN_ROW;
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_caption() || tag == tagnames.tag_col()
+            || tag == tagnames.tag_colgroup() || tag == tagnames.tag_tbody()
+            || tag == tagnames.tag_tfoot() || tag == tagnames.tag_thead() {
+            if !any_table_body_in_table_scope(b) {
+                return;
+            }
+            clear_to_table_body_context(b);
+            pop_open(b);
+            (*b).mode = MODE_IN_TABLE;
+            dispatch(b, s, index);
+            return;
+        }
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_tbody() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_thead() {
+            if !has_element_in_scope(b, tag, 3 as u32) {
+                return;
+            }
+            clear_to_table_body_context(b);
+            pop_open(b);
+            (*b).mode = MODE_IN_TABLE;
+            return;
+        }
+        if tag == tagnames.tag_table() {
+            if !any_table_body_in_table_scope(b) {
+                return;
+            }
+            clear_to_table_body_context(b);
+            pop_open(b);
+            (*b).mode = MODE_IN_TABLE;
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_body() || tag == tagnames.tag_caption()
+            || tag == tagnames.tag_col() || tag == tagnames.tag_colgroup()
+            || tag == tagnames.tag_html() || tag == tagnames.tag_td()
+            || tag == tagnames.tag_th() || tag == tagnames.tag_tr() {
+            return;
+        }
+    }
+    mode_in_table(b, s, index);
+}
+
+fn any_table_body_in_table_scope(b: *HtmlTreeBuilder) -> bool {
+    return has_element_in_scope(b, tagnames.tag_tbody(), 3 as u32)
+        || has_element_in_scope(b, tagnames.tag_thead(), 3 as u32)
+        || has_element_in_scope(b, tagnames.tag_tfoot(), 3 as u32);
+}
+
+// §13.2.6.4.14
+fn mode_in_row(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_th() || tag == tagnames.tag_td() {
+            clear_to_table_row_context(b);
+            insert_element(b, s, token);
+            (*b).mode = MODE_IN_CELL;
+            push_formatting_marker(b);
+            return;
+        }
+        if tag == tagnames.tag_caption() || tag == tagnames.tag_col()
+            || tag == tagnames.tag_colgroup() || tag == tagnames.tag_tbody()
+            || tag == tagnames.tag_tfoot() || tag == tagnames.tag_thead()
+            || tag == tagnames.tag_tr() {
+            if !has_element_in_scope(b, tagnames.tag_tr(), 3 as u32) {
+                return;
+            }
+            clear_to_table_row_context(b);
+            pop_open(b);
+            (*b).mode = MODE_IN_TABLE_BODY;
+            dispatch(b, s, index);
+            return;
+        }
+    }
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_tr() {
+            if !has_element_in_scope(b, tagnames.tag_tr(), 3 as u32) {
+                return;
+            }
+            clear_to_table_row_context(b);
+            pop_open(b);
+            (*b).mode = MODE_IN_TABLE_BODY;
+            return;
+        }
+        if tag == tagnames.tag_table() {
+            if !has_element_in_scope(b, tagnames.tag_tr(), 3 as u32) {
+                return;
+            }
+            clear_to_table_row_context(b);
+            pop_open(b);
+            (*b).mode = MODE_IN_TABLE_BODY;
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_tbody() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_thead() {
+            if !has_element_in_scope(b, tag, 3 as u32) {
+                return;
+            }
+            if !has_element_in_scope(b, tagnames.tag_tr(), 3 as u32) {
+                return;
+            }
+            clear_to_table_row_context(b);
+            pop_open(b);
+            (*b).mode = MODE_IN_TABLE_BODY;
+            dispatch(b, s, index);
+            return;
+        }
+        if tag == tagnames.tag_body() || tag == tagnames.tag_caption()
+            || tag == tagnames.tag_col() || tag == tagnames.tag_colgroup()
+            || tag == tagnames.tag_html() || tag == tagnames.tag_td()
+            || tag == tagnames.tag_th() {
+            return;
+        }
+    }
+    mode_in_table(b, s, index);
+}
+
+// §13.2.6.4.15
+fn mode_in_cell(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
+    let token: HtmlToken = tokens.get_token(s, index);
+    if token.kind == tokens.kind_end_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_td() || tag == tagnames.tag_th() {
+            if !has_element_in_scope(b, tag, 3 as u32) {
+                return;
+            }
+            generate_implied_end_tags(b, tagnames.tag_unknown());
+            pop_until_tag(b, tag);
+            clear_formatting_to_marker(b);
+            (*b).mode = MODE_IN_ROW;
+            return;
+        }
+        if tag == tagnames.tag_body() || tag == tagnames.tag_caption()
+            || tag == tagnames.tag_col() || tag == tagnames.tag_colgroup()
+            || tag == tagnames.tag_html() {
+            return;
+        }
+        if tag == tagnames.tag_table() || tag == tagnames.tag_tbody()
+            || tag == tagnames.tag_tfoot() || tag == tagnames.tag_thead()
+            || tag == tagnames.tag_tr() {
+            if !has_element_in_scope(b, tag, 3 as u32) {
+                return;
+            }
+            close_cell(b);
+            dispatch(b, s, index);
+            return;
+        }
+    }
+    if token.kind == tokens.kind_start_tag() {
+        let tag: u32 = token_tag(b, s, token);
+        if tag == tagnames.tag_caption() || tag == tagnames.tag_col()
+            || tag == tagnames.tag_colgroup() || tag == tagnames.tag_tbody()
+            || tag == tagnames.tag_td() || tag == tagnames.tag_tfoot()
+            || tag == tagnames.tag_th() || tag == tagnames.tag_thead()
+            || tag == tagnames.tag_tr() {
+            if !cell_in_table_scope(b) {
+                return;
+            }
+            close_cell(b);
+            dispatch(b, s, index);
+            return;
+        }
+    }
+    mode_in_body(b, s, index);
+}
+
+fn cell_in_table_scope(b: *HtmlTreeBuilder) -> bool {
+    return has_element_in_scope(b, tagnames.tag_td(), 3 as u32)
+        || has_element_in_scope(b, tagnames.tag_th(), 3 as u32);
+}
+
+// §13.2.6.4.15 "close the cell".
+fn close_cell(b: *HtmlTreeBuilder) -> void {
+    generate_implied_end_tags(b, tagnames.tag_unknown());
+    let tag: u32 = tagnames.tag_td();
+    if has_element_in_scope(b, tagnames.tag_th(), 3 as u32) {
+        tag = tagnames.tag_th();
+    }
+    pop_until_tag(b, tag);
+    clear_formatting_to_marker(b);
+    (*b).mode = MODE_IN_ROW;
 }
 
 fn token_tag(b: *HtmlTreeBuilder, s: *HtmlTokenSink, token: HtmlToken) -> u32 {
@@ -1648,6 +2293,17 @@ fn in_body_start_tag(
         insert_element(b, s, token);
         return;
     }
+    if tag == tagnames.tag_table() {
+        // In quirks mode an open <p> is deliberately NOT closed first.
+        if !node.is_quirks((*b).doc)
+            && has_element_in_scope(b, tagnames.tag_p(), 2 as u32) {
+            close_p_element(b);
+        }
+        insert_element(b, s, token);
+        (*b).frameset_ok = false;
+        (*b).mode = MODE_IN_TABLE;
+        return;
+    }
     if tag == tagnames.tag_caption() || tag == tagnames.tag_col()
         || tag == tagnames.tag_colgroup() || tag == tagnames.tag_frame()
         || tag == tagnames.tag_head() || tag == tagnames.tag_tbody()
@@ -1918,9 +2574,12 @@ fn mode_text(b: *HtmlTreeBuilder, s: *HtmlTokenSink, index: u64) -> void {
         return;
     }
     if token.kind == tokens.kind_eof() {
+        // Parse error: the element never closed. Pop it and reprocess the EOF
+        // in the original mode, which is what still gets a <body> onto a
+        // document that ends inside <script> or <title>.
         pop_open(b);
         (*b).mode = (*b).original_mode;
-        (*b).stopped = true;
+        dispatch(b, s, index);
         return;
     }
     if token.kind == tokens.kind_end_tag() {
