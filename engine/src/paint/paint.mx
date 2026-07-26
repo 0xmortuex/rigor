@@ -1,0 +1,174 @@
+// Painting — CSS 2.1 Appendix E, "elaborate description of stacking contexts".
+//
+// The box tree is walked in tree order and each box paints its background,
+// then its borders, then its text, then its children. That is the correct
+// order for content in normal flow with no positioning, which is everything
+// rigor lays out today; z-index and stacking contexts arrive with positioned
+// elements and will reorder this walk rather than replace it.
+//
+// Text is drawn with the bitmap font in engine.paint.font. That font is
+// monospaced 8x8 while layout measures proportional advances, so glyphs are
+// placed at the positions layout computed rather than stepped by a fixed
+// pitch: the two agree on where a run starts and ends even though the shapes
+// are not the ones measured.
+module engine.paint.paint;
+
+import canvas;
+import font;
+import engine.layout.box;
+import engine.layout.metrics;
+import engine.style.computed;
+
+fn paint_background(
+    target: *Canvas,
+    current: LayoutBox,
+    style: ComputedStyle
+) -> void {
+    // The background covers the padding box, which is the border box inset by
+    // the border widths (CSS Backgrounds §3, `background-clip: border-box` is
+    // the initial value, so in fact the whole border box).
+    canvas.fill_rect(target, current.x, current.y,
+        box.border_box_width(current), box.border_box_height(current),
+        style.background_color);
+}
+
+fn paint_borders(
+    target: *Canvas,
+    current: LayoutBox,
+    style: ComputedStyle
+) -> void {
+    let width: f64 = box.border_box_width(current);
+    let height: f64 = box.border_box_height(current);
+    if current.border_top > 0.0
+        && style.border_top_style != computed.border_none() {
+        canvas.fill_rect(target, current.x, current.y,
+            width, current.border_top, style.border_top_color);
+    }
+    if current.border_bottom > 0.0
+        && style.border_bottom_style != computed.border_none() {
+        canvas.fill_rect(target, current.x,
+            current.y + height - current.border_bottom,
+            width, current.border_bottom, style.border_bottom_color);
+    }
+    if current.border_left > 0.0
+        && style.border_left_style != computed.border_none() {
+        canvas.fill_rect(target, current.x, current.y,
+            current.border_left, height, style.border_left_color);
+    }
+    if current.border_right > 0.0
+        && style.border_right_style != computed.border_none() {
+        canvas.fill_rect(target, current.x + width - current.border_right,
+            current.y, current.border_right, height, style.border_right_color);
+    }
+}
+
+// Draw one glyph into a cell of `cell_width` x `cell_height`.
+//
+// The cell is sized from the advance layout measured, not from a fixed
+// multiple of the 8x8 bitmap. The font is monospaced and layout is
+// proportional, so a uniform scale would draw an 'i' as wide as an 'm' and
+// every run would overflow its measured width. Stretching each glyph into its
+// own advance keeps text aligned with the geometry, at the cost of distorting
+// the shapes — which is the honest trade until real font rendering lands.
+fn paint_glyph(
+    target: *Canvas,
+    code: u32,
+    left: f64,
+    top: f64,
+    cell_width: f64,
+    cell_height: f64,
+    color: StyleColor
+) -> void {
+    let pixel_width: f64 = cell_width / (font.glyph_width() as f64);
+    let pixel_height: f64 = cell_height / (font.glyph_height() as f64);
+    for row: u64 in 0..font.glyph_height() {
+        let bits: u8 = font.glyph_row(code, row);
+        if bits == 0 as u8 {
+            continue;
+        }
+        for column: u64 in 0..font.glyph_width() {
+            if ((bits >> (column as u8)) & (1 as u8)) == 0 as u8 {
+                continue;
+            }
+            canvas.fill_rect(target,
+                left + (column as f64) * pixel_width,
+                top + (row as f64) * pixel_height,
+                pixel_width, pixel_height, color);
+        }
+    }
+}
+
+fn paint_text(
+    target: *Canvas,
+    tree: *LayoutTree,
+    current: LayoutBox,
+    style: ComputedStyle
+) -> void {
+    if current.text_len == 0 {
+        return;
+    }
+    // In font8x8 the baseline sits at the bottom of row 6, so seven eighths of
+    // the cell is above it. Anchoring on the baseline layout computed keeps
+    // text of different sizes on one line aligned.
+    let cell_height: f64 = style.font_size;
+    let top: f64 = current.y + current.baseline - cell_height * 0.875;
+
+    let text: []const u8 = box.text_bytes(tree, current.text_off, current.text_len);
+    let pen: f64 = current.x;
+    for index: u64 in 0..len(text) {
+        let c: u8 = text[index];
+        // Multi-byte sequences have no glyph in this font; skipping the
+        // continuation bytes stops the pen advancing once per byte instead of
+        // once per character.
+        if (c & (0xC0 as u8)) == 0x80 as u8 {
+            continue;
+        }
+        let advance: f64 = metrics.char_width(c, style.font_size);
+        if c > 32 as u8 && c < 127 as u8 {
+            paint_glyph(target, c as u32, pen, top, advance, cell_height,
+                style.color);
+        }
+        pen = pen + advance;
+    }
+}
+
+fn paint_box(
+    target: *Canvas,
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    index: u64
+) -> void {
+    let current: LayoutBox = box.get(tree, index);
+    let style: ComputedStyle = computed.get(styles, current.style_node);
+
+    if current.kind == box.box_text() {
+        paint_text(target, tree, current, style);
+    } else if current.kind != box.box_anonymous() {
+        // Anonymous boxes have no style of their own to paint; their content
+        // is painted by their children.
+        paint_background(target, current, style);
+        paint_borders(target, current, style);
+    }
+
+    let child: u64 = current.first_child;
+    while child != box.none() {
+        paint_box(target, tree, styles, child);
+        child = box.get(tree, child).next_sibling;
+    }
+}
+
+// Paint the whole document onto `target`, over an opaque white canvas — the
+// initial containing block's background, which the spec propagates from the
+// root element and which rigor does not yet implement, so white is used.
+pub fn paint(
+    target: *Canvas,
+    tree: *LayoutTree,
+    styles: *StyleTree
+) -> void {
+    canvas.fill_all(target,
+        computed.rgba(255 as u8, 255 as u8, 255 as u8, 255 as u8));
+    if (*tree).root == box.none() {
+        return;
+    }
+    paint_box(target, tree, styles, (*tree).root);
+}

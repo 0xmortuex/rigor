@@ -1,0 +1,286 @@
+// rigor-view — render an HTML document into a real window.
+//
+//     Get-Content page.html | rigor-view        (PowerShell)
+//     rigor-view < page.html                    (cmd / sh)
+//
+// The whole engine runs first, producing a BGRA canvas; the window then blits
+// that canvas and scrolls it. Nothing above win32.mx knows a window exists.
+//
+// Mort has no argv access yet, so stdin is the interface, matching the `rigor`
+// CLI.
+
+import std.vec;
+import win32;
+import engine.html.preprocess;
+import engine.html.tokens;
+import engine.html.treebuilder;
+import engine.dom.node;
+import engine.css.preprocess as css_preprocess;
+import engine.css.tokenizer as css_tokenizer;
+import engine.css.tokens as css_tokens;
+import engine.css.parser as css_parser;
+import engine.css.stylesheet;
+import engine.html.tagnames;
+import engine.style.computed;
+import engine.style.cascade;
+import engine.style.ua;
+import engine.layout.box;
+import engine.layout.flow;
+import engine.paint.canvas;
+import engine.paint.paint;
+
+extern fn getchar() -> c_int;
+
+// The rendered page, reachable from the window procedure. Win32 calls that
+// procedure from inside DispatchMessage rather than passing state along, so
+// the pixels have to be file-scope.
+let PAGE_PIXELS: *u8 = null;
+let PAGE_WIDTH: i32 = 0;
+let PAGE_HEIGHT: i32 = 0;
+let SCROLL_Y: i32 = 0;
+
+fn read_stdin() -> Vec<u8> {
+    let buf: Vec<u8> = vec.with_capacity<u8>(65536);
+    loop {
+        let c: c_int = getchar();
+        if c < 0 {
+            break;
+        }
+        vec.push(&buf, c as u8);
+    }
+    return move buf;
+}
+
+fn cstr_len(text: *u8) -> u64 {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    return length;
+}
+
+// Gather every <style> element's text, in tree order.
+fn gather_style_text(doc: *DomDocument, out: *Vec<u8>, index: u64) -> void {
+    let current: DomNode = node.get(doc, index);
+    if current.kind == node.kind_element() && current.tag == tagnames.tag_style() {
+        let child: u64 = current.first_child;
+        while child != node.none() {
+            let child_node: DomNode = node.get(doc, child);
+            if child_node.kind == node.kind_text() {
+                let text: []const u8 =
+                node.bytes(doc, child_node.data_off, child_node.data_len);
+                for step: u64 in 0..len(text) {
+                    vec.push(out, text[step]);
+                }
+            }
+            child = child_node.next_sibling;
+        }
+        vec.push(out, 10 as u8);
+    }
+    let child: u64 = current.first_child;
+    while child != node.none() {
+        gather_style_text(doc, out, child);
+        child = node.get(doc, child).next_sibling;
+    }
+}
+
+fn clamp_scroll(view_height: i32) -> void {
+    let limit: i32 = PAGE_HEIGHT - view_height;
+    if limit < 0 {
+        limit = 0;
+    }
+    if SCROLL_Y > limit {
+        SCROLL_Y = limit;
+    }
+    if SCROLL_Y < 0 {
+        SCROLL_Y = 0;
+    }
+}
+
+fn window_proc(window: Handle, message: u32, wparam: u64, lparam: i64) -> i64 {
+    if message == win32.wm_destroy() {
+        win32.quit();
+        return 0;
+    }
+    if message == win32.wm_keydown() {
+        let client: Win32Rect = win32.client_rect(window);
+        let view_height: i32 = client.bottom - client.top;
+        if wparam == win32.vk_escape() {
+            win32.quit();
+            return 0;
+        }
+        if wparam == win32.vk_down() {
+            SCROLL_Y = SCROLL_Y + 40;
+        } else if wparam == win32.vk_up() {
+            SCROLL_Y = SCROLL_Y - 40;
+        } else if wparam == win32.vk_next() {
+            SCROLL_Y = SCROLL_Y + view_height;
+        } else if wparam == win32.vk_prior() {
+            SCROLL_Y = SCROLL_Y - view_height;
+        } else {
+            return win32.default_proc(window, message, wparam, lparam);
+        }
+        clamp_scroll(view_height);
+        win32.invalidate(window);
+        return 0;
+    }
+    if message == win32.wm_mousewheel() {
+        // The wheel delta is the signed high word of wparam, 120 per notch.
+        let delta: i64 = ((wparam >> 16) & (0xFFFF as u64)) as i64;
+        if delta > 32767 {
+            delta = delta - 65536;
+        }
+        SCROLL_Y = SCROLL_Y - ((delta * 40 / 120) as i32);
+        let client: Win32Rect = win32.client_rect(window);
+        clamp_scroll(client.bottom - client.top);
+        win32.invalidate(window);
+        return 0;
+    }
+    if message == win32.wm_paint() {
+        let paint: Win32PaintStruct = empty_paint();
+        let hdc: Handle = win32.begin_paint(window, &paint);
+        blit(hdc, window);
+        win32.end_paint(window, &paint);
+        return 0;
+    }
+    return win32.default_proc(window, message, wparam, lparam);
+}
+
+fn empty_paint() -> Win32PaintStruct {
+    return Win32PaintStruct {
+        hdc: 0 as Handle,
+        erase: 0,
+        paint_rect: Win32Rect { left: 0, top: 0, right: 0, bottom: 0 },
+        restore: 0,
+        inc_update: 0,
+        reserved_a: 0, reserved_b: 0, reserved_c: 0, reserved_d: 0,
+    };
+}
+
+// Copy the rendered page into the window, honouring the scroll offset.
+fn blit(hdc: Handle, window: Handle) -> void {
+    if PAGE_PIXELS == 0 as *u8 {
+        return;
+    }
+    let client: Win32Rect = win32.client_rect(window);
+    let view_width: i32 = client.right - client.left;
+    let view_height: i32 = client.bottom - client.top;
+    let rows: i32 = view_height;
+    if rows > PAGE_HEIGHT - SCROLL_Y {
+        rows = PAGE_HEIGHT - SCROLL_Y;
+    }
+    if rows < 0 {
+        rows = 0;
+    }
+    win32.blit_rows(hdc, PAGE_PIXELS, PAGE_WIDTH, PAGE_HEIGHT,
+    SCROLL_Y, view_width, rows);
+}
+
+fn main() -> int {
+    let raw: Vec<u8> = read_stdin();
+
+    let sink: HtmlTokenSink = tokens.new_sink();
+    let normalized: Vec<u8> =
+    preprocess.decode_and_normalize(raw.data as *const u8, raw.length, &sink);
+    let doc: DomDocument = node.new_document();
+    treebuilder.parse(
+    normalized.data as *const u8, normalized.length, &doc, &sink);
+
+    let style_text: Vec<u8> = vec.new<u8>();
+    gather_style_text(&doc, &style_text, 0);
+    let css_normalized: Vec<u8> =
+    css_preprocess.normalize(style_text.data as *const u8, style_text.length);
+    let css_sink: CssTokenSink = css_tokens.new_sink();
+    let css_t: CssTokenizer = css_tokenizer.new(
+    css_normalized.data as *const u8, css_normalized.length);
+    css_tokenizer.run(&css_t, &css_sink);
+    let sheet: CssStylesheet = stylesheet.new_stylesheet();
+    css_parser.parse_stylesheet(&sheet, &css_sink);
+
+    let ua_source: *u8 = ua.stylesheet_text();
+    let ua_normalized: Vec<u8> =
+    css_preprocess.normalize(ua_source as *const u8, cstr_len(ua_source));
+    let ua_sink: CssTokenSink = css_tokens.new_sink();
+    let ua_t: CssTokenizer = css_tokenizer.new(
+    ua_normalized.data as *const u8, ua_normalized.length);
+    css_tokenizer.run(&ua_t, &ua_sink);
+    let ua_sheet: CssStylesheet = stylesheet.new_stylesheet();
+    css_parser.parse_stylesheet(&ua_sheet, &ua_sink);
+
+    let styles: StyleTree = computed.new_tree(node.node_count(&doc));
+    cascade.compute(&doc, &ua_sheet, &ua_sink, &sheet, &css_sink, &styles);
+
+    let instance: Handle = win32.module_handle();
+    let class_name: *u8 = "RigorWindow";
+    let window_class: Win32WindowClass = Win32WindowClass {
+        size: 80 as u32,
+        style: win32.cs_hredraw() | win32.cs_vredraw(),
+        proc: window_proc,
+        class_extra: 0,
+        window_extra: 0,
+        instance: instance,
+        icon: 0 as Handle,
+        cursor: win32.arrow_cursor(),
+        // COLOR_WINDOW + 1, so the frame is not blank before the first blit.
+        background: 6 as Handle,
+        menu_name: 0 as *u8,
+        class_name: class_name,
+        small_icon: 0 as Handle,
+    };
+    if !win32.register_class(&window_class) {
+        return 1;
+    }
+    let window: Handle =
+    win32.create_window(class_name, "rigor", 1016, 800, instance);
+    if window == 0 as Handle {
+        return 1;
+    }
+
+    // Lay out to the window's actual client width rather than a guess, so the
+    // page fits the frame the user sees. Re-laying out on resize is not
+    // implemented yet; the window keeps its initial layout width.
+    let client: Win32Rect = win32.client_rect(window);
+    let viewport: f64 = (client.right - client.left) as f64;
+    if viewport < 1.0 {
+        viewport = 800.0;
+    }
+    let boxes: LayoutTree = box.new_tree();
+    flow.layout(&doc, &styles, &boxes, viewport);
+
+    let page_height: u64 = (flow.document_height(&boxes) + 0.5) as u64;
+    if page_height < 1 {
+        page_height = 1;
+    }
+    let target: Canvas = canvas.new_canvas(viewport as u64, page_height);
+    paint.paint(&target, &boxes, &styles);
+
+    PAGE_PIXELS = canvas.pixels(&target);
+    PAGE_WIDTH = viewport as i32;
+    PAGE_HEIGHT = page_height as i32;
+
+    win32.show(window);
+
+    let message: Win32Message = Win32Message {
+        hwnd: 0 as Handle, message: 0 as u32, wparam: 0, lparam: 0,
+        time: 0 as u32, pt: Win32Point { x: 0, y: 0 },
+    };
+    while win32.next_message(&message) {
+        win32.dispatch(&message);
+    }
+
+    canvas.destroy(&target);
+    box.destroy(&boxes);
+    computed.destroy(&styles);
+    stylesheet.destroy(&ua_sheet);
+    css_tokens.destroy(&ua_sink);
+    vec.destroy(&ua_normalized);
+    stylesheet.destroy(&sheet);
+    css_tokens.destroy(&css_sink);
+    vec.destroy(&css_normalized);
+    vec.destroy(&style_text);
+    node.destroy(&doc);
+    tokens.destroy(&sink);
+    vec.destroy(&normalized);
+    vec.destroy(&raw);
+    return 0;
+}

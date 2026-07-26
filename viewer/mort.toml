@@ -1,0 +1,11 @@
+[package]
+name = "rigor_view"
+version = "0.1.0"
+
+[build]
+sources = ["src/**/*.mx"]
+std = ["vec"]
+libraries = ["user32", "gdi32"]
+
+[dependencies]
+engine = "../engine"

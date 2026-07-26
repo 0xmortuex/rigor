@@ -13,9 +13,17 @@ Rigor is the classic engine pipeline, each stage an independent module of the
  DOM + style ──► layout tree ──► paint ──► framebuffer ──► window
 ```
 
-Everything up to and including the cascade exists today. Layout and paint do
-not; the pipeline shape is the contract they get built into. See ROADMAP.md
-for sequencing.
+Every stage above exists today. See ROADMAP.md for what each one does not yet
+cover.
+
+## The platform boundary is one file
+
+The engine renders into a BGRA byte buffer and knows nothing about any
+operating system: no windowing, no file I/O, no clock. `viewer/src/win32.mx`
+is the only file in the project that names a platform API, and all it does is
+open a window and blit that buffer. Porting rigor — to X11, to Wayland, to
+MortOS — replaces that file and nothing else. The BMP writer exists partly to
+prove the point: it consumes the same canvas with no platform involved at all.
 
 ## The user-agent stylesheet is CSS
 

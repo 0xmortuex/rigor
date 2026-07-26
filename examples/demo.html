@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rigor</title>
+<style>
+  body {
+    margin: 32px;
+    font-size: 16px;
+    color: #222222;
+    background-color: #fbfbf9;
+  }
+  h1 {
+    color: #202060;
+    font-size: 2.2em;
+    margin-bottom: 0.2em;
+  }
+  h2 {
+    color: #404070;
+    font-size: 1.3em;
+    margin-top: 1.6em;
+  }
+  .lede {
+    color: #555555;
+    margin-top: 0;
+  }
+  .card {
+    background-color: #ffffff;
+    border: 1px solid #d8d8d0;
+    padding: 20px 24px;
+    margin-top: 1em;
+    width: 70%;
+  }
+  .card p { margin: 0.4em 0 }
+  .note {
+    border-left: 6px solid #c0a000;
+    background-color: #fffbe6;
+    padding: 12px 16px;
+    margin-top: 1.5em;
+  }
+  .swatch {
+    background-color: #d04030;
+    color: white;
+    padding: 6px 10px;
+  }
+  .centered { text-align: center; margin-top: 2em; color: #888888 }
+  code { color: #a03060 }
+</style>
+</head>
+<body>
+  <h1>Rigor</h1>
+  <p class="lede">A browser engine written from scratch in Mort.</p>
+
+  <h2>What you are looking at</h2>
+  <div class="card">
+    <p>This page was tokenized, parsed into a DOM, cascaded against a
+    user-agent stylesheet and the rules above, laid out into a box tree, and
+    rasterized to the pixels on your screen &mdash; by code with no libraries
+    underneath it.</p>
+    <p>Every stage follows its specification: the HTML tokenizer is
+    WHATWG &sect;13.2.5 state for state, and the CSS side is Syntax Level 3.</p>
+  </div>
+
+  <div class="note">
+    <p>Text is drawn with a bitmap font and measured with estimated advances,
+    so it is legible but not metrically accurate. Real font parsing is the
+    next milestone.</p>
+  </div>
+
+  <h2>Things that work</h2>
+  <p>Nested markup with <b>bold</b>, <i>italic</i> and <code>inline
+  code</code>. Misnested tags are repaired by the adoption agency algorithm.
+  Long paragraphs wrap at the content edge, honour margins and padding, and
+  collapse adjacent vertical margins the way the box model requires.</p>
+  <p><span class="swatch">Backgrounds and borders paint too.</span></p>
+
+  <p class="centered">&copy; 2026 &mdash; scroll with the arrow keys, Esc to quit</p>
+</body>
+</html>

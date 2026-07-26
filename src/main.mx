@@ -29,6 +29,10 @@ import engine.style.ua;
 import engine.layout.box;
 import engine.layout.flow;
 import engine.layout.serialize as layout_serialize;
+import engine.paint.canvas;
+import engine.paint.paint;
+import engine.paint.bmp;
+import std.fs;
 
 extern fn getchar() -> c_int;
 extern fn putchar(character: c_int) -> c_int;
@@ -377,6 +381,30 @@ fn main() -> int {
     print_raw(out.data);
     vec.clear(&out);
     vec.destroy(&layout_text);
+
+    // Render to rigor.bmp, sized to the document.
+    let page_height: u64 = (flow.document_height(&boxes) + 0.5) as u64;
+    if page_height < 1 {
+        page_height = 1;
+    }
+    let target: Canvas = canvas.new_canvas(800, page_height);
+    paint.paint(&target, &boxes, &tree_styles);
+    let image: Vec<u8> = bmp.encode(&target);
+    let output: File = fs.open("rigor.bmp", "wb");
+    if fs.is_open(&output) {
+        fs.write(&output, vec.as_const_slice(&image));
+        fs.close(&output);
+        out_str(&out, "-- painted --");
+        out_line(&out);
+        out_str(&out, "rigor.bmp  800x");
+        out_u64(&out, page_height);
+        out_line(&out);
+    } else {
+        out_str(&out, "-- paint failed: could not open rigor.bmp --");
+        out_line(&out);
+    }
+    vec.destroy(&image);
+    canvas.destroy(&target);
     box.destroy(&boxes);
 
     computed.destroy(&tree_styles);

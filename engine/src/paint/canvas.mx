@@ -1,0 +1,125 @@
+// A software raster target.
+//
+// Pixels are stored as 32-bit BGRA in a flat row-major buffer, which is the
+// byte order Windows DIBs want, so presenting a canvas to a window is a memcpy
+// rather than a per-pixel conversion. Nothing here is Windows-specific though;
+// the same buffer is what the BMP writer serializes.
+//
+// Compositing is straight source-over alpha blending in 8-bit sRGB space. That
+// is what browsers did for years and is close enough for opaque content;
+// blending in linear space is a correctness improvement for translucent
+// overlays that can come with the compositor.
+module engine.paint.canvas;
+
+import std.vec;
+import engine.style.computed;
+
+resource struct Canvas {
+    pixels: Vec<u8>,
+    width: u64,
+    height: u64,
+}
+
+pub fn new_canvas(width: u64, height: u64) -> Canvas {
+    let canvas: Canvas = Canvas {
+        pixels: vec.with_capacity<u8>(width * height * 4 + 1),
+        width: width,
+        height: height,
+    };
+    for index: u64 in 0..(width * height * 4) {
+        vec.push(&canvas.pixels, 0 as u8);
+    }
+    return move canvas;
+}
+
+pub fn destroy(canvas: *Canvas) -> void {
+    vec.destroy(&(*canvas).pixels);
+    (*canvas).width = 0;
+    (*canvas).height = 0;
+}
+
+pub fn width(canvas: *Canvas) -> u64 { return (*canvas).width; }
+pub fn height(canvas: *Canvas) -> u64 { return (*canvas).height; }
+
+// The raw BGRA bytes, for a DIB blit or a file write.
+pub fn pixels(canvas: *Canvas) -> *u8 {
+    return (*canvas).pixels.data;
+}
+
+pub fn fill_all(canvas: *Canvas, color: StyleColor) -> void {
+    let total: u64 = (*canvas).width * (*canvas).height;
+    for index: u64 in 0..total {
+        let offset: u64 = index * 4;
+        (*canvas).pixels.data[offset] = color.b;
+        (*canvas).pixels.data[offset + 1] = color.g;
+        (*canvas).pixels.data[offset + 2] = color.r;
+        (*canvas).pixels.data[offset + 3] = 255 as u8;
+    }
+}
+
+// Source-over blend of one pixel. Fully transparent sources are skipped and
+// fully opaque ones are written directly, which covers almost every pixel.
+pub fn blend_pixel(canvas: *Canvas, x: u64, y: u64, color: StyleColor) -> void {
+    if x >= (*canvas).width || y >= (*canvas).height || color.a == 0 as u8 {
+        return;
+    }
+    let offset: u64 = (y * (*canvas).width + x) * 4;
+    if color.a == 255 as u8 {
+        (*canvas).pixels.data[offset] = color.b;
+        (*canvas).pixels.data[offset + 1] = color.g;
+        (*canvas).pixels.data[offset + 2] = color.r;
+        (*canvas).pixels.data[offset + 3] = 255 as u8;
+        return;
+    }
+    let alpha: u64 = color.a as u64;
+    let inverse: u64 = 255 - alpha;
+    let old_b: u64 = (*canvas).pixels.data[offset] as u64;
+    let old_g: u64 = (*canvas).pixels.data[offset + 1] as u64;
+    let old_r: u64 = (*canvas).pixels.data[offset + 2] as u64;
+    let old_a: u64 = (*canvas).pixels.data[offset + 3] as u64;
+    (*canvas).pixels.data[offset] =
+        (((color.b as u64) * alpha + old_b * inverse) / 255) as u8;
+    (*canvas).pixels.data[offset + 1] =
+        (((color.g as u64) * alpha + old_g * inverse) / 255) as u8;
+    (*canvas).pixels.data[offset + 2] =
+        (((color.r as u64) * alpha + old_r * inverse) / 255) as u8;
+    (*canvas).pixels.data[offset + 3] =
+        (alpha + old_a * inverse / 255) as u8;
+}
+
+// Clamp a floating-point edge to a pixel index, saturating at the canvas
+// bounds. Values below zero clamp to zero rather than wrapping, which they
+// would do if cast straight to u64.
+fn clamp_edge(value: f64, limit: u64) -> u64 {
+    if value <= 0.0 {
+        return 0;
+    }
+    let rounded: u64 = (value + 0.5) as u64;
+    if rounded > limit {
+        return limit;
+    }
+    return rounded;
+}
+
+// Fill the rectangle from (x, y) to (x + width, y + height).
+pub fn fill_rect(
+    canvas: *Canvas,
+    x: f64,
+    y: f64,
+    rect_width: f64,
+    rect_height: f64,
+    color: StyleColor
+) -> void {
+    if color.a == 0 as u8 || rect_width <= 0.0 || rect_height <= 0.0 {
+        return;
+    }
+    let left: u64 = clamp_edge(x, (*canvas).width);
+    let top: u64 = clamp_edge(y, (*canvas).height);
+    let right: u64 = clamp_edge(x + rect_width, (*canvas).width);
+    let bottom: u64 = clamp_edge(y + rect_height, (*canvas).height);
+    for row: u64 in top..bottom {
+        for column: u64 in left..right {
+            blend_pixel(canvas, column, row, color);
+        }
+    }
+}

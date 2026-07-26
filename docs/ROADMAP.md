@@ -48,14 +48,23 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       advances from a width table, so text is proportional but not accurate
 - [ ] Floats, static positioning beyond normal flow, parent/child margin
       collapsing, inline borders and padding
-- [ ] Paint: software rasterizer, bitmap font text first
-- [ ] Window: Win32 via `extern fn` FFI (CreateWindowExA + StretchDIBits)
+- [x] Paint: software rasterizer with alpha blending, backgrounds, borders,
+      bitmap-font text, and a BMP writer
+- [x] Window: Win32 via `extern fn` FFI, with scrolling
+
+**Milestone 1 is complete: HTML + CSS render to pixels in a window.**
 
 ## Milestone 2 — a usable document viewer
 
+- [ ] **Real text.** The single biggest quality gap: glyphs come from an 8x8
+      ASCII bitmap font and advances are estimated from a width table, so text
+      is legible but neither accurate nor able to render non-ASCII, bold or
+      italic. Needs TrueType parsing, real metrics, and shaping for Latin
+      scripts. `engine/src/layout/metrics.mx` and `engine/src/paint/font.mx`
+      are the only two files this touches.
+- [ ] Re-layout on window resize (the viewer keeps its initial width)
 - [ ] Charset sniffing + non-UTF-8 decoding (§13.2.3)
-- [ ] Real text: font loading (TrueType parsing), shaping for Latin scripts,
-      line breaking per UAX #14 subset
+- [ ] Line breaking per a UAX #14 subset (currently breaks at spaces only)
 - [ ] Images: PNG decoder first (from scratch, like everything else)
 - [ ] `std.net`/`std.https`-backed fetching: URLs, http(s), redirects, cache
 - [ ] Scrolling, hit testing, links

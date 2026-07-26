@@ -9,11 +9,16 @@ this project runs on: every algorithm is implemented from the WHATWG/CSSWG
 specification it cites, error recovery included, and progress is measured in
 passing conformance tests, not vibes.
 
-> **Status: pre-alpha.** The front end is complete: HTML parses to a DOM
-> (tokenizer at 100% and tree construction at 81% of the html5lib conformance
-> suites), CSS parses to rules and selectors, and the cascade produces
-> computed styles for every element. Layout and paint are next. See
-> [docs/ROADMAP.md](docs/ROADMAP.md) for the honest ledger.
+> **Status: pre-alpha, and it renders.** HTML and CSS go in, pixels come out
+> in a real window — parse, DOM, cascade, layout, paint, all from scratch with
+> no libraries underneath. What it does *not* do yet is at least as
+> interesting as what it does; see [docs/ROADMAP.md](docs/ROADMAP.md) for the
+> honest ledger.
+
+```
+Get-Content examples/demo.html | rigor-view     # a window
+Get-Content examples/demo.html | rigor          # tokens, tree, styles, layout
+```
 
 ```
 > '<b>1<p>2</b>3</p>' | rigor
@@ -113,9 +118,15 @@ by the tree builder). The harness prints the skip count on every run.
   block width constraint including `auto` margins centring a box, auto and
   fixed heights, adjacent-sibling margin collapsing, and inline formatting
   with line boxes, white-space collapsing, line breaking and `text-align`.
+- **Paint**: a software rasterizer with source-over alpha blending, drawing
+  backgrounds, borders and text into a BGRA canvas, plus a BMP writer so a
+  render can be diffed without a window.
+- **A window**: `rigor-view` opens a Win32 window and blits the canvas, with
+  arrow-key and mouse-wheel scrolling. Win32 is confined to one file —
+  `viewer/src/win32.mx` — so a port replaces that and nothing else.
 - **`rigor` CLI**: pipe HTML in, get the token stream, the parsed tree, the
-  parsed stylesheet, the computed style of every element, and the laid-out
-  box tree with its geometry.
+  parsed stylesheet, the computed style of every element, the laid-out box
+  tree with its geometry, and `rigor.bmp`.
 
 ```
 > '<!DOCTYPE html><p class="x">Hi &amp; bye</p>' | rigor
@@ -185,6 +196,8 @@ mortc build      # build the rigor CLI  -> build/rigor.exe
 mortc test       # run the engine's test suite
 mortc fmt        # format sources
 
+cd viewer && mortc build               # the windowed viewer -> rigor-view
+
 cd conformance && mortc build             # build the conformance harness
 python tools/run_conformance.py           # html5lib tokenizer suites
 python tools/run_tree_conformance.py      # html5lib tree-construction suites
@@ -201,10 +214,14 @@ engine/            the engine library (Mort package `engine`) — embeddable
   src/css/         preprocessing, tokenizer, parser, selectors, matching
   src/style/       the cascade, computed values, the UA stylesheet
   src/layout/      the box tree, normal flow, font metrics
+  src/paint/       the canvas, the rasterizer, the bitmap font, a BMP writer
 src/main.mx        the rigor developer CLI
+viewer/            the windowed viewer; viewer/src/win32.mx is all the
+                   platform-specific code in the project
 tests/             spec-behavior tests (mortc test)
 conformance/       batch driver binary for the html5lib suites
 tools/             generators, conformance drivers, vendored suites
+examples/          demo.html
 docs/              ARCHITECTURE.md, ROADMAP.md
 ```
 

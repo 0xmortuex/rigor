@@ -1,0 +1,269 @@
+// Win32 bindings.
+//
+// The only platform-specific code in rigor. The engine renders into a BGRA
+// buffer that knows nothing about Windows; this module opens a window and
+// blits that buffer into it, which is the entire platform surface. A port to
+// another OS — or to MortOS — replaces this file and nothing else.
+//
+// Structure layouts must match the Windows headers exactly. They do here
+// because Mort lowers each struct to a C struct with the same field order and
+// types, so the C compiler applies the same alignment rules the SDK assumes.
+module rigor_view.win32;
+
+// --- Opaque handles ---------------------------------------------------------
+// Every Win32 handle is a pointer-sized opaque value.
+
+type Handle = *void;
+
+// --- Structures --------------------------------------------------------------
+
+struct Win32Point {
+    x: i32,
+    y: i32,
+}
+
+struct Win32Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+struct Win32Message {
+    hwnd: Handle,
+    message: u32,
+    wparam: u64,
+    lparam: i64,
+    time: u32,
+    pt: Win32Point,
+}
+
+struct Win32WindowClass {
+    size: u32,
+    style: u32,
+    proc: fn(Handle, u32, u64, i64) -> i64,
+    class_extra: i32,
+    window_extra: i32,
+    instance: Handle,
+    icon: Handle,
+    cursor: Handle,
+    background: Handle,
+    menu_name: *u8,
+    class_name: *u8,
+    small_icon: Handle,
+}
+
+struct Win32PaintStruct {
+    hdc: Handle,
+    erase: i32,
+    paint_rect: Win32Rect,
+    restore: i32,
+    inc_update: i32,
+    // The SDK reserves 32 bytes here; naming them keeps the size right.
+    reserved_a: u64,
+    reserved_b: u64,
+    reserved_c: u64,
+    reserved_d: u64,
+}
+
+// BITMAPINFOHEADER. A 32-bit BI_RGB bitmap needs no colour table, so this
+// doubles as the BITMAPINFO the blit takes a pointer to.
+struct Win32BitmapInfoHeader {
+    size: u32,
+    width: i32,
+    height: i32,
+    planes: u16,
+    bit_count: u16,
+    compression: u32,
+    image_size: u32,
+    x_pixels_per_meter: i32,
+    y_pixels_per_meter: i32,
+    colors_used: u32,
+    colors_important: u32,
+}
+
+// --- Imports -----------------------------------------------------------------
+//
+// Mort's `pub` applies to function declarations only, not to `extern`, so each
+// import is declared privately and re-exported through a thin wrapper. That
+// keeps every Windows symbol inside this module, which is exactly the boundary
+// a port needs to replace.
+
+extern fn GetModuleHandleA(module_name: *u8) -> Handle;
+extern fn LoadCursorA(instance: Handle, cursor_name: *u8) -> Handle;
+extern fn RegisterClassExA(window_class: *Win32WindowClass) -> u16;
+extern fn CreateWindowExA(
+ex_style: u32,
+class_name: *u8,
+window_name: *u8,
+style: u32,
+x: i32,
+y: i32,
+width: i32,
+height: i32,
+parent: Handle,
+menu: Handle,
+instance: Handle,
+param: *void
+) -> Handle;
+extern fn ShowWindow(window: Handle, command: i32) -> i32;
+extern fn UpdateWindow(window: Handle) -> i32;
+extern fn GetMessageA(
+message: *Win32Message,
+window: Handle,
+filter_min: u32,
+filter_max: u32
+) -> i32;
+extern fn TranslateMessage(message: *Win32Message) -> i32;
+extern fn DispatchMessageA(message: *Win32Message) -> i64;
+extern fn DefWindowProcA(
+window: Handle,
+message: u32,
+wparam: u64,
+lparam: i64
+) -> i64;
+extern fn PostQuitMessage(exit_code: i32) -> void;
+extern fn BeginPaint(window: Handle, paint: *Win32PaintStruct) -> Handle;
+extern fn EndPaint(window: Handle, paint: *Win32PaintStruct) -> i32;
+extern fn GetClientRect(window: Handle, rect: *Win32Rect) -> i32;
+extern fn InvalidateRect(window: Handle, rect: *Win32Rect, erase: i32) -> i32;
+extern fn StretchDIBits(
+hdc: Handle,
+x_dest: i32,
+y_dest: i32,
+width_dest: i32,
+height_dest: i32,
+x_src: i32,
+y_src: i32,
+width_src: i32,
+height_src: i32,
+bits: *void,
+info: *Win32BitmapInfoHeader,
+usage: u32,
+rop: u32
+) -> i32;
+
+pub fn module_handle() -> Handle {
+    return GetModuleHandleA(0 as *u8);
+}
+
+pub fn arrow_cursor() -> Handle {
+    return LoadCursorA(0 as Handle, 32512 as *u8);
+}
+
+pub fn register_class(window_class: *Win32WindowClass) -> bool {
+    return RegisterClassExA(window_class) != 0 as u16;
+}
+
+pub fn create_window(
+class_name: *u8,
+title: *u8,
+width: i32,
+height: i32,
+instance: Handle
+) -> Handle {
+    return CreateWindowExA(0 as u32, class_name, title,
+    ws_overlappedwindow(), cw_usedefault(), cw_usedefault(),
+    width, height, 0 as Handle, 0 as Handle, instance, 0 as *void);
+}
+
+pub fn show(window: Handle) -> void {
+    ShowWindow(window, 5);
+    UpdateWindow(window);
+}
+
+pub fn next_message(message: *Win32Message) -> bool {
+    return GetMessageA(message, 0 as Handle, 0 as u32, 0 as u32) > 0;
+}
+
+pub fn dispatch(message: *Win32Message) -> void {
+    TranslateMessage(message);
+    DispatchMessageA(message);
+}
+
+pub fn default_proc(
+window: Handle,
+message: u32,
+wparam: u64,
+lparam: i64
+) -> i64 {
+    return DefWindowProcA(window, message, wparam, lparam);
+}
+
+pub fn quit() -> void {
+    PostQuitMessage(0);
+}
+
+pub fn begin_paint(window: Handle, paint: *Win32PaintStruct) -> Handle {
+    return BeginPaint(window, paint);
+}
+
+pub fn end_paint(window: Handle, paint: *Win32PaintStruct) -> void {
+    EndPaint(window, paint);
+}
+
+pub fn client_rect(window: Handle) -> Win32Rect {
+    let rect: Win32Rect = Win32Rect { left: 0, top: 0, right: 0, bottom: 0 };
+    GetClientRect(window, &rect);
+    return rect;
+}
+
+pub fn invalidate(window: Handle) -> void {
+    InvalidateRect(window, 0 as *Win32Rect, 0);
+}
+
+// Blit `rows` scanlines of a top-down 32-bit BGRA image, starting at
+// `source_y`, into the top-left of the window's client area.
+pub fn blit_rows(
+hdc: Handle,
+pixels: *u8,
+image_width: i32,
+image_height: i32,
+source_y: i32,
+width: i32,
+rows: i32
+) -> void {
+    // A negative height tells GDI the rows run top-down, which is how the
+    // canvas is laid out.
+    let info: Win32BitmapInfoHeader = Win32BitmapInfoHeader {
+        size: 40 as u32,
+        width: image_width,
+        height: 0 - image_height,
+        planes: 1 as u16,
+        bit_count: 32 as u16,
+        compression: 0 as u32,
+        image_size: 0 as u32,
+        x_pixels_per_meter: 2835,
+        y_pixels_per_meter: 2835,
+        colors_used: 0 as u32,
+        colors_important: 0 as u32,
+    };
+    StretchDIBits(hdc, 0, 0, width, rows,
+    0, source_y, width, rows,
+    pixels as *void, &info, 0 as u32, 0x00CC0020 as u32);
+}
+
+// --- Constants ---------------------------------------------------------------
+// Mort globals are file-scope, so these are functions.
+
+pub fn cs_hredraw() -> u32 { return 2 as u32; }
+pub fn cs_vredraw() -> u32 { return 1 as u32; }
+pub fn cs_owndc() -> u32 { return 32 as u32; }
+pub fn idc_arrow() -> *u8 { return 32512 as *u8; }
+pub fn ws_overlappedwindow() -> u32 { return 0x00CF0000 as u32; }
+pub fn ws_vscroll() -> u32 { return 0x00200000 as u32; }
+pub fn sw_show() -> i32 { return 5; }
+pub fn cw_usedefault() -> i32 { return 0x80000000 as i32; }
+pub fn wm_destroy() -> u32 { return 2 as u32; }
+pub fn wm_paint() -> u32 { return 15 as u32; }
+pub fn wm_keydown() -> u32 { return 256 as u32; }
+pub fn wm_mousewheel() -> u32 { return 522 as u32; }
+pub fn wm_size() -> u32 { return 5 as u32; }
+pub fn bi_rgb() -> u32 { return 0 as u32; }
+pub fn dib_rgb_colors() -> u32 { return 0 as u32; }
+pub fn srccopy() -> u32 { return 0x00CC0020 as u32; }
+pub fn vk_escape() -> u64 { return 27; }
+pub fn vk_down() -> u64 { return 40; }
+pub fn vk_up() -> u64 { return 38; }
+pub fn vk_next() -> u64 { return 34; }
+pub fn vk_prior() -> u64 { return 33; }
