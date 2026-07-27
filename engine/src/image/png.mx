@@ -1,0 +1,523 @@
+// PNG decoding — the PNG Specification (Third Edition, W3C).
+//
+// A PNG is a signature, then a chain of length-tagged chunks. The ones that
+// matter here are IHDR (the dimensions and pixel format), PLTE and tRNS (the
+// palette and its transparency), IDAT (the pixel data, as one zlib stream split
+// across however many chunks the encoder felt like), and IEND.
+//
+// Between the zlib stream and the pixels sit two more layers, and both are the
+// reason PNG compresses as well as it does:
+//
+//   filtering    each scanline is preceded by a filter byte saying how its
+//                bytes were predicted from the ones above and to the left
+//                (§9). Undoing it is a per-byte loop that has to run in order,
+//                because each byte's reconstruction depends on the last.
+//
+//   interlacing  an Adam7 image is seven smaller images at increasing
+//                resolution (§8), each separately filtered, which is what lets
+//                a browser show a blurry version before the file has finished
+//                arriving.
+//
+// Supported: every colour type (greyscale, truecolour, palette, greyscale with
+// alpha, truecolour with alpha) at every bit depth the format allows (1, 2, 4,
+// 8 and 16), interlaced or not, with tRNS transparency for the palette,
+// greyscale and truecolour types.
+//
+// Not supported, and each is a colour-accuracy refinement rather than a
+// decoding one: gAMA and iCCP colour correction, and 16-bit output precision
+// (16-bit samples are read and then reduced to 8 bits, which is what the
+// canvas holds).
+module engine.image.png;
+
+import std.vec;
+import engine.image.inflate;
+import engine.image.bitmap;
+
+// Colour types (§11.2.2).
+const COLOUR_GREY: u64 = 0;
+const COLOUR_RGB: u64 = 2;
+const COLOUR_PALETTE: u64 = 3;
+const COLOUR_GREY_ALPHA: u64 = 4;
+const COLOUR_RGBA: u64 = 6;
+
+struct PngHeader {
+    ok: bool,
+    width: u64,
+    height: u64,
+    bit_depth: u64,
+    colour_type: u64,
+    interlaced: bool,
+}
+
+fn u32_at(data: *const u8, length: u64, offset: u64) -> u64 {
+    if offset + 4 > length {
+        return 0;
+    }
+    return ((data[offset] as u64) << 24) | ((data[offset + 1] as u64) << 16)
+        | ((data[offset + 2] as u64) << 8) | (data[offset + 3] as u64);
+}
+
+fn tag_is(data: *const u8, offset: u64, text: *u8) -> bool {
+    for index: u64 in 0..4 {
+        if data[offset + index] != text[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// How many channels a colour type stores per pixel.
+fn channels_for(colour_type: u64) -> u64 {
+    if colour_type == COLOUR_GREY { return 1; }
+    if colour_type == COLOUR_RGB { return 3; }
+    if colour_type == COLOUR_PALETTE { return 1; }
+    if colour_type == COLOUR_GREY_ALPHA { return 2; }
+    if colour_type == COLOUR_RGBA { return 4; }
+    return 0;
+}
+
+fn valid_depth(colour_type: u64, depth: u64) -> bool {
+    if colour_type == COLOUR_GREY {
+        return depth == 1 || depth == 2 || depth == 4 || depth == 8
+            || depth == 16;
+    }
+    if colour_type == COLOUR_PALETTE {
+        return depth == 1 || depth == 2 || depth == 4 || depth == 8;
+    }
+    return depth == 8 || depth == 16;
+}
+
+// §9.2 "filter types": undo one scanline's filter in place. `previous` is the
+// already-reconstructed line above, and `step` is the distance to the
+// corresponding byte of the pixel to the left.
+fn unfilter_line(
+    line: *Vec<u8>,
+    start: u64,
+    length: u64,
+    previous: *Vec<u8>,
+    previous_start: u64,
+    has_previous: bool,
+    step: u64,
+    filter: u64
+) -> void {
+    if filter == 0 {
+        return;
+    }
+    for index: u64 in 0..length {
+        let raw: u64 = (*line).data[start + index] as u64;
+        let left: u64 = 0;
+        if index >= step {
+            left = (*line).data[start + index - step] as u64;
+        }
+        let above: u64 = 0;
+        if has_previous {
+            above = (*previous).data[previous_start + index] as u64;
+        }
+        let above_left: u64 = 0;
+        if has_previous && index >= step {
+            above_left = (*previous).data[previous_start + index - step] as u64;
+        }
+        let value: u64 = raw;
+        if filter == 1 {
+            value = raw + left;
+        } else if filter == 2 {
+            value = raw + above;
+        } else if filter == 3 {
+            value = raw + (left + above) / 2;
+        } else if filter == 4 {
+            value = raw + paeth(left, above, above_left);
+        }
+        vec.set(line, start + index, (value & (255 as u64)) as u8);
+    }
+}
+
+// §9.4: the Paeth predictor picks whichever neighbour the gradient suggests.
+fn paeth(a: u64, b: u64, c: u64) -> u64 {
+    let p: i64 = (a as i64) + (b as i64) - (c as i64);
+    let pa: i64 = p - (a as i64);
+    let pb: i64 = p - (b as i64);
+    let pc: i64 = p - (c as i64);
+    if pa < 0 { pa = 0 - pa; }
+    if pb < 0 { pb = 0 - pb; }
+    if pc < 0 { pc = 0 - pc; }
+    if pa <= pb && pa <= pc {
+        return a;
+    }
+    if pb <= pc {
+        return b;
+    }
+    return c;
+}
+
+// Read one sample of `depth` bits from a byte-packed scanline.
+fn sample_at(line: *Vec<u8>, start: u64, depth: u64, index: u64) -> u64 {
+    if depth == 8 {
+        return (*line).data[start + index] as u64;
+    }
+    if depth == 16 {
+        // Reduced to eight bits: the canvas has no more precision than that,
+        // and the high byte is the value to within 1/257.
+        return (*line).data[start + index * 2] as u64;
+    }
+    let per_byte: u64 = 8 / depth;
+    let byte: u64 = (*line).data[start + index / per_byte] as u64;
+    let shift: u64 = (per_byte - 1 - (index % per_byte)) * depth;
+    let mask: u64 = ((1 as u64) << depth) - 1;
+    return (byte >> shift) & mask;
+}
+
+// Scale a sample of `depth` bits into the full 0..255 range, which is what
+// §13.13 "sample depth scaling" prescribes.
+fn scale_sample(value: u64, depth: u64) -> u8 {
+    if depth == 8 || depth == 16 {
+        return value as u8;
+    }
+    let maximum: u64 = ((1 as u64) << depth) - 1;
+    return ((value * 255) / maximum) as u8;
+}
+
+// The palette and its optional alpha, as flat byte lists.
+struct PngPalette {
+    entries: Vec<u8>,
+    alpha: Vec<u8>,
+}
+
+fn palette_channel(palette: *PngPalette, index: u64, channel: u64) -> u8 {
+    match vec.get(&(*palette).entries, index * 3 + channel) {
+        Option<u8>.Some(value) => { return value; },
+        Option<u8>.None => { return 0 as u8; },
+    }
+}
+
+fn palette_alpha(palette: *PngPalette, index: u64) -> u8 {
+    match vec.get(&(*palette).alpha, index) {
+        Option<u8>.Some(value) => { return value; },
+        Option<u8>.None => { return 255 as u8; },
+    }
+}
+
+// The transparent colour a tRNS chunk names for a non-palette image.
+struct PngTransparency {
+    present: bool,
+    grey: u64,
+    r: u64,
+    g: u64,
+    b: u64,
+}
+
+// Turn one reconstructed scanline into pixels of the output image.
+fn emit_line(
+    image: *Bitmap,
+    line: *Vec<u8>,
+    start: u64,
+    header: PngHeader,
+    palette: *PngPalette,
+    transparent: PngTransparency,
+    x0: u64,
+    dx: u64,
+    y: u64,
+    count: u64
+) -> void {
+    let depth: u64 = header.bit_depth;
+    let channels: u64 = channels_for(header.colour_type);
+    for index: u64 in 0..count {
+        let base: u64 = index * channels;
+        let r: u8 = 0 as u8;
+        let g: u8 = 0 as u8;
+        let b: u8 = 0 as u8;
+        let a: u8 = 255 as u8;
+        if header.colour_type == COLOUR_GREY {
+            let raw: u64 = sample_at(line, start, depth, base);
+            let value: u8 = scale_sample(raw, depth);
+            r = value; g = value; b = value;
+            if transparent.present && raw == transparent.grey {
+                a = 0 as u8;
+            }
+        } else if header.colour_type == COLOUR_RGB {
+            let raw_r: u64 = sample_at(line, start, depth, base);
+            let raw_g: u64 = sample_at(line, start, depth, base + 1);
+            let raw_b: u64 = sample_at(line, start, depth, base + 2);
+            r = scale_sample(raw_r, depth);
+            g = scale_sample(raw_g, depth);
+            b = scale_sample(raw_b, depth);
+            if transparent.present && raw_r == transparent.r
+                && raw_g == transparent.g && raw_b == transparent.b {
+                a = 0 as u8;
+            }
+        } else if header.colour_type == COLOUR_PALETTE {
+            let entry: u64 = sample_at(line, start, depth, base);
+            r = palette_channel(palette, entry, 0);
+            g = palette_channel(palette, entry, 1);
+            b = palette_channel(palette, entry, 2);
+            a = palette_alpha(palette, entry);
+        } else if header.colour_type == COLOUR_GREY_ALPHA {
+            let value: u8 = scale_sample(sample_at(line, start, depth, base), depth);
+            r = value; g = value; b = value;
+            a = scale_sample(sample_at(line, start, depth, base + 1), depth);
+        } else {
+            r = scale_sample(sample_at(line, start, depth, base), depth);
+            g = scale_sample(sample_at(line, start, depth, base + 1), depth);
+            b = scale_sample(sample_at(line, start, depth, base + 2), depth);
+            a = scale_sample(sample_at(line, start, depth, base + 3), depth);
+        }
+        bitmap.set_pixel(image, x0 + index * dx, y, r, g, b, a);
+    }
+}
+
+// §8: the seven Adam7 passes, as (starting column, starting row, column step,
+// row step).
+fn pass_start_x(pass: u64) -> u64 {
+    let table: [u8; 7] = [
+        0 as u8, 4 as u8, 0 as u8, 2 as u8, 0 as u8, 1 as u8, 0 as u8,
+    ];
+    return table[pass] as u64;
+}
+
+fn pass_start_y(pass: u64) -> u64 {
+    let table: [u8; 7] = [
+        0 as u8, 0 as u8, 4 as u8, 0 as u8, 2 as u8, 0 as u8, 1 as u8,
+    ];
+    return table[pass] as u64;
+}
+
+fn pass_step_x(pass: u64) -> u64 {
+    let table: [u8; 7] = [
+        8 as u8, 8 as u8, 4 as u8, 4 as u8, 2 as u8, 2 as u8, 1 as u8,
+    ];
+    return table[pass] as u64;
+}
+
+fn pass_step_y(pass: u64) -> u64 {
+    let table: [u8; 7] = [
+        8 as u8, 8 as u8, 8 as u8, 4 as u8, 4 as u8, 2 as u8, 2 as u8,
+    ];
+    return table[pass] as u64;
+}
+
+// How many pixels across and down one Adam7 pass covers.
+fn pass_extent(total: u64, start: u64, step: u64) -> u64 {
+    if total <= start {
+        return 0;
+    }
+    return (total - start + step - 1) / step;
+}
+
+// Reconstruct one pass — or the whole image, when it is not interlaced — from
+// `data`, starting at `offset`, and write its pixels. Returns how many bytes
+// were consumed, or 0 on a malformed stream.
+fn read_pass(
+    image: *Bitmap,
+    data: *Vec<u8>,
+    offset: u64,
+    header: PngHeader,
+    palette: *PngPalette,
+    transparent: PngTransparency,
+    columns: u64,
+    rows: u64,
+    x0: u64,
+    y0: u64,
+    dx: u64,
+    dy: u64
+) -> u64 {
+    if columns == 0 || rows == 0 {
+        return 0;
+    }
+    let channels: u64 = channels_for(header.colour_type);
+    let bits_per_pixel: u64 = channels * header.bit_depth;
+    let stride: u64 = (columns * bits_per_pixel + 7) / 8;
+    // The filter's "left" neighbour is one pixel back, rounded up to a byte.
+    let step: u64 = (bits_per_pixel + 7) / 8;
+
+    // Two rolling buffers: the line being reconstructed and the one above it.
+    let current: Vec<u8> = vec.new<u8>();
+    let previous: Vec<u8> = vec.new<u8>();
+    for index: u64 in 0..stride {
+        vec.push(&current, 0 as u8);
+        vec.push(&previous, 0 as u8);
+    }
+
+    let cursor: u64 = offset;
+    for row: u64 in 0..rows {
+        if cursor >= (*data).length {
+            vec.destroy(&current);
+            vec.destroy(&previous);
+            return 0;
+        }
+        let filter: u64 = (*data).data[cursor] as u64;
+        cursor = cursor + 1;
+        if cursor + stride > (*data).length || filter > 4 {
+            vec.destroy(&current);
+            vec.destroy(&previous);
+            return 0;
+        }
+        for index: u64 in 0..stride {
+            vec.set(&current, index, (*data).data[cursor + index]);
+        }
+        cursor = cursor + stride;
+        unfilter_line(&current, 0, stride, &previous, 0, row > 0, step, filter);
+        emit_line(image, &current, 0, header, palette, transparent,
+            x0, dx, y0 + row * dy, columns);
+        for index: u64 in 0..stride {
+            vec.set(&previous, index, current.data[index]);
+        }
+    }
+    vec.destroy(&current);
+    vec.destroy(&previous);
+    return cursor - offset;
+}
+
+// Decode a PNG. An unreadable file gives an empty bitmap rather than an error,
+// which is what a browser shows for a broken image.
+pub fn decode(data: *const u8, length: u64) -> Bitmap {
+    let empty: Bitmap = bitmap.new_bitmap(0, 0);
+    if length < 8 {
+        return move empty;
+    }
+    // §5.2: the eight-byte signature, chosen to survive the transfer mistakes
+    // that used to mangle binary files.
+    if !is_png(data, length) {
+        return move empty;
+    }
+
+    let header: PngHeader = PngHeader {
+        ok: false, width: 0, height: 0, bit_depth: 8,
+        colour_type: COLOUR_RGB, interlaced: false,
+    };
+    let palette: PngPalette = PngPalette {
+        entries: vec.new<u8>(), alpha: vec.new<u8>(),
+    };
+    let transparent: PngTransparency = PngTransparency {
+        present: false, grey: 0, r: 0, g: 0, b: 0,
+    };
+    let compressed: Vec<u8> = vec.new<u8>();
+
+    let cursor: u64 = 8;
+    loop {
+        if cursor + 8 > length {
+            break;
+        }
+        let chunk_length: u64 = u32_at(data, length, cursor);
+        let tag: u64 = cursor + 4;
+        let body: u64 = cursor + 8;
+        if body + chunk_length + 4 > length {
+            break;
+        }
+        if tag_is(data, tag, "IHDR") && chunk_length >= 13 {
+            header.width = u32_at(data, length, body);
+            header.height = u32_at(data, length, body + 4);
+            header.bit_depth = data[body + 8] as u64;
+            header.colour_type = data[body + 9] as u64;
+            // Byte 10 is the compression method and byte 11 the filter method;
+            // the format defines exactly one of each, so anything else is a
+            // file this decoder cannot read.
+            let compression: u64 = data[body + 10] as u64;
+            let filter_method: u64 = data[body + 11] as u64;
+            header.interlaced = data[body + 12] == 1 as u8;
+            header.ok = compression == 0 && filter_method == 0
+                && channels_for(header.colour_type) > 0
+                && valid_depth(header.colour_type, header.bit_depth)
+                && header.width > 0 && header.height > 0;
+            if !header.ok {
+                break;
+            }
+        } else if tag_is(data, tag, "PLTE") {
+            for index: u64 in 0..chunk_length {
+                vec.push(&palette.entries, data[body + index]);
+            }
+        } else if tag_is(data, tag, "tRNS") {
+            if header.colour_type == COLOUR_PALETTE {
+                for index: u64 in 0..chunk_length {
+                    vec.push(&palette.alpha, data[body + index]);
+                }
+            } else if header.colour_type == COLOUR_GREY && chunk_length >= 2 {
+                transparent.present = true;
+                transparent.grey = ((data[body] as u64) << 8)
+                    | (data[body + 1] as u64);
+                if header.bit_depth <= 8 {
+                    transparent.grey = transparent.grey & (255 as u64);
+                }
+            } else if header.colour_type == COLOUR_RGB && chunk_length >= 6 {
+                transparent.present = true;
+                transparent.r = ((data[body] as u64) << 8)
+                    | (data[body + 1] as u64);
+                transparent.g = ((data[body + 2] as u64) << 8)
+                    | (data[body + 3] as u64);
+                transparent.b = ((data[body + 4] as u64) << 8)
+                    | (data[body + 5] as u64);
+                if header.bit_depth <= 8 {
+                    transparent.r = transparent.r & (255 as u64);
+                    transparent.g = transparent.g & (255 as u64);
+                    transparent.b = transparent.b & (255 as u64);
+                }
+            }
+        } else if tag_is(data, tag, "IDAT") {
+            // §5.4: the image data is one zlib stream, which may be split
+            // across any number of IDAT chunks at any boundary.
+            for index: u64 in 0..chunk_length {
+                vec.push(&compressed, data[body + index]);
+            }
+        } else if tag_is(data, tag, "IEND") {
+            break;
+        }
+        cursor = body + chunk_length + 4;
+    }
+
+    if !header.ok || compressed.length == 0 {
+        vec.destroy(&compressed);
+        vec.destroy(&palette.entries);
+        vec.destroy(&palette.alpha);
+        return move empty;
+    }
+
+    let raw: InflateResult =
+        inflate.zlib_inflate(compressed.data as *const u8, compressed.length);
+    vec.destroy(&compressed);
+    if raw.data.length == 0 {
+        vec.destroy(&raw.data);
+        vec.destroy(&palette.entries);
+        vec.destroy(&palette.alpha);
+        return move empty;
+    }
+
+    bitmap.destroy(&empty);
+    let image: Bitmap = bitmap.new_bitmap(header.width, header.height);
+    if header.interlaced {
+        let offset: u64 = 0;
+        for pass: u64 in 0..7 {
+            let columns: u64 = pass_extent(header.width, pass_start_x(pass),
+                pass_step_x(pass));
+            let rows: u64 = pass_extent(header.height, pass_start_y(pass),
+                pass_step_y(pass));
+            if columns == 0 || rows == 0 {
+                continue;
+            }
+            let used: u64 = read_pass(&image, &raw.data, offset, header,
+                &palette, transparent, columns, rows,
+                pass_start_x(pass), pass_start_y(pass),
+                pass_step_x(pass), pass_step_y(pass));
+            if used == 0 {
+                break;
+            }
+            offset = offset + used;
+        }
+    } else {
+        read_pass(&image, &raw.data, 0, header, &palette, transparent,
+            header.width, header.height, 0, 0, 1, 1);
+    }
+
+    vec.destroy(&raw.data);
+    vec.destroy(&palette.entries);
+    vec.destroy(&palette.alpha);
+    return move image;
+}
+
+// True when `data` starts with the PNG signature, so a caller can pick a
+// decoder without trusting a file extension.
+pub fn is_png(data: *const u8, length: u64) -> bool {
+    if length < 8 {
+        return false;
+    }
+    return data[0] == 137 as u8 && data[1] == 80 as u8 && data[2] == 78 as u8
+        && data[3] == 71 as u8 && data[4] == 13 as u8 && data[5] == 10 as u8
+        && data[6] == 26 as u8 && data[7] == 10 as u8;
+}

@@ -24,6 +24,7 @@ import engine.layout.box;
 import engine.layout.flow;
 import engine.layout.serialize as layout_serialize;
 import engine.text.fonts;
+import engine.image.store;
 
 resource struct Laid {
     html_normalized: Vec<u8>,
@@ -39,6 +40,7 @@ resource struct Laid {
     env: CustomEnv,
     styles: StyleTree,
     font_set: TextFontSet,
+    images: ImageStore,
     boxes: LayoutTree,
 }
 
@@ -81,8 +83,9 @@ fn build(html: *u8, css: *u8, viewport: f64) -> Laid {
     // No faces are installed, so metrics use the estimate table. That keeps
     // these expectations independent of which fonts the machine has.
     let font_set: TextFontSet = fonts.new_set();
+    let images: ImageStore = store.new_store();
     let boxes: LayoutTree = box.new_tree();
-    flow.layout(&doc, &styles, &boxes, &font_set, viewport);
+    flow.layout(&doc, &styles, &boxes, &font_set, &images, viewport);
 
     return Laid {
         html_normalized: move html_normalized,
@@ -98,12 +101,14 @@ fn build(html: *u8, css: *u8, viewport: f64) -> Laid {
         env: move env,
         styles: move styles,
         font_set: move font_set,
+        images: move images,
         boxes: move boxes,
     };
 }
 
 fn destroy(l: *Laid) -> void {
     box.destroy(&(*l).boxes);
+    store.destroy(&(*l).images);
     fonts.destroy(&(*l).font_set);
     computed.destroy(&(*l).styles);
     custom.destroy(&(*l).env);

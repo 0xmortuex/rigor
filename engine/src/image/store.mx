@@ -1,0 +1,103 @@
+// Decoded images, keyed by the DOM node that referenced them.
+//
+// Layout needs an image's intrinsic size before it can place the box, and paint
+// needs its pixels after; both look here. Everything lives in one flat arena —
+// a record per image and one shared pixel buffer — rather than a Bitmap per
+// entry, which keeps the store a single owner and matches how the DOM, the
+// stylesheet and the box tree are all built.
+module engine.image.store;
+
+import std.vec;
+import engine.image.bitmap;
+
+struct ImageEntry {
+    // The DOM node of the element that referenced this image.
+    node: u64,
+    // Where its RGBA pixels start in the shared buffer.
+    offset: u64,
+    width: u64,
+    height: u64,
+}
+
+resource struct ImageStore {
+    entries: Vec<ImageEntry>,
+    pixels: Vec<u8>,
+}
+
+pub fn new_store() -> ImageStore {
+    return ImageStore {
+        entries: vec.new<ImageEntry>(),
+        pixels: vec.new<u8>(),
+    };
+}
+
+pub fn destroy(store: *ImageStore) -> void {
+    vec.destroy(&(*store).entries);
+    vec.destroy(&(*store).pixels);
+}
+
+pub fn missing() -> ImageEntry {
+    return ImageEntry { node: 0, offset: 0, width: 0, height: 0 };
+}
+
+pub fn is_missing(entry: ImageEntry) -> bool {
+    return entry.width == 0 || entry.height == 0;
+}
+
+// Copy a decoded image in, associating it with `node`.
+pub fn add(store: *ImageStore, node: u64, image: *Bitmap) -> void {
+    if bitmap.is_empty(image) {
+        return;
+    }
+    let offset: u64 = (*store).pixels.length;
+    for y: u64 in 0..bitmap.height(image) {
+        for x: u64 in 0..bitmap.width(image) {
+            for channel: u64 in 0..4 {
+                vec.push(&(*store).pixels, bitmap.channel(image, x, y, channel));
+            }
+        }
+    }
+    vec.push(&(*store).entries, ImageEntry {
+        node: node,
+        offset: offset,
+        width: bitmap.width(image),
+        height: bitmap.height(image),
+    });
+}
+
+pub fn find(store: *ImageStore, node: u64) -> ImageEntry {
+    for index: u64 in 0..(*store).entries.length {
+        match vec.get(&(*store).entries, index) {
+            Option<ImageEntry>.Some(entry) => {
+                if entry.node == node {
+                    return entry;
+                }
+            },
+            Option<ImageEntry>.None => {},
+        }
+    }
+    return missing();
+}
+
+pub fn count(store: *ImageStore) -> u64 {
+    return (*store).entries.length;
+}
+
+// One channel of one pixel. Coordinates outside the image read as transparent
+// black, so a caller sampling a scaled image cannot walk off the end.
+pub fn channel(
+    store: *ImageStore,
+    entry: ImageEntry,
+    x: u64,
+    y: u64,
+    index: u64
+) -> u8 {
+    if x >= entry.width || y >= entry.height || index >= 4 {
+        return 0 as u8;
+    }
+    match vec.get(&(*store).pixels,
+        entry.offset + (y * entry.width + x) * 4 + index) {
+        Option<u8>.Some(value) => { return value; },
+        Option<u8>.None => { return 0 as u8; },
+    }
+}

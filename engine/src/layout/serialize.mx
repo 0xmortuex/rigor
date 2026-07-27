@@ -60,6 +60,7 @@ fn kind_name(kind: u8) -> *u8 {
     if kind == box.box_block() { return "block"; }
     if kind == box.box_inline() { return "inline"; }
     if kind == box.box_anonymous() { return "anon"; }
+    if kind == box.box_replaced() { return "replaced"; }
     return "text";
 }
 

@@ -23,6 +23,7 @@ import engine.text.sfnt;
 import engine.text.fonts;
 import engine.text.cache;
 import engine.text.utf8;
+import engine.image.store;
 
 fn paint_background(
     target: *Canvas,
@@ -221,12 +222,54 @@ fn estimate_advance(c: u8, font_size: f64) -> f64 {
     return 0.55 * font_size;
 }
 
+// Draw a decoded image into its box, scaled to the used size.
+//
+// Nearest-neighbour sampling: the source pixel for a destination pixel is the
+// one its centre falls in. That is what an unscaled image needs (and an image
+// is usually unscaled), and it is honest about what it does — a smooth filter
+// would be a separate, later choice about quality rather than about
+// correctness.
+fn paint_image(
+    target: *Canvas,
+    images: *ImageStore,
+    current: LayoutBox
+) -> void {
+    let entry: ImageEntry = store.find(images, current.node);
+    if store.is_missing(entry) || current.width <= 0.0 || current.height <= 0.0 {
+        return;
+    }
+    let left: f64 = current.x + current.border_left + current.padding_left;
+    let top: f64 = current.y + current.border_top + current.padding_top;
+    let columns: u64 = (current.width + 0.5) as u64;
+    let rows: u64 = (current.height + 0.5) as u64;
+    for row: u64 in 0..rows {
+        let source_y: u64 =
+            (((row as f64) + 0.5) * (entry.height as f64) / current.height) as u64;
+        for column: u64 in 0..columns {
+            let source_x: u64 = (((column as f64) + 0.5) * (entry.width as f64)
+                / current.width) as u64;
+            let alpha: u8 = store.channel(images, entry, source_x, source_y, 3);
+            if alpha == 0 as u8 {
+                continue;
+            }
+            canvas.fill_rect(target,
+                left + (column as f64), top + (row as f64), 1.0, 1.0,
+                computed.rgba(
+                    store.channel(images, entry, source_x, source_y, 0),
+                    store.channel(images, entry, source_x, source_y, 1),
+                    store.channel(images, entry, source_x, source_y, 2),
+                    alpha));
+        }
+    }
+}
+
 fn paint_box(
     target: *Canvas,
     tree: *LayoutTree,
     styles: *StyleTree,
     set: *TextFontSet,
     glyphs: *TextGlyphCache,
+    images: *ImageStore,
     index: u64
 ) -> void {
     let current: LayoutBox = box.get(tree, index);
@@ -239,6 +282,10 @@ fn paint_box(
         // Fall through to the children, each of which decides for itself.
     } else if current.kind == box.box_text() {
         paint_text(target, tree, set, glyphs, current, style);
+    } else if current.kind == box.box_replaced() {
+        paint_background(target, current, style);
+        paint_borders(target, current, style);
+        paint_image(target, images, current);
     } else if current.kind != box.box_anonymous() {
         // Anonymous boxes have no style of their own to paint; their content
         // is painted by their children.
@@ -248,7 +295,7 @@ fn paint_box(
 
     let child: u64 = current.first_child;
     while child != box.none() {
-        paint_box(target, tree, styles, set, glyphs, child);
+        paint_box(target, tree, styles, set, glyphs, images, child);
         child = box.get(tree, child).next_sibling;
     }
 }
@@ -260,7 +307,8 @@ pub fn paint(
     target: *Canvas,
     tree: *LayoutTree,
     styles: *StyleTree,
-    set: *TextFontSet
+    set: *TextFontSet,
+    images: *ImageStore
 ) -> void {
     canvas.fill_all(target,
         computed.rgba(255 as u8, 255 as u8, 255 as u8, 255 as u8));
@@ -272,6 +320,6 @@ pub fn paint(
     // renders would need the caller to own it and matters only once
     // incremental repaint exists.
     let glyphs: TextGlyphCache = cache.new_cache();
-    paint_box(target, tree, styles, set, &glyphs, (*tree).root);
+    paint_box(target, tree, styles, set, &glyphs, images, (*tree).root);
     cache.destroy(&glyphs);
 }

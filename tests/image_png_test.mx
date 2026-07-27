@@ -1,0 +1,285 @@
+// PNG decoding, and the DEFLATE decompressor underneath it.
+//
+// The images are built by tools/gen_test_images.py with zlib and struct alone,
+// so the inputs come from code as independent of this decoder as the decoder is
+// of them. Between them they cover every colour type, every bit depth the
+// format allows for it, both interlace methods, tRNS in all three of its forms,
+// and each of the five scanline filters.
+
+import std.vec;
+import std.string;
+import engine.image.png;
+import engine.image.bitmap;
+import engine.image.inflate;
+import engine.text.load;
+
+fn open_image(name: *u8) -> Bitmap {
+    let data: Vec<u8> = load.read_file(name);
+    let image: Bitmap = png.decode(data.data as *const u8, data.length);
+    vec.destroy(&data);
+    return move image;
+}
+
+// True when the pixel at (x, y) is exactly this colour.
+fn pixel_is(image: *Bitmap, x: u64, y: u64, r: u64, g: u64, b: u64, a: u64)
+    -> bool {
+    return (bitmap.channel(image, x, y, 0) as u64) == r
+        && (bitmap.channel(image, x, y, 1) as u64) == g
+        && (bitmap.channel(image, x, y, 2) as u64) == b
+        && (bitmap.channel(image, x, y, 3) as u64) == a;
+}
+
+fn opaque_grey(image: *Bitmap, x: u64, y: u64, value: u64) -> bool {
+    return pixel_is(image, x, y, value, value, value, 255);
+}
+
+// --- DEFLATE (RFC 1951) ------------------------------------------------------
+
+test "a stored deflate block round trips" {
+    // BFINAL=1, BTYPE=00, then LEN, ~LEN and the bytes themselves.
+    let stream: *u8 = "\x01\x05\x00\xfa\xffhello";
+    let result: InflateResult = inflate.inflate(stream as *const u8, 10);
+    assert(result.ok);
+    assert(result.data.length == 5);
+    assert(result.data.data[0] == 'h');
+    assert(result.data.data[4] == 'o');
+    vec.destroy(&result.data);
+}
+
+test "a truncated stream fails rather than reading past its end" {
+    let stream: *u8 = "\x01\x05\x00\xfa\xffhe";
+    let result: InflateResult = inflate.inflate(stream as *const u8, 7);
+    assert(!result.ok);
+    vec.destroy(&result.data);
+}
+
+test "adler32 matches the value RFC 1950 defines" {
+    // The checksum of "abc" is 0x024D0127.
+    let text: *u8 = "abc";
+    let sum: u32 = inflate.adler32(slice(text as *const u8, 3));
+    assert(sum == 0x024D0127 as u32);
+}
+
+test "a zlib stream with a bad header is refused" {
+    let stream: *u8 = "\x00\x00\x00\x00\x00\x00";
+    let result: InflateResult = inflate.zlib_inflate(stream as *const u8, 6);
+    assert(!result.ok);
+    vec.destroy(&result.data);
+}
+
+// --- Colour types ------------------------------------------------------------
+
+test "an 8-bit truecolour png decodes" {
+    let image: Bitmap = open_image("tests/images/rgb8.png");
+    assert(bitmap.width(&image) == 4);
+    assert(bitmap.height(&image) == 4);
+    assert(pixel_is(&image, 0, 0, 255, 0, 0, 255));
+    assert(pixel_is(&image, 3, 0, 0, 255, 0, 255));
+    assert(pixel_is(&image, 0, 3, 0, 0, 255, 255));
+    assert(pixel_is(&image, 3, 3, 255, 255, 255, 255));
+    bitmap.destroy(&image);
+}
+
+test "truecolour with alpha keeps its alpha channel" {
+    let image: Bitmap = open_image("tests/images/rgba8.png");
+    assert(pixel_is(&image, 0, 0, 255, 0, 0, 255));
+    assert(pixel_is(&image, 0, 3, 0, 0, 255, 128));
+    bitmap.destroy(&image);
+}
+
+test "greyscale decodes to equal channels" {
+    let image: Bitmap = open_image("tests/images/grey8.png");
+    assert(opaque_grey(&image, 0, 0, 0));
+    assert(opaque_grey(&image, 1, 0, 85));
+    assert(opaque_grey(&image, 3, 0, 255));
+    bitmap.destroy(&image);
+}
+
+test "16-bit samples are reduced to 8 bits" {
+    let image: Bitmap = open_image("tests/images/grey16.png");
+    assert(bitmap.width(&image) == 4);
+    assert(opaque_grey(&image, 1, 0, 85));
+    assert(opaque_grey(&image, 3, 0, 255));
+    bitmap.destroy(&image);
+}
+
+test "greyscale with alpha decodes both channels" {
+    let image: Bitmap = open_image("tests/images/greya8.png");
+    assert(pixel_is(&image, 0, 0, 0, 0, 0, 255));
+    assert(pixel_is(&image, 1, 0, 255, 255, 255, 0));
+    assert(pixel_is(&image, 0, 1, 128, 128, 128, 255));
+    bitmap.destroy(&image);
+}
+
+test "a palette image looks its colours up" {
+    let image: Bitmap = open_image("tests/images/palette8.png");
+    assert(pixel_is(&image, 0, 0, 255, 0, 0, 255));
+    assert(pixel_is(&image, 1, 0, 0, 255, 0, 255));
+    assert(pixel_is(&image, 2, 0, 0, 0, 255, 255));
+    assert(pixel_is(&image, 3, 0, 255, 255, 0, 255));
+    bitmap.destroy(&image);
+}
+
+// --- Sub-byte bit depths -----------------------------------------------------
+
+test "one bit per pixel unpacks and scales to full range" {
+    // §13.13: a 1-bit sample of 1 is white, not 1.
+    let image: Bitmap = open_image("tests/images/grey1.png");
+    assert(bitmap.width(&image) == 8);
+    assert(opaque_grey(&image, 0, 0, 0));
+    assert(opaque_grey(&image, 1, 0, 255));
+    assert(opaque_grey(&image, 7, 0, 0));
+    assert(opaque_grey(&image, 0, 1, 255));
+    bitmap.destroy(&image);
+}
+
+test "two bits per pixel unpacks" {
+    let image: Bitmap = open_image("tests/images/grey2.png");
+    assert(opaque_grey(&image, 0, 0, 0));
+    assert(opaque_grey(&image, 1, 0, 85));
+    assert(opaque_grey(&image, 2, 0, 170));
+    assert(opaque_grey(&image, 3, 0, 255));
+    bitmap.destroy(&image);
+}
+
+test "four bits per pixel unpacks" {
+    let image: Bitmap = open_image("tests/images/grey4.png");
+    assert(opaque_grey(&image, 0, 0, 0));
+    assert(opaque_grey(&image, 3, 0, 255));
+    assert(opaque_grey(&image, 0, 1, 255));
+    bitmap.destroy(&image);
+}
+
+test "a four-bit palette image unpacks and looks up" {
+    let image: Bitmap = open_image("tests/images/palette4.png");
+    assert(pixel_is(&image, 0, 0, 255, 0, 0, 255));
+    assert(pixel_is(&image, 3, 0, 255, 255, 0, 255));
+    assert(pixel_is(&image, 0, 1, 255, 255, 0, 255));
+    bitmap.destroy(&image);
+}
+
+// --- Filters (§9) ------------------------------------------------------------
+
+test "the sub, up and average filters reconstruct" {
+    // Each row of this image uses a different filter; the result must be the
+    // same as the unfiltered version.
+    let filtered: Bitmap = open_image("tests/images/rgb8-filters.png");
+    let plain: Bitmap = open_image("tests/images/rgb8.png");
+    let same: bool = true;
+    for y: u64 in 0..4 {
+        for x: u64 in 0..4 {
+            for channel: u64 in 0..4 {
+                if bitmap.channel(&filtered, x, y, channel)
+                    != bitmap.channel(&plain, x, y, channel) {
+                    same = false;
+                }
+            }
+        }
+    }
+    assert(same);
+    bitmap.destroy(&filtered);
+    bitmap.destroy(&plain);
+}
+
+test "the paeth filter reconstructs" {
+    let filtered: Bitmap = open_image("tests/images/rgb8-paeth.png");
+    let plain: Bitmap = open_image("tests/images/rgb8.png");
+    let same: bool = true;
+    for y: u64 in 0..4 {
+        for x: u64 in 0..4 {
+            for channel: u64 in 0..4 {
+                if bitmap.channel(&filtered, x, y, channel)
+                    != bitmap.channel(&plain, x, y, channel) {
+                    same = false;
+                }
+            }
+        }
+    }
+    assert(same);
+    bitmap.destroy(&filtered);
+    bitmap.destroy(&plain);
+}
+
+// --- Transparency (tRNS) -----------------------------------------------------
+
+test "tRNS makes one palette entry transparent" {
+    let image: Bitmap = open_image("tests/images/palette8-trns.png");
+    assert(pixel_is(&image, 0, 0, 255, 0, 0, 0));
+    assert(pixel_is(&image, 1, 0, 0, 255, 0, 255));
+    bitmap.destroy(&image);
+}
+
+test "tRNS makes one grey value transparent" {
+    let image: Bitmap = open_image("tests/images/grey8-trns.png");
+    assert(pixel_is(&image, 0, 0, 0, 0, 0, 0));
+    assert(pixel_is(&image, 1, 0, 85, 85, 85, 255));
+    bitmap.destroy(&image);
+}
+
+test "tRNS makes one colour transparent" {
+    let image: Bitmap = open_image("tests/images/rgb8-trns.png");
+    assert(pixel_is(&image, 0, 0, 255, 0, 0, 0));
+    assert(pixel_is(&image, 1, 0, 0, 255, 0, 255));
+    bitmap.destroy(&image);
+}
+
+// --- Interlacing (§8) --------------------------------------------------------
+
+test "an interlaced image decodes to the same pixels as a progressive one" {
+    let interlaced: Bitmap = open_image("tests/images/rgb8-interlaced.png");
+    let progressive: Bitmap = open_image("tests/images/rgb8-progressive.png");
+    assert(bitmap.width(&interlaced) == 8);
+    assert(bitmap.height(&interlaced) == 8);
+    let same: bool = true;
+    for y: u64 in 0..8 {
+        for x: u64 in 0..8 {
+            for channel: u64 in 0..4 {
+                if bitmap.channel(&interlaced, x, y, channel)
+                    != bitmap.channel(&progressive, x, y, channel) {
+                    same = false;
+                }
+            }
+        }
+    }
+    assert(same);
+    bitmap.destroy(&interlaced);
+    bitmap.destroy(&progressive);
+}
+
+// --- Larger images -----------------------------------------------------------
+
+test "a larger image decodes, exercising dynamic huffman blocks" {
+    let image: Bitmap = open_image("tests/images/rgb8-large.png");
+    assert(bitmap.width(&image) == 64);
+    assert(bitmap.height(&image) == 64);
+    // Every pixel is (x*y, x^y, x+y) modulo 256.
+    assert(pixel_is(&image, 0, 0, 0, 0, 0, 255));
+    assert(pixel_is(&image, 3, 5, 15, 6, 8, 255));
+    assert(pixel_is(&image, 63, 63, (63 * 63) % 256, 0, 126, 255));
+    bitmap.destroy(&image);
+}
+
+// --- Rejection ---------------------------------------------------------------
+
+test "a file that is not a png decodes to nothing" {
+    let text: *u8 = "not a png at all";
+    let image: Bitmap = png.decode(text as *const u8, 16);
+    assert(bitmap.is_empty(&image));
+    bitmap.destroy(&image);
+}
+
+test "the signature is checked" {
+    let text: *u8 = "\x89PNG\r\n\x1a\n";
+    assert(png.is_png(text as *const u8, 8));
+    let wrong: *u8 = "\x89PNG\r\n\x1a\x00";
+    assert(!png.is_png(wrong as *const u8, 8));
+}
+
+test "a truncated png decodes to nothing rather than crashing" {
+    let data: Vec<u8> = load.read_file("tests/images/rgb8.png");
+    // Half a file: the header survives, the image data does not.
+    let image: Bitmap = png.decode(data.data as *const u8, data.length / 2);
+    assert(bitmap.is_empty(&image));
+    bitmap.destroy(&image);
+    vec.destroy(&data);
+}

@@ -1,0 +1,456 @@
+// DEFLATE decompression — RFC 1951, and the zlib wrapper of RFC 1950.
+//
+// PNG's image data is a zlib stream, so a PNG decoder needs an inflater before
+// it needs anything else. This is that inflater: no compression, only
+// decompression, and no dependency on a library — which is the whole point of
+// the project.
+//
+// The Huffman decoder is the canonical-code one: rather than building a lookup
+// table, it walks the code lengths one bit at a time, comparing the code so far
+// against the first code of each length. That is slower per symbol than a
+// multi-level table and very much simpler to get right, and it is not where a
+// page's time goes.
+//
+// Everything is bounds-checked. A PNG is untrusted input, and a truncated or
+// hostile stream must stop rather than read past the buffer.
+module engine.image.inflate;
+
+import std.vec;
+
+// The literal/length alphabet has 288 symbols and the distance alphabet 32, so
+// one table sized for the larger serves both.
+struct HuffTable {
+    // How many codes there are of each bit length, 1 to 15.
+    counts: [u16; 16],
+    // The symbols, ordered canonically: by code length, then by symbol.
+    symbols: [u16; 288],
+}
+
+fn empty_table() -> HuffTable {
+    return HuffTable {
+        counts: [0 as u16; 16],
+        symbols: [0 as u16; 288],
+    };
+}
+
+struct InflateState {
+    data: *const u8,
+    length: u64,
+    // Byte position of the next unread byte.
+    pos: u64,
+    // Bits read out of the current byte but not yet consumed.
+    bitbuf: u64,
+    bitcount: u64,
+    ok: bool,
+}
+
+fn new_state(data: *const u8, length: u64) -> InflateState {
+    return InflateState {
+        data: data, length: length, pos: 0,
+        bitbuf: 0, bitcount: 0, ok: true,
+    };
+}
+
+// Read `need` bits, least significant first, which is DEFLATE's bit order.
+fn bits(state: *InflateState, need: u64) -> u64 {
+    let value: u64 = (*state).bitbuf;
+    while (*state).bitcount < need {
+        if (*state).pos >= (*state).length {
+            (*state).ok = false;
+            return 0;
+        }
+        value = value
+            | (((*state).data[(*state).pos] as u64) << (*state).bitcount);
+        (*state).pos = (*state).pos + 1;
+        (*state).bitcount = (*state).bitcount + 8;
+    }
+    (*state).bitbuf = value >> need;
+    (*state).bitcount = (*state).bitcount - need;
+    if need >= 64 {
+        return value;
+    }
+    return value & (((1 as u64) << need) - 1);
+}
+
+// §3.2.2: decode one symbol by walking the code lengths.
+fn decode(state: *InflateState, table: *HuffTable) -> i64 {
+    let code: i64 = 0;
+    let first: i64 = 0;
+    let index: i64 = 0;
+    for length: u64 in 1..16 {
+        code = code | (bits(state, 1) as i64);
+        if !(*state).ok {
+            return -1;
+        }
+        let count: i64 = (*table).counts[length] as i64;
+        if code - count < first {
+            let at: u64 = (index + (code - first)) as u64;
+            if at >= 288 {
+                return -1;
+            }
+            return (*table).symbols[at] as i64;
+        }
+        index = index + count;
+        first = (first + count) << 1;
+        code = code << 1;
+    }
+    return -1;
+}
+
+// Build a canonical Huffman table from a list of code lengths. Returns false
+// when the lengths are over-subscribed, which is a corrupt stream.
+fn construct(table: *HuffTable, lengths: *Vec<u8>, count: u64) -> bool {
+    for length: u64 in 0..16 {
+        (*table).counts[length] = 0 as u16;
+    }
+    for symbol: u64 in 0..count {
+        let length: u64 = length_at(lengths, symbol);
+        (*table).counts[length] = (*table).counts[length] + (1 as u16);
+    }
+    if ((*table).counts[0] as u64) == count {
+        // No codes at all: valid for a distance table when a block has only
+        // literals.
+        return true;
+    }
+    // §3.2.2: a complete code uses up exactly the available code space.
+    let left: i64 = 1;
+    for length: u64 in 1..16 {
+        left = left << 1;
+        left = left - ((*table).counts[length] as i64);
+        if left < 0 {
+            return false;
+        }
+    }
+    let offsets: [u16; 16] = [0 as u16; 16];
+    for length: u64 in 1..15 {
+        offsets[length + 1] = offsets[length] + (*table).counts[length];
+    }
+    for symbol: u64 in 0..count {
+        let length: u64 = length_at(lengths, symbol);
+        if length != 0 {
+            let at: u64 = offsets[length] as u64;
+            if at < 288 {
+                (*table).symbols[at] = symbol as u16;
+            }
+            offsets[length] = offsets[length] + (1 as u16);
+        }
+    }
+    return true;
+}
+
+fn length_at(lengths: *Vec<u8>, index: u64) -> u64 {
+    match vec.get(lengths, index) {
+        Option<u8>.Some(value) => {
+            if value > 15 as u8 {
+                return 15;
+            }
+            return value as u64;
+        },
+        Option<u8>.None => { return 0; },
+    }
+}
+
+// §3.2.5: the length and distance code tables. Written out rather than
+// computed, because that is how the RFC gives them.
+fn length_base(symbol: u64) -> u64 {
+    let table: [u16; 29] = [
+        3 as u16, 4 as u16, 5 as u16, 6 as u16, 7 as u16, 8 as u16, 9 as u16,
+        10 as u16, 11 as u16, 13 as u16, 15 as u16, 17 as u16, 19 as u16,
+        23 as u16, 27 as u16, 31 as u16, 35 as u16, 43 as u16, 51 as u16,
+        59 as u16, 67 as u16, 83 as u16, 99 as u16, 115 as u16, 131 as u16,
+        163 as u16, 195 as u16, 227 as u16, 258 as u16,
+    ];
+    if symbol >= 29 {
+        return 0;
+    }
+    return table[symbol] as u64;
+}
+
+fn length_extra(symbol: u64) -> u64 {
+    let table: [u8; 29] = [
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        1 as u8, 1 as u8, 1 as u8, 1 as u8, 2 as u8, 2 as u8, 2 as u8, 2 as u8,
+        3 as u8, 3 as u8, 3 as u8, 3 as u8, 4 as u8, 4 as u8, 4 as u8, 4 as u8,
+        5 as u8, 5 as u8, 5 as u8, 5 as u8, 0 as u8,
+    ];
+    if symbol >= 29 {
+        return 0;
+    }
+    return table[symbol] as u64;
+}
+
+fn distance_base(symbol: u64) -> u64 {
+    let table: [u16; 30] = [
+        1 as u16, 2 as u16, 3 as u16, 4 as u16, 5 as u16, 7 as u16, 9 as u16,
+        13 as u16, 17 as u16, 25 as u16, 33 as u16, 49 as u16, 65 as u16,
+        97 as u16, 129 as u16, 193 as u16, 257 as u16, 385 as u16, 513 as u16,
+        769 as u16, 1025 as u16, 1537 as u16, 2049 as u16, 3073 as u16,
+        4097 as u16, 6145 as u16, 8193 as u16, 12289 as u16, 16385 as u16,
+        24577 as u16,
+    ];
+    if symbol >= 30 {
+        return 0;
+    }
+    return table[symbol] as u64;
+}
+
+fn distance_extra(symbol: u64) -> u64 {
+    let table: [u8; 30] = [
+        0 as u8, 0 as u8, 0 as u8, 0 as u8, 1 as u8, 1 as u8, 2 as u8, 2 as u8,
+        3 as u8, 3 as u8, 4 as u8, 4 as u8, 5 as u8, 5 as u8, 6 as u8, 6 as u8,
+        7 as u8, 7 as u8, 8 as u8, 8 as u8, 9 as u8, 9 as u8, 10 as u8,
+        10 as u8, 11 as u8, 11 as u8, 12 as u8, 12 as u8, 13 as u8, 13 as u8,
+    ];
+    if symbol >= 30 {
+        return 0;
+    }
+    return table[symbol] as u64;
+}
+
+// §3.2.6: the fixed Huffman code, which small streams use in place of sending
+// a code of their own.
+fn fixed_tables(literals: *HuffTable, distances: *HuffTable) -> void {
+    let lengths: Vec<u8> = vec.new<u8>();
+    for symbol: u64 in 0..144 { vec.push(&lengths, 8 as u8); }
+    for symbol: u64 in 144..256 { vec.push(&lengths, 9 as u8); }
+    for symbol: u64 in 256..280 { vec.push(&lengths, 7 as u8); }
+    for symbol: u64 in 280..288 { vec.push(&lengths, 8 as u8); }
+    construct(literals, &lengths, 288);
+    vec.clear(&lengths);
+    for symbol: u64 in 0..30 { vec.push(&lengths, 5 as u8); }
+    construct(distances, &lengths, 30);
+    vec.destroy(&lengths);
+}
+
+// §3.2.7: a dynamic block sends its own code lengths, themselves Huffman coded.
+fn dynamic_tables(
+    state: *InflateState,
+    literals: *HuffTable,
+    distances: *HuffTable
+) -> bool {
+    let literal_count: u64 = bits(state, 5) + 257;
+    let distance_count: u64 = bits(state, 5) + 1;
+    let code_count: u64 = bits(state, 4) + 4;
+    if !(*state).ok || literal_count > 286 || distance_count > 30 {
+        return false;
+    }
+    // The code length alphabet's own lengths arrive in this order, which puts
+    // the ones most likely to be zero last.
+    let order: [u8; 19] = [
+        16 as u8, 17 as u8, 18 as u8, 0 as u8, 8 as u8, 7 as u8, 9 as u8,
+        6 as u8, 10 as u8, 5 as u8, 11 as u8, 4 as u8, 12 as u8, 3 as u8,
+        13 as u8, 2 as u8, 14 as u8, 1 as u8, 15 as u8,
+    ];
+    let code_lengths: Vec<u8> = vec.new<u8>();
+    for index: u64 in 0..19 {
+        vec.push(&code_lengths, 0 as u8);
+    }
+    for index: u64 in 0..code_count {
+        vec.set(&code_lengths, order[index] as u64, bits(state, 3) as u8);
+    }
+    if !(*state).ok {
+        vec.destroy(&code_lengths);
+        return false;
+    }
+    let code_table: HuffTable = empty_table();
+    if !construct(&code_table, &code_lengths, 19) {
+        vec.destroy(&code_lengths);
+        return false;
+    }
+    vec.destroy(&code_lengths);
+
+    // Now the literal and distance lengths, run-length coded.
+    let lengths: Vec<u8> = vec.new<u8>();
+    let total: u64 = literal_count + distance_count;
+    while lengths.length < total {
+        let symbol: i64 = decode(state, &code_table);
+        if symbol < 0 {
+            vec.destroy(&lengths);
+            return false;
+        }
+        if symbol < 16 {
+            vec.push(&lengths, symbol as u8);
+            continue;
+        }
+        let repeat: u64 = 0;
+        let value: u8 = 0 as u8;
+        if symbol == 16 {
+            // Repeat the previous length 3 to 6 times.
+            if lengths.length == 0 {
+                vec.destroy(&lengths);
+                return false;
+            }
+            value = lengths.data[lengths.length - 1];
+            repeat = 3 + bits(state, 2);
+        } else if symbol == 17 {
+            repeat = 3 + bits(state, 3);
+        } else {
+            repeat = 11 + bits(state, 7);
+        }
+        if !(*state).ok || lengths.length + repeat > total {
+            vec.destroy(&lengths);
+            return false;
+        }
+        for step: u64 in 0..repeat {
+            vec.push(&lengths, value);
+        }
+    }
+
+    let distance_lengths: Vec<u8> = vec.new<u8>();
+    for index: u64 in literal_count..total {
+        vec.push(&distance_lengths, lengths.data[index]);
+    }
+    let ok: bool = construct(literals, &lengths, literal_count)
+        && construct(distances, &distance_lengths, distance_count);
+    vec.destroy(&distance_lengths);
+    vec.destroy(&lengths);
+    return ok;
+}
+
+// Decompress one Huffman-coded block into `out`.
+fn inflate_block(
+    state: *InflateState,
+    literals: *HuffTable,
+    distances: *HuffTable,
+    out: *Vec<u8>
+) -> bool {
+    loop {
+        let symbol: i64 = decode(state, literals);
+        if symbol < 0 {
+            return false;
+        }
+        if symbol < 256 {
+            vec.push(out, symbol as u8);
+            continue;
+        }
+        if symbol == 256 {
+            return true;
+        }
+        let index: u64 = (symbol - 257) as u64;
+        if index >= 29 {
+            return false;
+        }
+        let length: u64 =
+            length_base(index) + bits(state, length_extra(index));
+        let distance_symbol: i64 = decode(state, distances);
+        if distance_symbol < 0 || distance_symbol >= 30 {
+            return false;
+        }
+        let distance: u64 = distance_base(distance_symbol as u64)
+            + bits(state, distance_extra(distance_symbol as u64));
+        if !(*state).ok || distance == 0 || distance > (*out).length {
+            return false;
+        }
+        // A back-reference may overlap what it is copying, which is how a run
+        // of one byte is encoded — so this copies one byte at a time rather
+        // than a block.
+        let from: u64 = (*out).length - distance;
+        for step: u64 in 0..length {
+            vec.push(out, (*out).data[from + step]);
+        }
+    }
+}
+
+// §3.2.4: a stored block is raw bytes, byte-aligned.
+fn stored_block(state: *InflateState, out: *Vec<u8>) -> bool {
+    // Discard the rest of the current byte.
+    (*state).bitbuf = 0;
+    (*state).bitcount = 0;
+    if (*state).pos + 4 > (*state).length {
+        return false;
+    }
+    let length: u64 = ((*state).data[(*state).pos] as u64)
+        | (((*state).data[(*state).pos + 1] as u64) << 8);
+    let complement: u64 = ((*state).data[(*state).pos + 2] as u64)
+        | (((*state).data[(*state).pos + 3] as u64) << 8);
+    (*state).pos = (*state).pos + 4;
+    if length != (complement ^ (0xFFFF as u64)) {
+        return false;
+    }
+    if (*state).pos + length > (*state).length {
+        return false;
+    }
+    for step: u64 in 0..length {
+        vec.push(out, (*state).data[(*state).pos + step]);
+    }
+    (*state).pos = (*state).pos + length;
+    return true;
+}
+
+// Decompress a raw DEFLATE stream. `ok` reports whether the whole stream was
+// read; a partial result is still returned, so a truncated image can show what
+// arrived.
+struct InflateResult {
+    ok: bool,
+    data: Vec<u8>,
+}
+
+pub fn inflate(data: *const u8, length: u64) -> InflateResult {
+    let out: Vec<u8> = vec.new<u8>();
+    let state: InflateState = new_state(data, length);
+    let literals: HuffTable = empty_table();
+    let distances: HuffTable = empty_table();
+    // The output buffer is moved into the result exactly once, after the loop:
+    // a partial result is still worth returning, so failure sets the flag and
+    // leaves rather than discarding what was decoded.
+    let complete: bool = false;
+    loop {
+        let final_block: u64 = bits(&state, 1);
+        let kind: u64 = bits(&state, 2);
+        if !state.ok {
+            break;
+        }
+        let block_ok: bool = false;
+        if kind == 0 {
+            block_ok = stored_block(&state, &out);
+        } else if kind == 1 {
+            fixed_tables(&literals, &distances);
+            block_ok = inflate_block(&state, &literals, &distances, &out);
+        } else if kind == 2 {
+            block_ok = dynamic_tables(&state, &literals, &distances)
+                && inflate_block(&state, &literals, &distances, &out);
+        } else {
+            // Type 3 is reserved.
+            block_ok = false;
+        }
+        if !block_ok {
+            break;
+        }
+        if final_block == 1 {
+            complete = true;
+            break;
+        }
+    }
+    return InflateResult { ok: complete, data: move out };
+}
+
+// RFC 1950: a zlib stream is a two-byte header, a DEFLATE stream, and an
+// Adler-32 checksum. PNG uses this rather than raw DEFLATE.
+pub fn zlib_inflate(data: *const u8, length: u64) -> InflateResult {
+    if length < 6 {
+        let empty: Vec<u8> = vec.new<u8>();
+        return InflateResult { ok: false, data: move empty };
+    }
+    let cmf: u64 = data[0] as u64;
+    let flg: u64 = data[1] as u64;
+    // The compression method must be 8 (deflate), the header must check, and a
+    // preset dictionary is not something PNG ever uses.
+    if (cmf & 15) != 8 || ((cmf << 8) | flg) % 31 != 0 || (flg & 32) != 0 {
+        let empty: Vec<u8> = vec.new<u8>();
+        return InflateResult { ok: false, data: move empty };
+    }
+    let result: InflateResult = inflate(&data[2], length - 2);
+    return move result;
+}
+
+// RFC 1950 §9. Used to check a decompressed stream against the checksum that
+// follows it.
+pub fn adler32(data: []const u8) -> u32 {
+    let a: u64 = 1;
+    let b: u64 = 0;
+    for index: u64 in 0..len(data) {
+        a = (a + (data[index] as u64)) % 65521;
+        b = (b + a) % 65521;
+    }
+    return ((b << 16) | a) as u32;
+}

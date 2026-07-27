@@ -1,0 +1,75 @@
+// A decoded image: 8-bit RGBA, one row after another, top row first.
+//
+// Every decoder in engine.image produces this, and paint consumes it, so
+// nothing downstream of a decoder knows what format the bytes arrived in.
+// Alpha is straight rather than premultiplied, which is what PNG stores and
+// what the compositor expects.
+module engine.image.bitmap;
+
+import std.vec;
+
+resource struct Bitmap {
+    width: u64,
+    height: u64,
+    // width * height * 4 bytes, RGBA.
+    pixels: Vec<u8>,
+}
+
+pub fn new_bitmap(width: u64, height: u64) -> Bitmap {
+    let image: Bitmap = Bitmap {
+        width: width,
+        height: height,
+        pixels: vec.with_capacity<u8>(width * height * 4 + 1),
+    };
+    for index: u64 in 0..(width * height * 4) {
+        vec.push(&image.pixels, 0 as u8);
+    }
+    return move image;
+}
+
+pub fn destroy(image: *Bitmap) -> void {
+    vec.destroy(&(*image).pixels);
+    (*image).width = 0;
+    (*image).height = 0;
+}
+
+pub fn width(image: *Bitmap) -> u64 { return (*image).width; }
+pub fn height(image: *Bitmap) -> u64 { return (*image).height; }
+
+pub fn is_empty(image: *Bitmap) -> bool {
+    return (*image).width == 0 || (*image).height == 0;
+}
+
+fn offset_of(image: *Bitmap, x: u64, y: u64) -> u64 {
+    return (y * (*image).width + x) * 4;
+}
+
+pub fn set_pixel(
+    image: *Bitmap,
+    x: u64,
+    y: u64,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8
+) -> void {
+    if x >= (*image).width || y >= (*image).height {
+        return;
+    }
+    let at: u64 = offset_of(image, x, y);
+    vec.set(&(*image).pixels, at, r);
+    vec.set(&(*image).pixels, at + 1, g);
+    vec.set(&(*image).pixels, at + 2, b);
+    vec.set(&(*image).pixels, at + 3, a);
+}
+
+// One channel of one pixel, so paint can composite without a struct per pixel.
+pub fn channel(image: *Bitmap, x: u64, y: u64, index: u64) -> u8 {
+    if x >= (*image).width || y >= (*image).height || index >= 4 {
+        return 0 as u8;
+    }
+    match vec.get(&(*image).pixels, offset_of(image, x, y) + index) {
+        Option<u8>.Some(value) => { return value; },
+        Option<u8>.None => { return 0 as u8; },
+    }
+}

@@ -28,6 +28,8 @@ import metrics;
 import floats;
 import intrinsic;
 import engine.dom.node;
+import engine.html.tagnames;
+import engine.image.store;
 import engine.style.computed;
 import engine.text.fonts;
 import engine.text.utf8;
@@ -110,6 +112,7 @@ fn build_children(
     doc: *DomDocument,
     styles: *StyleTree,
     tree: *LayoutTree,
+    images: *ImageStore,
     dom_parent: u64,
     parent_box: u64,
     style_node: u64
@@ -141,14 +144,24 @@ fn build_children(
                     context.anonymous = box.none();
                     let block: u64 = box.create(tree, box.box_block(), child, child);
                     box.append_child(tree, parent_box, block);
-                    build_children(doc, styles, tree, child, block, child);
+                    build_children(doc, styles, tree, images, child, block,
+                        child);
+                } else if is_replaced(doc, images, child) {
+                    // A replaced element has no children to lay out: its
+                    // content is the image.
+                    let target: u64 =
+                        inline_parent(tree, parent_box, style_node, &context);
+                    let replaced: u64 =
+                        box.create(tree, box.box_replaced(), child, child);
+                    box.append_child(tree, target, replaced);
                 } else {
                     let target: u64 =
                         inline_parent(tree, parent_box, style_node, &context);
                     let inline_box: u64 =
                         box.create(tree, box.box_inline(), child, child);
                     box.append_child(tree, target, inline_box);
-                    build_children(doc, styles, tree, child, inline_box, child);
+                    build_children(doc, styles, tree, images, child,
+                        inline_box, child);
                 }
             }
         }
@@ -158,7 +171,25 @@ fn build_children(
 
 // Build the box tree for `doc`. A document whose root element is
 // `display: none` produces no boxes at all.
-pub fn build(doc: *DomDocument, styles: *StyleTree, tree: *LayoutTree) -> void {
+// The <img> elements a document references, so build() knows which elements
+// are replaced. Set for the duration of one build; a null store simply means no
+// element is replaced, which is what a caller with no images passes.
+fn is_replaced(doc: *DomDocument, images: *ImageStore, dom_node: u64) -> bool {
+    if images == 0 as *ImageStore {
+        return false;
+    }
+    if node.get(doc, dom_node).tag != tagnames.tag_img() {
+        return false;
+    }
+    return !store.is_missing(store.find(images, dom_node));
+}
+
+pub fn build(
+    doc: *DomDocument,
+    styles: *StyleTree,
+    tree: *LayoutTree,
+    images: *ImageStore
+) -> void {
     let child: u64 = node.get(doc, 0).first_child;
     while child != node.none() {
         let child_node: DomNode = node.get(doc, child);
@@ -167,7 +198,7 @@ pub fn build(doc: *DomDocument, styles: *StyleTree, tree: *LayoutTree) -> void {
             if display != computed.display_none() {
                 let root: u64 = box.create(tree, box.box_block(), child, child);
                 (*tree).root = root;
-                build_children(doc, styles, tree, child, root, child);
+                build_children(doc, styles, tree, images, child, root, child);
                 return;
             }
         }
@@ -370,6 +401,7 @@ fn layout_block(
     styles: *StyleTree,
     set: *TextFontSet,
     context: *FloatContext,
+    images: *ImageStore,
     box_index: u64,
     x: f64,
     y: f64,
@@ -452,7 +484,7 @@ fn layout_block(
     let content_height: f64 = 0.0;
     if first_child_is_inline(tree, box_index) {
         content_height = layout_inline_content(doc, tree, styles, set, context,
-            box_index, content_x, content_y, width);
+            images, box_index, content_x, content_y, width);
     } else {
         // Whether this box's own margins adjoin its children's decides whether
         // the first child's margin was already applied above this box.
@@ -462,7 +494,7 @@ fn layout_block(
         let collapse_bottom: bool = !anonymous
             && bottom_adjoins_children(style, containing_width)
             && style.float_side == computed.float_none();
-        content_height = layout_block_children(doc, tree, styles, set, context,
+        content_height = layout_block_children(doc, tree, styles, set, context, images,
             box_index, content_x, content_y, width, collapse_top,
             collapse_bottom);
     }
@@ -486,6 +518,7 @@ fn layout_float(
     styles: *StyleTree,
     set: *TextFontSet,
     context: *FloatContext,
+    images: *ImageStore,
     child: u64,
     content_x: f64,
     top: f64,
@@ -526,7 +559,7 @@ fn layout_float(
     let spot: FloatPlacement = floats.place(context, start, outer, side,
         content_x, content_x + containing_width);
 
-    layout_block(doc, tree, styles, set, context, child, spot.x,
+    layout_block(doc, tree, styles, set, context, images, child, spot.x,
         spot.y + resolve(style.margin_top, containing_width), containing_width,
         width);
 
@@ -543,7 +576,8 @@ fn first_child_is_inline(tree: *LayoutTree, box_index: u64) -> bool {
         return false;
     }
     let kind: u8 = box.get(tree, first).kind;
-    return kind == box.box_inline() || kind == box.box_text();
+    return kind == box.box_inline() || kind == box.box_text()
+        || kind == box.box_replaced();
 }
 
 // Stack block children vertically, collapsing adjacent sibling margins.
@@ -553,6 +587,7 @@ fn layout_block_children(
     styles: *StyleTree,
     set: *TextFontSet,
     context: *FloatContext,
+    images: *ImageStore,
     parent: u64,
     content_x: f64,
     content_y: f64,
@@ -570,8 +605,8 @@ fn layout_block_children(
         if is_floated(styles, tree, child) {
             // Out of flow: it does not move the cursor, and the next in-flow
             // box's margins are unaffected by it.
-            layout_float(doc, tree, styles, set, context, child, content_x,
-                cursor, content_width);
+            layout_float(doc, tree, styles, set, context, images, child,
+                content_x, cursor, content_width);
             child = next;
             continue;
         }
@@ -593,8 +628,8 @@ fn layout_block_children(
         let child_style: ComputedStyle =
             style_of(styles, box.get(tree, child).style_node);
         child_y = floats.clearance(context, child_y, child_style.clear_side);
-        layout_block(doc, tree, styles, set, context, child, content_x, child_y,
-            content_width, -1.0);
+        layout_block(doc, tree, styles, set, context, images, child,
+            content_x, child_y, content_width, -1.0);
         let placed: LayoutBox = box.get(tree, child);
         cursor = placed.y + box.border_box_height(placed);
         previous_bottom =
@@ -637,6 +672,7 @@ struct InlineState {
     edge_left: f64,
     edge_right: f64,
     context: *FloatContext,
+    images: *ImageStore,
 }
 
 // §9.5: a line box beside a float is only as wide as the space the float
@@ -676,6 +712,7 @@ fn layout_inline_content(
     styles: *StyleTree,
     set: *TextFontSet,
     context: *FloatContext,
+    images: *ImageStore,
     container: u64,
     content_x: f64,
     content_y: f64,
@@ -695,6 +732,7 @@ fn layout_inline_content(
         edge_left: content_x,
         edge_right: content_x + content_width,
         context: context,
+        images: images,
     };
     apply_float_band(&state);
     layout_inline_children(doc, tree, styles, set, container, &state);
@@ -739,6 +777,8 @@ fn layout_inline_children(
         let next: u64 = child_box.next_sibling;
         if child_box.kind == box.box_text() {
             place_text(doc, tree, styles, set, child, state);
+        } else if child_box.kind == box.box_replaced() {
+            place_replaced(tree, styles, set, child, state);
         } else if child_box.kind == box.box_inline() {
             // §10.8: horizontal margins, borders and padding on an inline box
             // do take up room on the line, even though the vertical ones do
@@ -746,6 +786,7 @@ fn layout_inline_children(
             // its fragments plus those edges.
             let style: ComputedStyle = style_of(styles, child_box.style_node);
             let containing: f64 = (*state).edge_right - (*state).edge_left;
+            emit_pending_space(tree, styles, set, state);
             let margin_left: f64 = resolve(style.margin_left, containing);
             let margin_right: f64 = resolve(style.margin_right, containing);
             let padding_left: f64 = resolve(style.padding_left, containing);
@@ -793,6 +834,105 @@ fn layout_inline_children(
         }
         child = next;
     }
+}
+
+// Emit the collapsible space that is waiting before the next thing on the
+// line. §16.6.1 makes it one space wide; it belongs to the run *before* it, so
+// it extends that fragment rather than opening a new one — which is what keeps
+// `in <b>bold</b>` from putting the space inside the <b>.
+fn emit_pending_space(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    set: *TextFontSet,
+    state: *InlineState
+) -> void {
+    if !(*state).pending_space {
+        return;
+    }
+    (*state).pending_space = false;
+    if (*state).last_fragment == box.none() {
+        return;
+    }
+    let previous: LayoutBox = box.get(tree, (*state).last_fragment);
+    let style: ComputedStyle = style_of(styles, previous.style_node);
+    let width: f64 = metrics.codepoint_width(set, style, ' ' as u32);
+    // The previous fragment's bytes end the text buffer, so extending it is
+    // just a longer length.
+    box.push_byte(tree, ' ');
+    previous.text_len = previous.text_len + 1;
+    previous.width = previous.width + width;
+    box.set(tree, (*state).last_fragment, previous);
+    (*state).x = (*state).x + width;
+}
+
+// Put a replaced element on the line, wrapping first when it does not fit.
+//
+// §10.3.2 and §10.4.2: the used width and height come from the declared ones
+// where they are given, and from the image's own size where they are not — with
+// one declared dimension scaling the other by the intrinsic ratio, which is
+// what stops a `width: 200px` on a photo squashing it.
+fn place_replaced(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    set: *TextFontSet,
+    box_index: u64,
+    state: *InlineState
+) -> void {
+    emit_pending_space(tree, styles, set, state);
+    let current: LayoutBox = box.get(tree, box_index);
+    let style: ComputedStyle = style_of(styles, current.style_node);
+    let entry: ImageEntry = store.find((*state).images, current.node);
+    let containing: f64 = (*state).edge_right - (*state).edge_left;
+
+    let natural_width: f64 = entry.width as f64;
+    let natural_height: f64 = entry.height as f64;
+    let width: f64 = natural_width;
+    let height: f64 = natural_height;
+    let has_width: bool = !is_auto(style.width);
+    let has_height: bool = !is_auto(style.height);
+    if has_width {
+        width = resolve(style.width, containing);
+    }
+    if has_height {
+        height = resolve(style.height, containing);
+    }
+    if has_width && !has_height && natural_width > 0.0 {
+        height = width * natural_height / natural_width;
+    }
+    if has_height && !has_width && natural_height > 0.0 {
+        width = height * natural_width / natural_height;
+    }
+
+    let padding_left: f64 = resolve(style.padding_left, containing);
+    let padding_right: f64 = resolve(style.padding_right, containing);
+    let outer: f64 = width + padding_left + padding_right
+        + style.border_left_width + style.border_right_width;
+
+    if !(*state).line_empty
+        && (*state).x + outer > (*state).origin_x + (*state).available {
+        break_line(tree, styles, set, state);
+    }
+    current.x = (*state).x;
+    current.y = (*state).line_top;
+    current.width = width;
+    current.height = height;
+    current.padding_left = padding_left;
+    current.padding_right = padding_right;
+    current.padding_top = resolve(style.padding_top, containing);
+    current.padding_bottom = resolve(style.padding_bottom, containing);
+    current.border_left = style.border_left_width;
+    current.border_right = style.border_right_width;
+    current.border_top = style.border_top_width;
+    current.border_bottom = style.border_bottom_width;
+    // §10.8: an inline-level replaced box sits on the baseline.
+    current.baseline = box.border_box_height(current);
+    box.set(tree, box_index, current);
+
+    (*state).x = (*state).x + outer;
+    (*state).line_empty = false;
+    (*state).last_fragment = box.none();
+    grow_line(state, box.border_box_height(current));
+    grow_line(state, style.line_height);
 }
 
 // Break one text node into fragments and place them on lines. Reads from the
@@ -1099,9 +1239,10 @@ pub fn layout(
     styles: *StyleTree,
     tree: *LayoutTree,
     set: *TextFontSet,
+    images: *ImageStore,
     viewport_width: f64
 ) -> void {
-    build(doc, styles, tree);
+    build(doc, styles, tree, images);
     if (*tree).root == box.none() {
         return;
     }
@@ -1113,8 +1254,8 @@ pub fn layout(
     // unstyled page come from.
     let top: f64 =
         collapsed_top_margin(tree, styles, (*tree).root, viewport_width);
-    layout_block(doc, tree, styles, set, &context, (*tree).root, 0.0, top,
-        viewport_width, -1.0);
+    layout_block(doc, tree, styles, set, &context, images, (*tree).root, 0.0,
+        top, viewport_width, -1.0);
     // §10.6.3: a float does not make its containing block taller, but the
     // document still has to be tall enough to show it.
     let lowest: f64 = floats.lowest(&context);

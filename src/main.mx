@@ -37,6 +37,8 @@ import engine.paint.paint;
 import engine.paint.bmp;
 import engine.text.fonts;
 import engine.text.load;
+import engine.image.store;
+import engine.image.load as image_load;
 import std.fs;
 
 extern fn getchar() -> c_int;
@@ -385,8 +387,12 @@ fn main() -> int {
     // Lay the document out at a conventional 800px viewport.
     let font_set: TextFontSet = fonts.new_set();
     load.load_windows_defaults(&font_set);
+    // Images referenced by the document, resolved against the working
+    // directory since stdin carries no location of its own.
+    let images: ImageStore = store.new_store();
+    image_load.load_document(&doc, &images, "");
     let boxes: LayoutTree = box.new_tree();
-    flow.layout(&doc, &tree_styles, &boxes, &font_set, 800.0);
+    flow.layout(&doc, &tree_styles, &boxes, &font_set, &images, 800.0);
     out_str(&out, "-- layout --");
     out_line(&out);
     let layout_text: Vec<u8> = layout_serialize.tree_text(&boxes, &doc);
@@ -404,7 +410,7 @@ fn main() -> int {
         page_height = 1;
     }
     let target: Canvas = canvas.new_canvas(800, page_height);
-    paint.paint(&target, &boxes, &tree_styles, &font_set);
+    paint.paint(&target, &boxes, &tree_styles, &font_set, &images);
     let image: Vec<u8> = bmp.encode(&target);
     let output: File = fs.open("rigor.bmp", "wb");
     if fs.is_open(&output) {

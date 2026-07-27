@@ -1,0 +1,127 @@
+// Finding and decoding the images a document references.
+//
+// This is image *policy*, deliberately separate from the decoding in
+// engine.image.png: which bytes an `src` resolves to is a property of where the
+// document came from, not of the file format. A build that fetches over the
+// network replaces this module and leaves the decoder untouched.
+//
+// What it does today is read from the filesystem, resolving a relative `src`
+// against a base directory. A `src` that is a URL, or a data: URI, is left for
+// the fetching layer.
+module engine.image.load;
+
+import std.vec;
+import std.fs;
+import engine.dom.node;
+import engine.html.tagnames;
+import engine.image.png;
+import engine.image.bitmap;
+import engine.image.store;
+
+fn read_file(path: *u8) -> Vec<u8> {
+    let contents: Vec<u8> = vec.new<u8>();
+    let handle: File = fs.open(path, "rb");
+    if !fs.is_open(&handle) {
+        return move contents;
+    }
+    let chunk: [u8; 65536] = [0; 65536];
+    loop {
+        let read: u64 = fs.read(&handle, slice(&chunk[0], 65536));
+        if read == 0 {
+            break;
+        }
+        for index: u64 in 0..read {
+            vec.push(&contents, chunk[index]);
+        }
+    }
+    fs.close(&handle);
+    return move contents;
+}
+
+fn push_view(out: *Vec<u8>, view: []const u8) -> void {
+    for index: u64 in 0..len(view) {
+        vec.push(out, view[index]);
+    }
+}
+
+fn push_cstr(out: *Vec<u8>, text: *u8) -> void {
+    let index: u64 = 0;
+    while text[index] != 0 as u8 {
+        vec.push(out, text[index]);
+        index = index + 1;
+    }
+}
+
+// True when `src` names something this loader cannot open: a URL, a protocol-
+// relative reference, or a data: URI.
+fn is_remote(src: []const u8) -> bool {
+    if len(src) >= 2 && src[0] == '/' && src[1] == '/' {
+        return true;
+    }
+    for index: u64 in 0..len(src) {
+        if src[index] == ':' {
+            // A colon before any slash is a scheme.
+            return true;
+        }
+        if src[index] == '/' {
+            return false;
+        }
+    }
+    return false;
+}
+
+fn name_view(text: *u8) -> []const u8 {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    return slice(text as *const u8, length);
+}
+
+// Load every <img> the document references into `images`. `base` is the
+// directory relative paths resolve against, with a trailing separator; an empty
+// base means the working directory.
+pub fn load_document(
+    doc: *DomDocument,
+    images: *ImageStore,
+    base: *u8
+) -> void {
+    load_from(doc, images, base, 0);
+}
+
+fn load_from(
+    doc: *DomDocument,
+    images: *ImageStore,
+    base: *u8,
+    index: u64
+) -> void {
+    let current: DomNode = node.get(doc, index);
+    if current.kind == node.kind_element() && current.tag == tagnames.tag_img() {
+        let found: DomAttrValue =
+            node.find_attr(doc, index, name_view("src"));
+        if found.found && found.value_len > 0 {
+            let src: []const u8 =
+                node.bytes(doc, found.value_off, found.value_len);
+            if !is_remote(src) {
+                let path: Vec<u8> = vec.new<u8>();
+                push_cstr(&path, base);
+                push_view(&path, src);
+                vec.push(&path, 0 as u8);
+                let data: Vec<u8> = read_file(path.data);
+                if data.length > 0 {
+                    let decoded: Bitmap =
+                        png.decode(data.data as *const u8, data.length);
+                    store.add(images, index, &decoded);
+                    bitmap.destroy(&decoded);
+                }
+                vec.destroy(&data);
+                vec.destroy(&path);
+            }
+        }
+    }
+    let child: u64 = current.first_child;
+    while child != node.none() {
+        load_from(doc, images, base, child);
+        child = node.get(doc, child).next_sibling;
+    }
+}
