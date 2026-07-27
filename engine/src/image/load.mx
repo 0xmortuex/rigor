@@ -125,3 +125,4 @@ fn load_from(
         child = node.get(doc, child).next_sibling;
     }
 }
+

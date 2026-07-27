@@ -6,7 +6,12 @@
 //     Get-Content page.html | rigor        (PowerShell)
 //     rigor < page.html                    (cmd / sh)
 //
-// Mort has no argv access yet, so stdin is the whole interface for now.
+// A URL can be loaded instead, by setting RIGOR_URL:
+//
+//     $env:RIGOR_URL = "https://example.com"; rigor
+//
+// Mort has no argv access yet, so stdin and the environment are the whole
+// interface for now.
 
 import std.vec;
 import engine.lib;
@@ -39,10 +44,26 @@ import engine.text.fonts;
 import engine.text.load;
 import engine.image.store;
 import engine.image.load as image_load;
+import engine.net.url;
+import engine.net.fetch;
+import engine.net.resources;
+import engine.net.imagefetch;
+import std.env;
 import std.fs;
 
 extern fn getchar() -> c_int;
 extern fn putchar(character: c_int) -> c_int;
+
+// Read stdin, unless the document is coming from somewhere else — in which
+// case an empty buffer, since a resource cannot be rebound later.
+fn read_stdin_unless(skip: bool) -> Vec<u8> {
+    if skip {
+        let empty: Vec<u8> = vec.new<u8>();
+        return move empty;
+    }
+    let contents: Vec<u8> = read_stdin();
+    return move contents;
+}
 
 fn read_stdin() -> Vec<u8> {
     let buf: Vec<u8> = vec.new<u8>();
@@ -94,6 +115,18 @@ fn print_raw(text: *u8) -> void {
         putchar(text[index] as c_int);
         index = index + 1;
     }
+}
+
+// A status code, or 0 when the request never got one.
+fn out_status(out: *Vec<u8>, status: i64) -> void {
+    if status <= 0 {
+        out_str(out, "0 (no response)");
+        return;
+    }
+    if status >= 10 {
+        out_status(out, status / 10);
+    }
+    vec.push(out, '0' + ((status % 10) as u8));
 }
 
 fn out_line(out: *Vec<u8>) -> void {
@@ -305,11 +338,59 @@ depth: u64
 }
 
 fn main() -> int {
-    let raw: Vec<u8> = read_stdin();
+    // A document comes either from stdin or, when RIGOR_URL names one, from
+    // the network. A fetched document also carries a location, which is what
+    // its relative references resolve against, and possibly a transport
+    // charset, which outranks anything the bytes themselves declare.
+    // Read stdin first: a Vec is a resource and cannot be replaced once bound,
+    // so the fetch branch below appends to an empty buffer instead.
+    let from_url: bool = env.exists("RIGOR_URL");
+    let raw: Vec<u8> = read_stdin_unless(from_url);
+    let charset: Vec<u8> = vec.new<u8>();
+    // The document's location, as text: a Url is a resource, so it is built
+    // once below rather than replaced inside the branch.
+    let location_text: Vec<u8> = vec.new<u8>();
+    if from_url {
+        let target: *u8 = env.get("RIGOR_URL");
+        let requested: Url = url.parse(slice(target as *const u8,
+        cstr_len(target)));
+        if !url.is_valid(&requested) {
+            print_raw("rigor: RIGOR_URL is not a valid absolute URL\n");
+            url.destroy(&requested);
+            return 1;
+        }
+        let response: FetchResult = fetch.get(&requested);
+        url.destroy(&requested);
+        if !response.ok {
+            let report: Vec<u8> = vec.new<u8>();
+            out_str(&report, "rigor: fetch failed, HTTP status ");
+            out_status(&report, response.status);
+            out_line(&report);
+            vec.push(&report, 0 as u8);
+            print_raw(report.data);
+            vec.destroy(&report);
+            fetch.destroy(&response);
+            return 1;
+        }
+        for index: u64 in 0..response.body.length {
+            vec.push(&raw, response.body.data[index]);
+        }
+        for index: u64 in 0..response.charset.length {
+            vec.push(&charset, response.charset.data[index]);
+        }
+        let final_text: []const u8 = url.serialize(&response.final_url);
+        for index: u64 in 0..len(final_text) {
+            vec.push(&location_text, final_text[index]);
+        }
+        fetch.destroy(&response);
+    }
+    let location: Url = url.parse(vec.as_const_slice(&location_text));
+
     // Raw document bytes, so the byte stream decoder runs first.
     let sink: HtmlTokenSink = tokens.new_sink();
     let normalized: Vec<u8> =
-    preprocess.decode_and_normalize(raw.data as *const u8, raw.length, &sink);
+    preprocess.decode_and_normalize_as(raw.data as *const u8, raw.length,
+    vec.as_const_slice(&charset), &sink);
     let doc: DomDocument = node.new_document();
     treebuilder.parse(
     normalized.data as *const u8, normalized.length, &doc, &sink);
@@ -332,9 +413,11 @@ fn main() -> int {
     print_raw(out.data);
     vec.clear(&out);
 
-    // Author styles: every <style> element's text, concatenated in tree order.
+    // Author styles: every <style> element's text and every linked stylesheet,
+    // concatenated in tree order, which is the order the cascade's final
+    // tiebreak depends on.
     let style_text: Vec<u8> = vec.new<u8>();
-    gather_style_text(&doc, &style_text, 0);
+    resources.gather_stylesheets(&doc, &location, &style_text);
     let css_normalized: Vec<u8> =
     css_preprocess.normalize(style_text.data as *const u8, style_text.length);
     let css_sink: CssTokenSink = css_tokens.new_sink();
@@ -390,7 +473,11 @@ fn main() -> int {
     // Images referenced by the document, resolved against the working
     // directory since stdin carries no location of its own.
     let images: ImageStore = store.new_store();
-    image_load.load_document(&doc, &images, "");
+    if url.is_valid(&location) {
+        imagefetch.load_document(&doc, &images, &location);
+    } else {
+        image_load.load_document(&doc, &images, "");
+    }
     let boxes: LayoutTree = box.new_tree();
     flow.layout(&doc, &tree_styles, &boxes, &font_set, &images, 800.0);
     out_str(&out, "-- layout --");

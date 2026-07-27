@@ -1,0 +1,619 @@
+// URLs — the WHATWG URL Standard.
+//
+// Everything a browser does starts with a URL, and almost nothing about them is
+// obvious: `a/b/../c` is `a/c`, `//example.com` inherits the scheme it is
+// written next to, an empty path against an http URL is `/`, and a relative
+// reference resolves against a *directory*, not against the base URL itself.
+// Getting those wrong means fetching the wrong thing, so they are implemented
+// rather than approximated.
+//
+// One buffer holds the serialized URL; each component is an offset and a length
+// into it, the same flat-arena shape the DOM and the stylesheet use.
+//
+// Implemented: the scheme, host, port, path, query and fragment states of §4.4
+// "URL parsing", the special-scheme defaults of §3.1, path normalisation
+// (removing `.` and `..` segments), and relative resolution against a base.
+//
+// Not implemented, and each is noted where it would go: IDNA (a non-ASCII host
+// is kept as written rather than punycoded), percent-encoding of the input (the
+// bytes are passed through, which is right for a URL that is already encoded
+// and wrong for one that is not), IPv6 host validation beyond keeping the
+// brackets, and the file: scheme's Windows drive-letter rules.
+module engine.net.url;
+
+import std.vec;
+
+resource struct Url {
+    // The serialized URL. Components point into it.
+    buffer: Vec<u8>,
+    scheme_off: u64,
+    scheme_len: u64,
+    host_off: u64,
+    host_len: u64,
+    // 0 means "the scheme's default", which is what an omitted port means.
+    port: u64,
+    path_off: u64,
+    path_len: u64,
+    query_off: u64,
+    query_len: u64,
+    fragment_off: u64,
+    fragment_len: u64,
+    has_query: bool,
+    has_fragment: bool,
+    valid: bool,
+}
+
+pub fn destroy(url: *Url) -> void {
+    vec.destroy(&(*url).buffer);
+    (*url).valid = false;
+}
+
+fn empty_url() -> Url {
+    return Url {
+        buffer: vec.new<u8>(),
+        scheme_off: 0, scheme_len: 0,
+        host_off: 0, host_len: 0,
+        port: 0,
+        path_off: 0, path_len: 0,
+        query_off: 0, query_len: 0,
+        fragment_off: 0, fragment_len: 0,
+        has_query: false, has_fragment: false,
+        valid: false,
+    };
+}
+
+pub fn is_valid(url: *Url) -> bool { return (*url).valid; }
+
+pub fn bytes(url: *Url, offset: u64, length: u64) -> []const u8 {
+    if length == 0 {
+        return slice(0 as *const u8, 0);
+    }
+    let base: *const u8 = (*url).buffer.data as *const u8;
+    return slice((&base[offset]) as *const u8, length);
+}
+
+pub fn scheme(url: *Url) -> []const u8 {
+    return bytes(url, (*url).scheme_off, (*url).scheme_len);
+}
+
+pub fn host(url: *Url) -> []const u8 {
+    return bytes(url, (*url).host_off, (*url).host_len);
+}
+
+pub fn path(url: *Url) -> []const u8 {
+    return bytes(url, (*url).path_off, (*url).path_len);
+}
+
+pub fn query(url: *Url) -> []const u8 {
+    return bytes(url, (*url).query_off, (*url).query_len);
+}
+
+pub fn fragment(url: *Url) -> []const u8 {
+    return bytes(url, (*url).fragment_off, (*url).fragment_len);
+}
+
+fn ascii_lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32 as u8;
+    }
+    return c;
+}
+
+fn equals_ci(view: []const u8, text: *u8) -> bool {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if len(view) != length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        if ascii_lower(view[index]) != text[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// §3.1: the schemes with special parsing rules and a default port.
+pub fn default_port(scheme_name: []const u8) -> u64 {
+    if equals_ci(scheme_name, "http") { return 80; }
+    if equals_ci(scheme_name, "https") { return 443; }
+    if equals_ci(scheme_name, "ws") { return 80; }
+    if equals_ci(scheme_name, "wss") { return 443; }
+    if equals_ci(scheme_name, "ftp") { return 21; }
+    return 0;
+}
+
+fn is_special(scheme_name: []const u8) -> bool {
+    return default_port(scheme_name) != 0 || equals_ci(scheme_name, "file");
+}
+
+pub fn port_of(url: *Url) -> u64 {
+    if (*url).port != 0 {
+        return (*url).port;
+    }
+    return default_port(scheme(url));
+}
+
+pub fn is_https(url: *Url) -> bool {
+    return equals_ci(scheme(url), "https") || equals_ci(scheme(url), "wss");
+}
+
+// --- Parsing helpers ---------------------------------------------------------
+
+fn is_alpha(c: u8) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= '0' && c <= '9';
+}
+
+fn is_scheme_byte(c: u8) -> bool {
+    return is_alpha(c) || is_digit(c) || c == '+' || c == '-' || c == '.';
+}
+
+// §4.4 "URL parsing" step 1: strip leading and trailing C0 controls and spaces,
+// and remove every tab and newline from the middle.
+fn clean_input(input: []const u8, out: *Vec<u8>) -> void {
+    let start: u64 = 0;
+    let end: u64 = len(input);
+    while start < end && input[start] <= (32 as u8) {
+        start = start + 1;
+    }
+    while end > start && input[end - 1] <= (32 as u8) {
+        end = end - 1;
+    }
+    for index: u64 in start..end {
+        let c: u8 = input[index];
+        if c == 9 as u8 || c == 10 as u8 || c == 13 as u8 {
+            continue;
+        }
+        vec.push(out, c);
+    }
+}
+
+// The scheme at the start of `input`, or a zero length when there is none.
+// A scheme is letters, digits, `+`, `-` and `.` starting with a letter, then a
+// colon — so `C:\path` is a scheme to this rule, which is exactly the ambiguity
+// the file: scheme's drive-letter rules exist to resolve.
+fn scheme_length(input: *Vec<u8>) -> u64 {
+    if (*input).length == 0 || !is_alpha((*input).data[0]) {
+        return 0;
+    }
+    let index: u64 = 1;
+    while index < (*input).length {
+        let c: u8 = (*input).data[index];
+        if c == ':' {
+            return index;
+        }
+        if !is_scheme_byte(c) {
+            return 0;
+        }
+        index = index + 1;
+    }
+    return 0;
+}
+
+fn push_view(out: *Vec<u8>, view: []const u8) -> void {
+    for index: u64 in 0..len(view) {
+        vec.push(out, view[index]);
+    }
+}
+
+fn push_slice(out: *Vec<u8>, source: *Vec<u8>, from: u64, to: u64) -> void {
+    let end: u64 = to;
+    if end > (*source).length {
+        end = (*source).length;
+    }
+    for index: u64 in from..end {
+        vec.push(out, (*source).data[index]);
+    }
+}
+
+// §4.4 "path state" and RFC 3986 §5.2.4: remove `.` and `..` segments.
+fn normalize_path(input: *Vec<u8>, out: *Vec<u8>) -> void {
+    // Segment boundaries, so a `..` can pop back to the previous one.
+    let starts: Vec<u64> = vec.new<u64>();
+    let absolute: bool = (*input).length > 0 && (*input).data[0] == '/';
+    if absolute {
+        vec.push(out, '/');
+    }
+    let index: u64 = 0;
+    if absolute {
+        index = 1;
+    }
+    let first: bool = true;
+    while index <= (*input).length {
+        // One segment: up to the next '/' or the end.
+        let segment_start: u64 = index;
+        while index < (*input).length && (*input).data[index] != '/' {
+            index = index + 1;
+        }
+        let length: u64 = index - segment_start;
+        let is_dot: bool = length == 1 && (*input).data[segment_start] == '.';
+        let is_dotdot: bool = length == 2
+            && (*input).data[segment_start] == '.'
+            && (*input).data[segment_start + 1] == '.';
+        let trailing: bool = index < (*input).length;
+
+        if is_dotdot {
+            // Pop the previous segment, if there is one.
+            match vec.pop(&starts) {
+                Option<u64>.Some(previous) => {
+                    while (*out).length > previous {
+                        vec.pop(out);
+                    }
+                },
+                Option<u64>.None => {},
+            }
+            // A `..` that ends the path leaves a trailing slash behind.
+            if !trailing && (*out).length > 0
+                && (*out).data[(*out).length - 1] != '/' {
+                vec.push(out, '/');
+            }
+        } else if is_dot {
+            if !trailing && (*out).length > 0
+                && (*out).data[(*out).length - 1] != '/' {
+                vec.push(out, '/');
+            }
+        } else {
+            vec.push(&starts, (*out).length);
+            push_slice(out, input, segment_start, index);
+            if trailing {
+                vec.push(out, '/');
+            }
+        }
+        if index >= (*input).length {
+            break;
+        }
+        index = index + 1;
+        first = false;
+    }
+    vec.destroy(&starts);
+}
+
+// --- Building ----------------------------------------------------------------
+
+// Assemble a URL from its parts, serializing it into one buffer and recording
+// where each component landed.
+fn build(
+    scheme_text: []const u8,
+    host_text: []const u8,
+    port_value: u64,
+    path_text: *Vec<u8>,
+    query_text: []const u8,
+    has_query_value: bool,
+    fragment_text: []const u8,
+    has_fragment_value: bool
+) -> Url {
+    let result: Url = empty_url();
+    // scheme:
+    result.scheme_off = result.buffer.length;
+    for index: u64 in 0..len(scheme_text) {
+        vec.push(&result.buffer, ascii_lower(scheme_text[index]));
+    }
+    result.scheme_len = len(scheme_text);
+    vec.push(&result.buffer, ':');
+
+    if len(host_text) > 0 || is_special(scheme_text) {
+        vec.push(&result.buffer, '/');
+        vec.push(&result.buffer, '/');
+        result.host_off = result.buffer.length;
+        for index: u64 in 0..len(host_text) {
+            vec.push(&result.buffer, ascii_lower(host_text[index]));
+        }
+        result.host_len = len(host_text);
+        if port_value != 0 && port_value != default_port(scheme_text) {
+            vec.push(&result.buffer, ':');
+            push_number(&result.buffer, port_value);
+        }
+    }
+    result.port = port_value;
+
+    // A special scheme always has a path, even when none was written.
+    let normalized: Vec<u8> = vec.new<u8>();
+    normalize_path(path_text, &normalized);
+    result.path_off = result.buffer.length;
+    if normalized.length == 0 && is_special(scheme_text) {
+        vec.push(&result.buffer, '/');
+        result.path_len = 1;
+    } else {
+        for index: u64 in 0..normalized.length {
+            vec.push(&result.buffer, normalized.data[index]);
+        }
+        result.path_len = normalized.length;
+    }
+    vec.destroy(&normalized);
+
+    result.has_query = has_query_value;
+    if has_query_value {
+        vec.push(&result.buffer, '?');
+        result.query_off = result.buffer.length;
+        push_view(&result.buffer, query_text);
+        result.query_len = len(query_text);
+    }
+    result.has_fragment = has_fragment_value;
+    if has_fragment_value {
+        vec.push(&result.buffer, '#');
+        result.fragment_off = result.buffer.length;
+        push_view(&result.buffer, fragment_text);
+        result.fragment_len = len(fragment_text);
+    }
+    result.valid = true;
+    return move result;
+}
+
+fn push_number(out: *Vec<u8>, value: u64) -> void {
+    if value >= 10 {
+        push_number(out, value / 10);
+    }
+    vec.push(out, '0' + ((value % 10) as u8));
+}
+
+// The whole serialized URL, which is what a request line and a cache key use.
+pub fn serialize(url: *Url) -> []const u8 {
+    if (*url).buffer.length == 0 {
+        return slice(0 as *const u8, 0);
+    }
+    return slice((*url).buffer.data as *const u8, (*url).buffer.length);
+}
+
+// The request target: the path plus the query, which is what goes on an HTTP
+// request line.
+pub fn request_target(url: *Url, out: *Vec<u8>) -> void {
+    push_view(out, path(url));
+    if (*url).has_query {
+        vec.push(out, '?');
+        push_view(out, query(url));
+    }
+    if (*out).length == 0 {
+        vec.push(out, '/');
+    }
+    vec.push(out, 0 as u8);
+}
+
+// --- The parser --------------------------------------------------------------
+
+// Parse an absolute URL. An input with no scheme fails; use parse_relative to
+// resolve one against a base.
+pub fn parse(input: []const u8) -> Url {
+    let cleaned: Vec<u8> = vec.new<u8>();
+    clean_input(input, &cleaned);
+    let scheme_len: u64 = scheme_length(&cleaned);
+    if scheme_len == 0 {
+        vec.destroy(&cleaned);
+        return empty_url();
+    }
+    let result: Url = parse_after_scheme(&cleaned, scheme_len);
+    vec.destroy(&cleaned);
+    return move result;
+}
+
+fn view_of(source: *Vec<u8>, from: u64, to: u64) -> []const u8 {
+    if to <= from || from >= (*source).length {
+        return slice(0 as *const u8, 0);
+    }
+    let end: u64 = to;
+    if end > (*source).length {
+        end = (*source).length;
+    }
+    return slice((&(*source).data[from]) as *const u8, end - from);
+}
+
+fn parse_after_scheme(cleaned: *Vec<u8>, scheme_len: u64) -> Url {
+    let scheme_text: []const u8 = view_of(cleaned, 0, scheme_len);
+    let cursor: u64 = scheme_len + 1;
+
+    let host_text: []const u8 = slice(0 as *const u8, 0);
+    let port_value: u64 = 0;
+    if cursor + 1 < (*cleaned).length
+        && (*cleaned).data[cursor] == '/' && (*cleaned).data[cursor + 1] == '/' {
+        cursor = cursor + 2;
+        let authority_end: u64 = cursor;
+        while authority_end < (*cleaned).length {
+            let c: u8 = (*cleaned).data[authority_end];
+            if c == '/' || c == '?' || c == '#' {
+                break;
+            }
+            authority_end = authority_end + 1;
+        }
+        // Userinfo, if any, ends at the last '@' before the host.
+        let host_start: u64 = cursor;
+        for index: u64 in cursor..authority_end {
+            if (*cleaned).data[index] == '@' {
+                host_start = index + 1;
+            }
+        }
+        // The port is after the last ':' that is not inside [] brackets.
+        let host_end: u64 = authority_end;
+        let in_brackets: bool = false;
+        for index: u64 in host_start..authority_end {
+            let c: u8 = (*cleaned).data[index];
+            if c == '[' { in_brackets = true; }
+            if c == ']' { in_brackets = false; }
+            if c == ':' && !in_brackets {
+                host_end = index;
+            }
+        }
+        host_text = view_of(cleaned, host_start, host_end);
+        if host_end < authority_end {
+            for index: u64 in (host_end + 1)..authority_end {
+                let c: u8 = (*cleaned).data[index];
+                if is_digit(c) {
+                    port_value = port_value * 10 + ((c - '0') as u64);
+                }
+            }
+        }
+        cursor = authority_end;
+    }
+
+    // Path, query and fragment.
+    let path_end: u64 = cursor;
+    while path_end < (*cleaned).length {
+        let c: u8 = (*cleaned).data[path_end];
+        if c == '?' || c == '#' {
+            break;
+        }
+        path_end = path_end + 1;
+    }
+    let path_text: Vec<u8> = vec.new<u8>();
+    push_slice(&path_text, cleaned, cursor, path_end);
+
+    let query_text: []const u8 = slice(0 as *const u8, 0);
+    let has_query_value: bool = false;
+    let fragment_text: []const u8 = slice(0 as *const u8, 0);
+    let has_fragment_value: bool = false;
+    let rest: u64 = path_end;
+    if rest < (*cleaned).length && (*cleaned).data[rest] == '?' {
+        let query_end: u64 = rest + 1;
+        while query_end < (*cleaned).length && (*cleaned).data[query_end] != '#' {
+            query_end = query_end + 1;
+        }
+        query_text = view_of(cleaned, rest + 1, query_end);
+        has_query_value = true;
+        rest = query_end;
+    }
+    if rest < (*cleaned).length && (*cleaned).data[rest] == '#' {
+        fragment_text = view_of(cleaned, rest + 1, (*cleaned).length);
+        has_fragment_value = true;
+    }
+
+    let result: Url = build(scheme_text, host_text, port_value, &path_text,
+        query_text, has_query_value, fragment_text, has_fragment_value);
+    vec.destroy(&path_text);
+    return move result;
+}
+
+// Resolve `input` against `base`, which is what every `href` and `src` in a
+// document needs (§4.4 "URL parsing" with a base URL).
+pub fn parse_relative(input: []const u8, base: *Url) -> Url {
+    let cleaned: Vec<u8> = vec.new<u8>();
+    clean_input(input, &cleaned);
+
+    // A reference with its own scheme is absolute.
+    let scheme_len: u64 = scheme_length(&cleaned);
+    if scheme_len > 0 {
+        let absolute: Url = parse_after_scheme(&cleaned, scheme_len);
+        vec.destroy(&cleaned);
+        return move absolute;
+    }
+    if !(*base).valid {
+        vec.destroy(&cleaned);
+        return empty_url();
+    }
+
+    // Everything below reuses the base's scheme, and usually its authority.
+    let rebuilt: Vec<u8> = vec.new<u8>();
+    if cleaned.length >= 2 && cleaned.data[0] == '/' && cleaned.data[1] == '/' {
+        // A scheme-relative reference: the base's scheme, the reference's
+        // authority.
+        push_view(&rebuilt, scheme(base));
+        vec.push(&rebuilt, ':');
+        for index: u64 in 0..cleaned.length {
+            vec.push(&rebuilt, cleaned.data[index]);
+        }
+    } else if cleaned.length > 0 && cleaned.data[0] == '#' {
+        // Only the fragment changes.
+        push_view(&rebuilt, scheme(base));
+        vec.push(&rebuilt, ':');
+        push_authority(&rebuilt, base);
+        push_view(&rebuilt, path(base));
+        if (*base).has_query {
+            vec.push(&rebuilt, '?');
+            push_view(&rebuilt, query(base));
+        }
+        for index: u64 in 0..cleaned.length {
+            vec.push(&rebuilt, cleaned.data[index]);
+        }
+    } else if cleaned.length > 0 && cleaned.data[0] == '?' {
+        push_view(&rebuilt, scheme(base));
+        vec.push(&rebuilt, ':');
+        push_authority(&rebuilt, base);
+        push_view(&rebuilt, path(base));
+        for index: u64 in 0..cleaned.length {
+            vec.push(&rebuilt, cleaned.data[index]);
+        }
+    } else if cleaned.length > 0 && cleaned.data[0] == '/' {
+        // An absolute path against the base's authority.
+        push_view(&rebuilt, scheme(base));
+        vec.push(&rebuilt, ':');
+        push_authority(&rebuilt, base);
+        for index: u64 in 0..cleaned.length {
+            vec.push(&rebuilt, cleaned.data[index]);
+        }
+    } else {
+        // A relative path, resolved against the base path's *directory* — so
+        // "b" against "/one/two" is "/one/b", not "/one/two/b".
+        push_view(&rebuilt, scheme(base));
+        vec.push(&rebuilt, ':');
+        push_authority(&rebuilt, base);
+        let base_path: []const u8 = path(base);
+        let cut: u64 = 0;
+        for index: u64 in 0..len(base_path) {
+            if base_path[index] == '/' {
+                cut = index + 1;
+            }
+        }
+        for index: u64 in 0..cut {
+            vec.push(&rebuilt, base_path[index]);
+        }
+        if cut == 0 {
+            vec.push(&rebuilt, '/');
+        }
+        for index: u64 in 0..cleaned.length {
+            vec.push(&rebuilt, cleaned.data[index]);
+        }
+    }
+    vec.destroy(&cleaned);
+
+    let final_clean: Vec<u8> = vec.new<u8>();
+    clean_input(slice(rebuilt.data as *const u8, rebuilt.length), &final_clean);
+    let result: Url = parse_after_scheme(&final_clean,
+        scheme_length(&final_clean));
+    vec.destroy(&final_clean);
+    vec.destroy(&rebuilt);
+    return move result;
+}
+
+fn push_authority(out: *Vec<u8>, base: *Url) -> void {
+    if (*base).host_len == 0 && !is_special(scheme(base)) {
+        return;
+    }
+    vec.push(out, '/');
+    vec.push(out, '/');
+    push_view(out, host(base));
+    if (*base).port != 0 && (*base).port != default_port(scheme(base)) {
+        vec.push(out, ':');
+        push_number(out, (*base).port);
+    }
+}
+
+// The host as a NUL-terminated string, which the socket layer needs.
+pub fn host_cstring(url: *Url, out: *Vec<u8>) -> void {
+    push_view(out, host(url));
+    vec.push(out, 0 as u8);
+}
+
+// The directory a relative reference resolves against, as a serialized URL —
+// used as the base when a document declares no <base> of its own.
+pub fn directory_of(url: *Url) -> Url {
+    let text: Vec<u8> = vec.new<u8>();
+    push_view(&text, scheme(url));
+    vec.push(&text, ':');
+    push_authority(&text, url);
+    let base_path: []const u8 = path(url);
+    let cut: u64 = 0;
+    for index: u64 in 0..len(base_path) {
+        if base_path[index] == '/' {
+            cut = index + 1;
+        }
+    }
+    for index: u64 in 0..cut {
+        vec.push(&text, base_path[index]);
+    }
+    let result: Url = parse(slice(text.data as *const u8, text.length));
+    vec.destroy(&text);
+    return move result;
+}

@@ -1,0 +1,67 @@
+// Fetching the images a document references.
+//
+// The counterpart to engine.image.load, which reads them from disk. They are
+// separate modules rather than one with two entry points because importing this
+// one pulls in the TLS backend and its system headers — a cost a program that
+// only ever reads local files should not pay, and one that a program with its
+// own declarations of the platform API cannot pay at all.
+module engine.net.imagefetch;
+
+import std.vec;
+import engine.dom.node;
+import engine.html.tagnames;
+import engine.image.png;
+import engine.image.bitmap;
+import engine.image.store;
+import engine.net.url;
+import engine.net.fetch;
+
+fn name_view(text: *u8) -> []const u8 {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    return slice(text as *const u8, length);
+}
+
+// Fetch every <img> the document references, resolving each `src` against the
+// document's location.
+pub fn load_document(
+    doc: *DomDocument,
+    images: *ImageStore,
+    base: *Url
+) -> void {
+    fetch_from(doc, images, base, 0);
+}
+
+fn fetch_from(
+    doc: *DomDocument,
+    images: *ImageStore,
+    base: *Url,
+    index: u64
+) -> void {
+    let current: DomNode = node.get(doc, index);
+    if current.kind == node.kind_element() && current.tag == tagnames.tag_img() {
+        let found: DomAttrValue = node.find_attr(doc, index, name_view("src"));
+        if found.found && found.value_len > 0 {
+            let target: Url = url.parse_relative(
+                node.bytes(doc, found.value_off, found.value_len), base);
+            if url.is_valid(&target) {
+                let response: FetchResult = fetch.get(&target);
+                if response.ok && response.body.length > 0 {
+                    let decoded: Bitmap = png.decode(
+                        response.body.data as *const u8, response.body.length);
+                    store.add(images, index, &decoded);
+                    bitmap.destroy(&decoded);
+                }
+                fetch.destroy(&response);
+            }
+            url.destroy(&target);
+        }
+    }
+    let child: u64 = current.first_child;
+    while child != node.none() {
+        fetch_from(doc, images, base, child);
+        child = node.get(doc, child).next_sibling;
+    }
+}

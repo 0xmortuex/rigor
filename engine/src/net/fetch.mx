@@ -1,0 +1,460 @@
+// Fetching a URL over HTTP and HTTPS.
+//
+// This is the layer between "here is a URL" and "here are some bytes and what
+// the server said they are". It is deliberately small: one GET, redirects
+// followed, the response split into headers and body, and the Content-Type's
+// charset handed back so the HTML decoder can honour a transport declaration
+// (§13.2.3.2 step 3) rather than sniffing.
+//
+// Implemented: http and https, absolute and relative Location headers, a
+// redirect limit, and the Content-Type charset parameter.
+//
+// Not implemented, and each is noted rather than hidden: request methods other
+// than GET, cookies, caching and conditional requests, connection reuse (every
+// request sends `Connection: close`), and content encodings — a server that
+// gzips a response would hand back bytes rigor does not inflate, though since
+// Accept-Encoding is never offered, no server should.
+module engine.net.fetch;
+
+import std.vec;
+import std.net;
+import std.tls;
+import std.http;
+import engine.net.url;
+
+// The most a single response may occupy. A browser streams; rigor reads a
+// whole response into memory, so it needs a ceiling rather than trusting
+// Content-Length.
+const MAX_RESPONSE: u64 = 16777216;
+const MAX_REDIRECTS: u64 = 20;
+
+struct FetchResult {
+    ok: bool,
+    status: i64,
+    body: Vec<u8>,
+    // The charset from the Content-Type header, empty when there was none.
+    charset: Vec<u8>,
+    // The URL the body actually came from, after redirects.
+    final_url: Url,
+}
+
+pub fn destroy(result: *FetchResult) -> void {
+    vec.destroy(&(*result).body);
+    vec.destroy(&(*result).charset);
+    url.destroy(&(*result).final_url);
+}
+
+fn failed(status: i64) -> FetchResult {
+    return FetchResult {
+        ok: false, status: status,
+        body: vec.new<u8>(), charset: vec.new<u8>(),
+        final_url: url.parse(slice(0 as *const u8, 0)),
+    };
+}
+
+fn ascii_lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32 as u8;
+    }
+    return c;
+}
+
+// Find a header's value in a response. std.http offers this, but only for a
+// NUL-terminated name and into a caller's buffer; this returns the range.
+struct HeaderSpan {
+    found: bool,
+    offset: u64,
+    length: u64,
+}
+
+fn find_header(
+    data: *Vec<u8>,
+    header_end: u64,
+    name: *u8
+) -> HeaderSpan {
+    let name_length: u64 = 0;
+    while name[name_length] != 0 as u8 {
+        name_length = name_length + 1;
+    }
+    // Start after the status line.
+    let index: u64 = 0;
+    while index < header_end && (*data).data[index] != 10 as u8 {
+        index = index + 1;
+    }
+    index = index + 1;
+    while index < header_end {
+        let line_end: u64 = index;
+        while line_end < header_end && (*data).data[line_end] != 10 as u8 {
+            line_end = line_end + 1;
+        }
+        // Does this line start with the name, then a colon?
+        let matches: bool = index + name_length < line_end;
+        if matches {
+            for step: u64 in 0..name_length {
+                if ascii_lower((*data).data[index + step]) != ascii_lower(name[step]) {
+                    matches = false;
+                }
+            }
+        }
+        if matches && (*data).data[index + name_length] == ':' {
+            let value_start: u64 = index + name_length + 1;
+            while value_start < line_end
+                && ((*data).data[value_start] == ' '
+                    || (*data).data[value_start] == 9 as u8) {
+                value_start = value_start + 1;
+            }
+            let value_end: u64 = line_end;
+            while value_end > value_start
+                && ((*data).data[value_end - 1] == 13 as u8
+                    || (*data).data[value_end - 1] == ' ') {
+                value_end = value_end - 1;
+            }
+            return HeaderSpan {
+                found: true, offset: value_start, length: value_end - value_start,
+            };
+        }
+        index = line_end + 1;
+    }
+    return HeaderSpan { found: false, offset: 0, length: 0 };
+}
+
+// The charset parameter of a Content-Type, if it names one.
+fn extract_charset(data: *Vec<u8>, span: HeaderSpan, out: *Vec<u8>) -> void {
+    if !span.found {
+        return;
+    }
+    let end: u64 = span.offset + span.length;
+    let index: u64 = span.offset;
+    while index + 8 <= end {
+        let matches: bool = true;
+        let word: *u8 = "charset";
+        for step: u64 in 0..7 {
+            if ascii_lower((*data).data[index + step]) != word[step] {
+                matches = false;
+            }
+        }
+        if matches {
+            let cursor: u64 = index + 7;
+            while cursor < end && (*data).data[cursor] == ' ' {
+                cursor = cursor + 1;
+            }
+            if cursor < end && (*data).data[cursor] == '=' {
+                cursor = cursor + 1;
+                while cursor < end && (*data).data[cursor] == ' ' {
+                    cursor = cursor + 1;
+                }
+                let quoted: bool = cursor < end && (*data).data[cursor] == '"';
+                if quoted {
+                    cursor = cursor + 1;
+                }
+                while cursor < end {
+                    let c: u8 = (*data).data[cursor];
+                    if quoted && c == '"' {
+                        break;
+                    }
+                    if !quoted && (c == ';' || c == ' ') {
+                        break;
+                    }
+                    vec.push(out, c);
+                    cursor = cursor + 1;
+                }
+                return;
+            }
+        }
+        index = index + 1;
+    }
+}
+
+fn is_redirect(status: i64) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307
+        || status == 308;
+}
+
+// Fetch one URL, without following redirects. `raw` is already MAX_RESPONSE
+// bytes long, and the return value says how much of it arrived.
+//
+// The transport is driven here rather than through std.http's `get`, because
+// that frames a response by Content-Length and gives up on anything else — and
+// most of the web answers with `Transfer-Encoding: chunked`. The request sends
+// `Connection: close`, so reading to end-of-stream is itself valid framing
+// (RFC 9112 §6.3), and a chunked body is then de-chunked below.
+fn request(target: *Url, raw: *Vec<u8>) -> i64 {
+    let host_text: Vec<u8> = vec.new<u8>();
+    url.host_cstring(target, &host_text);
+    if host_text.length <= 1 {
+        vec.destroy(&host_text);
+        return 0 - 1;
+    }
+    let path_text: Vec<u8> = vec.new<u8>();
+    url.request_target(target, &path_text);
+    let message: Vec<u8> = vec.new<u8>();
+    build_request(&message, &path_text, &host_text);
+    let port: u64 = url.port_of(target);
+    let read: i64 = 0 - 1;
+    if url.is_https(target) {
+        read = read_tls(host_text.data, port as u16, &message, raw);
+    } else {
+        read = read_tcp(host_text.data, port as u16, &message, raw);
+    }
+    vec.destroy(&message);
+    vec.destroy(&path_text);
+    vec.destroy(&host_text);
+    return read;
+}
+
+fn push_cstr(out: *Vec<u8>, text: *u8) -> void {
+    let index: u64 = 0;
+    while text[index] != 0 as u8 {
+        vec.push(out, text[index]);
+        index = index + 1;
+    }
+}
+
+// The request line and headers. Written here rather than taken from
+// std.http.build_request because a request needs a User-Agent: a server that
+// cannot tell who is asking is entitled to refuse, and several large sites do
+// exactly that.
+fn build_request(out: *Vec<u8>, target: *Vec<u8>, host_name: *Vec<u8>) -> void {
+    push_cstr(out, "GET ");
+    // Both buffers are NUL-terminated for the socket layer; the terminator is
+    // not part of the request.
+    for index: u64 in 0..((*target).length - 1) {
+        vec.push(out, (*target).data[index]);
+    }
+    push_cstr(out, " HTTP/1.1\r\nHost: ");
+    for index: u64 in 0..((*host_name).length - 1) {
+        vec.push(out, (*host_name).data[index]);
+    }
+    push_cstr(out, "\r\nUser-Agent: rigor/0.1 (+https://github.com/0xmortuex/rigor)");
+    push_cstr(out, "\r\nAccept: text/html,application/xhtml+xml,image/png,*/*");
+    // No Accept-Encoding: rigor does not inflate a content encoding, so it
+    // must not claim to.
+    push_cstr(out, "\r\nConnection: close\r\n\r\n");
+}
+
+fn read_tcp(
+    host_name: *u8,
+    port: u16,
+    message: *Vec<u8>,
+    raw: *Vec<u8>
+) -> i64 {
+    let socket: Socket = net.tcp_connect(host_name, port);
+    if !net.send_all(&socket, (*message).data as *const u8, (*message).length) {
+        net.destroy(&socket);
+        return 0 - 1;
+    }
+    let total: u64 = 0;
+    while total < MAX_RESPONSE {
+        let amount: i64 =
+            net.receive(&socket, &(*raw).data[total], MAX_RESPONSE - total);
+        if amount <= 0 {
+            break;
+        }
+        total = total + (amount as u64);
+    }
+    net.destroy(&socket);
+    if total == 0 {
+        return 0 - 1;
+    }
+    return total as i64;
+}
+
+fn read_tls(
+    host_name: *u8,
+    port: u16,
+    message: *Vec<u8>,
+    raw: *Vec<u8>
+) -> i64 {
+    let stream: Stream = tls.connect(host_name, port);
+    if !tls.send_all(&stream, (*message).data as *const u8, (*message).length) {
+        tls.destroy(&stream);
+        return 0 - 1;
+    }
+    let total: u64 = 0;
+    while total < MAX_RESPONSE {
+        let amount: i64 =
+            tls.receive(&stream, &(*raw).data[total], MAX_RESPONSE - total);
+        if amount <= 0 {
+            break;
+        }
+        total = total + (amount as u64);
+    }
+    tls.destroy(&stream);
+    if total == 0 {
+        return 0 - 1;
+    }
+    return total as i64;
+}
+
+// RFC 9112 §7.1: a chunked body is a sequence of hex-length-prefixed pieces,
+// ending with a zero-length one. Everything after that is trailers, which
+// rigor has no use for.
+fn dechunk(source: *Vec<u8>, start: u64, end: u64, out: *Vec<u8>) -> void {
+    let cursor: u64 = start;
+    loop {
+        // The chunk size, in hex, up to a CR or a semicolon (which introduces
+        // chunk extensions).
+        let size: u64 = 0;
+        let digits: u64 = 0;
+        while cursor < end {
+            let c: u8 = (*source).data[cursor];
+            let value: u64 = 16;
+            if c >= '0' && c <= '9' {
+                value = (c - '0') as u64;
+            } else if c >= 'a' && c <= 'f' {
+                value = ((c - 'a') as u64) + 10;
+            } else if c >= 'A' && c <= 'F' {
+                value = ((c - 'A') as u64) + 10;
+            }
+            if value == 16 {
+                break;
+            }
+            size = size * 16 + value;
+            digits = digits + 1;
+            cursor = cursor + 1;
+        }
+        if digits == 0 {
+            return;
+        }
+        // Skip any extensions and the CRLF that ends the size line.
+        while cursor < end && (*source).data[cursor] != 10 as u8 {
+            cursor = cursor + 1;
+        }
+        cursor = cursor + 1;
+        if size == 0 {
+            return;
+        }
+        if cursor + size > end {
+            // A truncated final chunk: take what there is.
+            for index: u64 in cursor..end {
+                vec.push(out, (*source).data[index]);
+            }
+            return;
+        }
+        for index: u64 in 0..size {
+            vec.push(out, (*source).data[cursor + index]);
+        }
+        cursor = cursor + size;
+        // The CRLF that follows every chunk.
+        while cursor < end && (*source).data[cursor] != 10 as u8 {
+            cursor = cursor + 1;
+        }
+        cursor = cursor + 1;
+    }
+}
+
+fn header_is(data: *Vec<u8>, span: HeaderSpan, text: *u8) -> bool {
+    if !span.found {
+        return false;
+    }
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    if span.length != length {
+        return false;
+    }
+    for index: u64 in 0..length {
+        if ascii_lower((*data).data[span.offset + index]) != text[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn push_view(out: *Vec<u8>, view: []const u8) -> void {
+    for index: u64 in 0..len(view) {
+        vec.push(out, view[index]);
+    }
+}
+
+// Fetch a URL, following redirects. The result owns its body and the URL it
+// finally came from.
+//
+// The redirect chain is carried as *text* rather than as a parsed Url: a Url
+// owns a buffer, and a resource bound outside a loop cannot be rebound inside
+// one, so each hop parses its own and destroys it before the next.
+pub fn get(target: *Url) -> FetchResult {
+    if !url.is_valid(target) {
+        return failed(0);
+    }
+    let current_text: Vec<u8> = vec.new<u8>();
+    push_view(&current_text, url.serialize(target));
+
+    let raw: Vec<u8> = vec.with_capacity<u8>(MAX_RESPONSE + 1);
+    for index: u64 in 0..MAX_RESPONSE {
+        vec.push(&raw, 0 as u8);
+    }
+
+    let status: i64 = 0;
+    let length: u64 = 0;
+    let header_end: i64 = 0 - 1;
+    let redirects: u64 = 0;
+    loop {
+        // One parse per hop, destroyed at the bottom of the same iteration —
+        // exactly once, on every path, which is what the move checker wants.
+        let current: Url = url.parse(vec.as_const_slice(&current_text));
+        let read: i64 = request(&current, &raw);
+        let follow: bool = false;
+        if read <= 0 {
+            status = 0;
+            header_end = 0 - 1;
+        } else {
+            length = read as u64;
+            status = http.status_code(raw.data as *const u8, length) as i64;
+            header_end = http.find_header_end(raw.data as *const u8, length);
+            if header_end >= 0 && is_redirect(status)
+                && redirects < MAX_REDIRECTS {
+                let location: HeaderSpan =
+                    find_header(&raw, header_end as u64, "location");
+                if location.found && location.length > 0 {
+                    let next: Url = url.parse_relative(
+                        slice((&raw.data[location.offset]) as *const u8,
+                            location.length),
+                        &current);
+                    if url.is_valid(&next) {
+                        vec.clear(&current_text);
+                        push_view(&current_text, url.serialize(&next));
+                        follow = true;
+                    }
+                    url.destroy(&next);
+                }
+            }
+        }
+        url.destroy(&current);
+        if !follow {
+            break;
+        }
+        redirects = redirects + 1;
+    }
+
+    let body: Vec<u8> = vec.new<u8>();
+    let charset: Vec<u8> = vec.new<u8>();
+    if header_end >= 0 {
+        // The body is everything past the blank line that ends the headers —
+        // unless it arrived in chunks, in which case the lengths between the
+        // pieces are framing and not content.
+        let chunked: bool = header_is(&raw,
+            find_header(&raw, header_end as u64, "transfer-encoding"),
+            "chunked");
+        if chunked {
+            dechunk(&raw, header_end as u64, length, &body);
+        } else {
+            for index: u64 in (header_end as u64)..length {
+                vec.push(&body, raw.data[index]);
+            }
+        }
+        extract_charset(&raw, find_header(&raw, header_end as u64,
+            "content-type"), &charset);
+    }
+    let final_url: Url = url.parse(vec.as_const_slice(&current_text));
+    vec.destroy(&current_text);
+    vec.destroy(&raw);
+    return FetchResult {
+        ok: header_end >= 0 && status >= 200 && status < 300,
+        status: status,
+        body: move body,
+        charset: move charset,
+        final_url: move final_url,
+    };
+}

@@ -1,0 +1,197 @@
+// URL parsing and relative resolution (the WHATWG URL Standard).
+//
+// The cases are the ones that decide whether a page loads the right thing:
+// path normalisation, the difference between a path relative to a directory
+// and one relative to a file, and the four kinds of relative reference.
+
+import std.vec;
+import std.string;
+import engine.net.url;
+
+fn view_of(text: *u8) -> []const u8 {
+    return slice(text as *const u8, str_len(text));
+}
+
+fn view_is(view: []const u8, expected: *u8) -> bool {
+    let want: u64 = str_len(expected);
+    if len(view) != want {
+        return false;
+    }
+    for index: u64 in 0..want {
+        if view[index] != expected[index] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parses_to(input: *u8, expected: *u8) -> bool {
+    let parsed: Url = url.parse(view_of(input));
+    let ok: bool = url.is_valid(&parsed)
+        && view_is(url.serialize(&parsed), expected);
+    url.destroy(&parsed);
+    return ok;
+}
+
+fn resolves_to(base_text: *u8, input: *u8, expected: *u8) -> bool {
+    let base: Url = url.parse(view_of(base_text));
+    let resolved: Url = url.parse_relative(view_of(input), &base);
+    let ok: bool = url.is_valid(&resolved)
+        && view_is(url.serialize(&resolved), expected);
+    url.destroy(&resolved);
+    url.destroy(&base);
+    return ok;
+}
+
+// --- Absolute URLs -----------------------------------------------------------
+
+test "a plain http url parses and round trips" {
+    assert(parses_to("http://example.com/path", "http://example.com/path"));
+}
+
+test "an empty path becomes a slash" {
+    // §4.4: a special scheme always has a path.
+    assert(parses_to("http://example.com", "http://example.com/"));
+}
+
+test "the scheme and host are lowercased" {
+    assert(parses_to("HTTP://Example.COM/Path", "http://example.com/Path"));
+}
+
+test "a default port is dropped and a non-default one kept" {
+    assert(parses_to("http://example.com:80/", "http://example.com/"));
+    assert(parses_to("https://example.com:443/", "https://example.com/"));
+    assert(parses_to("http://example.com:8080/", "http://example.com:8080/"));
+}
+
+test "a query and a fragment survive" {
+    assert(parses_to("http://example.com/a?b=c#d", "http://example.com/a?b=c#d"));
+}
+
+test "an empty query is not the same as no query" {
+    assert(parses_to("http://example.com/a?", "http://example.com/a?"));
+}
+
+test "userinfo is stripped from the host" {
+    let parsed: Url = url.parse(view_of("http://user:pass@example.com/x"));
+    assert(view_is(url.host(&parsed), "example.com"));
+    url.destroy(&parsed);
+}
+
+test "a url with no scheme does not parse" {
+    let parsed: Url = url.parse(view_of("/just/a/path"));
+    assert(!url.is_valid(&parsed));
+    url.destroy(&parsed);
+}
+
+test "surrounding whitespace and inner tabs are removed" {
+    assert(parses_to("  http://exa\tmple.com/a  ", "http://example.com/a"));
+}
+
+test "the port and scheme are reported" {
+    let parsed: Url = url.parse(view_of("https://example.com/x"));
+    assert(view_is(url.scheme(&parsed), "https"));
+    assert(url.port_of(&parsed) == 443);
+    assert(url.is_https(&parsed));
+    url.destroy(&parsed);
+}
+
+// --- Path normalisation ------------------------------------------------------
+
+test "dot segments are removed" {
+    assert(parses_to("http://example.com/a/./b", "http://example.com/a/b"));
+}
+
+test "double dot segments pop a directory" {
+    assert(parses_to("http://example.com/a/b/../c", "http://example.com/a/c"));
+}
+
+test "double dots cannot escape the root" {
+    assert(parses_to("http://example.com/../../a", "http://example.com/a"));
+}
+
+test "a trailing dot segment leaves a slash" {
+    assert(parses_to("http://example.com/a/b/..", "http://example.com/a/"));
+    assert(parses_to("http://example.com/a/b/.", "http://example.com/a/b/"));
+}
+
+// --- Relative resolution -----------------------------------------------------
+
+test "a relative path resolves against the base's directory" {
+    // "b" against "/one/two" is "/one/b" — the base's last segment is a file
+    // name, not a directory.
+    assert(resolves_to("http://example.com/one/two", "b",
+    "http://example.com/one/b"));
+    assert(resolves_to("http://example.com/one/two/", "b",
+    "http://example.com/one/two/b"));
+}
+
+test "an absolute path replaces the base's path" {
+    assert(resolves_to("http://example.com/one/two", "/three",
+    "http://example.com/three"));
+}
+
+test "a scheme-relative reference keeps the base's scheme" {
+    assert(resolves_to("https://example.com/a", "//other.example/b",
+    "https://other.example/b"));
+}
+
+test "a query-only reference keeps the base's path" {
+    assert(resolves_to("http://example.com/a/b?old=1", "?new=2",
+    "http://example.com/a/b?new=2"));
+}
+
+test "a fragment-only reference keeps everything else" {
+    assert(resolves_to("http://example.com/a?q=1", "#top",
+    "http://example.com/a?q=1#top"));
+}
+
+test "an absolute reference ignores the base entirely" {
+    assert(resolves_to("http://example.com/a", "https://other.example/b",
+    "https://other.example/b"));
+}
+
+test "dot segments in a relative reference are resolved after merging" {
+    assert(resolves_to("http://example.com/a/b/c", "../d",
+    "http://example.com/a/d"));
+    assert(resolves_to("http://example.com/a/b/c", "./d",
+    "http://example.com/a/b/d"));
+}
+
+test "an empty reference keeps the base's path" {
+    assert(resolves_to("http://example.com/a/b", "",
+    "http://example.com/a/"));
+}
+
+// --- Derived forms -----------------------------------------------------------
+
+test "the request target is the path and query" {
+    let parsed: Url = url.parse(view_of("http://example.com/a/b?c=d#e"));
+    let target: Vec<u8> = vec.new<u8>();
+    url.request_target(&parsed, &target);
+    // NUL-terminated for the socket layer, so the comparison drops the last
+    // byte.
+    assert(target.length == 9);
+    assert(view_is(slice(target.data as *const u8, 8), "/a/b?c=d"));
+    vec.destroy(&target);
+    url.destroy(&parsed);
+}
+
+test "the directory of a url drops its last segment" {
+    let parsed: Url = url.parse(view_of("http://example.com/a/b/page.html"));
+    let directory: Url = url.directory_of(&parsed);
+    assert(view_is(url.serialize(&directory), "http://example.com/a/b/"));
+    url.destroy(&directory);
+    url.destroy(&parsed);
+}
+
+test "the host is available as a c string" {
+    let parsed: Url = url.parse(view_of("http://example.com:8080/x"));
+    let host: Vec<u8> = vec.new<u8>();
+    url.host_cstring(&parsed, &host);
+    assert(host.length == 12);
+    assert(host.data[11] == 0 as u8);
+    assert(url.port_of(&parsed) == 8080);
+    vec.destroy(&host);
+    url.destroy(&parsed);
+}

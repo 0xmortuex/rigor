@@ -1,0 +1,132 @@
+// Gathering a document's stylesheets.
+//
+// A page's CSS comes from two places: `<style>` elements, whose text is right
+// there in the document, and `<link rel=stylesheet>` elements, whose text has to
+// be fetched. Both are collected here, in document order, because that order is
+// what the cascade's final tiebreak depends on — a rule in a linked sheet loses
+// to an equally specific rule in a `<style>` that follows it.
+//
+// A document with no location can only use its `<style>` elements; a relative
+// `href` has nothing to resolve against. That is the CLI reading from stdin, and
+// it is why this takes the base URL as a parameter rather than assuming one.
+module engine.net.resources;
+
+import std.vec;
+import engine.dom.node;
+import engine.html.tagnames;
+import engine.net.url;
+import engine.net.fetch;
+
+fn name_view(text: *u8) -> []const u8 {
+    let length: u64 = 0;
+    while text[length] != 0 as u8 {
+        length = length + 1;
+    }
+    return slice(text as *const u8, length);
+}
+
+fn ascii_lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32 as u8;
+    }
+    return c;
+}
+
+// A `rel` attribute is a space-separated list of tokens; this looks for one.
+fn rel_contains(value: []const u8, wanted: *u8) -> bool {
+    let length: u64 = 0;
+    while wanted[length] != 0 as u8 {
+        length = length + 1;
+    }
+    // Bound the scan with a local: `index < len(value) && value[index] > x`
+    // reads as a generic argument list to the parser.
+    let total: u64 = len(value);
+    let index: u64 = 0;
+    while index < total {
+        while index < total && value[index] <= (32 as u8) {
+            index = index + 1;
+        }
+        let start: u64 = index;
+        while index < total && !(value[index] <= (32 as u8)) {
+            index = index + 1;
+        }
+        if index - start == length {
+            let same: bool = true;
+            for step: u64 in 0..length {
+                if ascii_lower(value[start + step]) != wanted[step] {
+                    same = false;
+                }
+            }
+            if same {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn push_text_children(doc: *DomDocument, element: u64, out: *Vec<u8>) -> void {
+    let child: u64 = node.get(doc, element).first_child;
+    while child != node.none() {
+        let child_node: DomNode = node.get(doc, child);
+        if child_node.kind == node.kind_text() {
+            let text: []const u8 =
+                node.bytes(doc, child_node.data_off, child_node.data_len);
+            for index: u64 in 0..len(text) {
+                vec.push(out, text[index]);
+            }
+        }
+        child = child_node.next_sibling;
+    }
+    vec.push(out, 10 as u8);
+}
+
+// Append every stylesheet the document uses to `out`, in document order.
+// `base` may be an invalid Url, in which case linked sheets are skipped.
+pub fn gather_stylesheets(
+    doc: *DomDocument,
+    base: *Url,
+    out: *Vec<u8>
+) -> void {
+    gather_from(doc, base, out, 0);
+}
+
+fn gather_from(
+    doc: *DomDocument,
+    base: *Url,
+    out: *Vec<u8>,
+    index: u64
+) -> void {
+    let current: DomNode = node.get(doc, index);
+    if current.kind == node.kind_element() {
+        if current.tag == tagnames.tag_style() {
+            push_text_children(doc, index, out);
+        } else if current.tag == tagnames.tag_link() && url.is_valid(base) {
+            let rel: DomAttrValue = node.find_attr(doc, index, name_view("rel"));
+            let href: DomAttrValue =
+                node.find_attr(doc, index, name_view("href"));
+            if rel.found && href.found && href.value_len > 0
+                && rel_contains(node.bytes(doc, rel.value_off, rel.value_len),
+                    "stylesheet") {
+                let target: Url = url.parse_relative(
+                    node.bytes(doc, href.value_off, href.value_len), base);
+                if url.is_valid(&target) {
+                    let response: FetchResult = fetch.get(&target);
+                    if response.ok {
+                        for step: u64 in 0..response.body.length {
+                            vec.push(out, response.body.data[step]);
+                        }
+                        vec.push(out, 10 as u8);
+                    }
+                    fetch.destroy(&response);
+                }
+                url.destroy(&target);
+            }
+        }
+    }
+    let child: u64 = current.first_child;
+    while child != node.none() {
+        gather_from(doc, base, out, child);
+        child = node.get(doc, child).next_sibling;
+    }
+}
