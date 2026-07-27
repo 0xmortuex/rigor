@@ -8,7 +8,8 @@
 // Implemented: block-level boxes in normal flow, the width constraint of
 // §10.3.3 (including `auto` margins centring a box), auto and fixed heights,
 // adjacent-sibling margin collapsing, and inline formatting with line boxes,
-// white-space processing, line breaking and text-align.
+// white-space processing, text-align, and line breaking at the opportunities
+// UAX #14 finds (engine.text.linebreak) rather than only at spaces.
 //
 // Not implemented, and noted where each would go: floats, positioning other
 // than static, margin collapsing through parents or across empty boxes,
@@ -24,6 +25,7 @@ import engine.dom.node;
 import engine.style.computed;
 import engine.text.fonts;
 import engine.text.utf8;
+import engine.text.linebreak;
 
 // --- Box tree construction ---------------------------------------------------
 
@@ -459,6 +461,10 @@ fn place_text(
     let fragment_width: f64 = 0.0;
     let first_fragment: bool = true;
     let index: u64 = 0;
+    // Reused across every word in this text node rather than allocated per
+    // word, since a paragraph has a lot of words and none of them need the
+    // buffer to outlive them.
+    let breaks: Vec<u64> = vec.new<u64>();
 
     while index < source_len {
         let c: u8 = dom_byte(doc, source_off, index);
@@ -512,53 +518,107 @@ fn place_text(
         let word_len: u64 = index - word_start;
         let word: []const u8 =
             node.bytes(doc, source_off + word_start, word_len);
-        let word_width: f64 = metrics.text_width(set, style, word);
-        let space_width: f64 = 0.0;
-        if (*state).pending_space {
-            space_width = metrics.codepoint_width(set, style, ' ' as u32);
-        }
 
-        let overflows: bool = !nowrap && !(*state).line_empty
-            && (*state).x + space_width + word_width
-                > (*state).origin_x + (*state).available;
-        if overflows {
-            first_fragment = flush_fragment(tree, styles, set, text_box, state,
-                fragment_start, fragment_width, first_fragment);
-            break_line(tree, styles, set, state);
-            fragment_start = box.text_length(tree);
-            fragment_width = 0.0;
-            (*state).pending_space = false;
-            space_width = 0.0;
-        }
-        if (*state).pending_space {
-            box.push_byte(tree, ' ');
-            (*state).x = (*state).x + space_width;
-            (*state).pending_space = false;
-            if fragment_width == 0.0 && (*state).last_fragment != box.none() {
-                // Nothing accumulated here yet, so the space separates this
-                // fragment from the previous one and belongs to that one. It
-                // sits at the buffer's end, immediately after that fragment's
-                // bytes, so extending it is just a longer length.
-                let previous: LayoutBox =
-                    box.get(tree, (*state).last_fragment);
-                previous.text_len = previous.text_len + 1;
-                previous.width = previous.width + space_width;
-                box.set(tree, (*state).last_fragment, previous);
-                fragment_start = box.text_length(tree);
-            } else {
-                fragment_width = fragment_width + space_width;
+        // §16.6 breaks at spaces; UAX #14 finds the opportunities *inside* a
+        // run of non-space text — after a hyphen, between two ideographs —
+        // which is what lets a long CJK line wrap at all, and what stops a
+        // wrap landing inside "3.5" or before a closing bracket.
+        vec.clear(&breaks);
+        collect_breaks(word, &breaks);
+
+        let piece_start: u64 = 0;
+        for step: u64 in 0..breaks.length {
+            let piece_end: u64 = boundary(&breaks, step);
+            if piece_end <= piece_start {
+                continue;
             }
+            let piece: []const u8 = subview(word, piece_start, piece_end);
+            let piece_width: f64 = metrics.text_width(set, style, piece);
+            let space_width: f64 = 0.0;
+            if (*state).pending_space {
+                space_width = metrics.codepoint_width(set, style, ' ' as u32);
+            }
+
+            let overflows: bool = !nowrap && !(*state).line_empty
+                && (*state).x + space_width + piece_width
+                    > (*state).origin_x + (*state).available;
+            if overflows {
+                first_fragment = flush_fragment(tree, styles, set, text_box,
+                    state, fragment_start, fragment_width, first_fragment);
+                break_line(tree, styles, set, state);
+                fragment_start = box.text_length(tree);
+                fragment_width = 0.0;
+                (*state).pending_space = false;
+                space_width = 0.0;
+            }
+            if (*state).pending_space {
+                box.push_byte(tree, ' ');
+                (*state).x = (*state).x + space_width;
+                (*state).pending_space = false;
+                if fragment_width == 0.0 && (*state).last_fragment != box.none() {
+                    // Nothing accumulated here yet, so the space separates this
+                    // fragment from the previous one and belongs to that one.
+                    // It sits at the buffer's end, immediately after that
+                    // fragment's bytes, so extending it is just a longer
+                    // length.
+                    let previous: LayoutBox =
+                        box.get(tree, (*state).last_fragment);
+                    previous.text_len = previous.text_len + 1;
+                    previous.width = previous.width + space_width;
+                    box.set(tree, (*state).last_fragment, previous);
+                    fragment_start = box.text_length(tree);
+                } else {
+                    fragment_width = fragment_width + space_width;
+                }
+            }
+            for byte: u64 in 0..len(piece) {
+                box.push_byte(tree, piece[byte]);
+            }
+            fragment_width = fragment_width + piece_width;
+            (*state).x = (*state).x + piece_width;
+            (*state).line_empty = false;
+            grow_line(state, style.line_height);
+            piece_start = piece_end;
         }
-        for step: u64 in 0..word_len {
-            box.push_byte(tree, dom_byte(doc, source_off, word_start + step));
-        }
-        fragment_width = fragment_width + word_width;
-        (*state).x = (*state).x + word_width;
-        (*state).line_empty = false;
-        grow_line(state, style.line_height);
     }
     flush_fragment(tree, styles, set, text_box, state, fragment_start,
         fragment_width, first_fragment);
+    vec.destroy(&breaks);
+}
+
+// Every byte offset in `text` where UAX #14 allows a line to break, followed
+// by the run's end so the caller can walk consecutive boundaries.
+fn collect_breaks(text: []const u8, out: *Vec<u64>) -> void {
+    let state: BreakState = linebreak.new_state();
+    let index: u64 = 0;
+    while index < len(text) {
+        let decoded: TextChar = utf8.decode(text, index);
+        let decision: u8 = linebreak.next(&state,
+            linebreak.class_of(decoded.codepoint), decoded.codepoint);
+        if index > 0 && decision != linebreak.break_prohibited() {
+            vec.push(out, index);
+        }
+        index = index + decoded.size;
+    }
+    vec.push(out, len(text));
+}
+
+fn boundary(breaks: *Vec<u64>, index: u64) -> u64 {
+    match vec.get(breaks, index) {
+        Option<u64>.Some(value) => { return value; },
+        Option<u64>.None => { return 0; },
+    }
+}
+
+fn subview(view: []const u8, from: u64, to: u64) -> []const u8 {
+    if to <= from || from >= len(view) {
+        return slice(0 as *const u8, 0);
+    }
+    let end: u64 = to;
+    if end > len(view) {
+        end = len(view);
+    }
+    return slice((&view[from]) as *const u8, end - from);
 }
 
 fn dom_byte(doc: *DomDocument, offset: u64, index: u64) -> u8 {

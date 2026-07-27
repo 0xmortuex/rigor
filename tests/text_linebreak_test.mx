@@ -1,0 +1,222 @@
+// The Unicode Line Breaking Algorithm (UAX #14).
+//
+// Each test names the rule it is checking, so a failure points at a rule
+// number rather than at a character.
+
+import std.vec;
+import std.string;
+import engine.text.linebreak;
+import engine.text.linebreak_data as data;
+import engine.text.utf8;
+
+fn view_of(text: *u8) -> []const u8 {
+    return slice(text as *const u8, str_len(text));
+}
+
+// Collect the byte offsets where a break is allowed, as a string of positions
+// for readable comparison: "abc def" gives "4".
+fn breaks_of(text: *u8, out: *Vec<u64>) -> void {
+    let view: []const u8 = view_of(text);
+    let state: BreakState = linebreak.new_state();
+    let index: u64 = 0;
+    while index < len(view) {
+        let decoded: TextChar = utf8.decode(view, index);
+        let decision: u8 = linebreak.next(&state,
+            linebreak.class_of(decoded.codepoint), decoded.codepoint);
+        if index > 0 && decision != linebreak.break_prohibited() {
+            vec.push(out, index);
+        }
+        index = index + decoded.size;
+    }
+}
+
+// How many break opportunities `text` has.
+fn break_count(text: *u8) -> u64 {
+    let found: Vec<u64> = vec.new<u64>();
+    breaks_of(text, &found);
+    let count: u64 = found.length;
+    vec.destroy(&found);
+    return count;
+}
+
+// The byte offset of the `index`th opportunity, or the length when there is
+// no such opportunity.
+fn break_at(text: *u8, index: u64) -> u64 {
+    let found: Vec<u64> = vec.new<u64>();
+    breaks_of(text, &found);
+    let offset: u64 = str_len(text);
+    match vec.get(&found, index) {
+        Option<u64>.Some(value) => { offset = value; },
+        Option<u64>.None => {},
+    }
+    vec.destroy(&found);
+    return offset;
+}
+
+// True when `text` has no break opportunity at all.
+fn unbreakable(text: *u8) -> bool {
+    return break_count(text) == 0;
+}
+
+// --- Class assignment (LB1) --------------------------------------------------
+
+test "the classes of the ascii range are the expected ones" {
+    assert(linebreak.class_of('a' as u32) == data.lb_al());
+    assert(linebreak.class_of('5' as u32) == data.lb_nu());
+    assert(linebreak.class_of(' ' as u32) == data.lb_sp());
+    assert(linebreak.class_of('-' as u32) == data.lb_hy());
+    assert(linebreak.class_of('(' as u32) == data.lb_op());
+    assert(linebreak.class_of(')' as u32) == data.lb_cp());
+    assert(linebreak.class_of('!' as u32) == data.lb_ex());
+    assert(linebreak.class_of(10 as u32) == data.lb_lf());
+}
+
+test "LB1 resolves the unknown classes away" {
+    // U+3005 IDEOGRAPHIC ITERATION MARK is CJ, which resolves to NS.
+    assert(linebreak.class_of(0x3005 as u32) == data.lb_ns());
+    // An unassigned code point is XX, which resolves to AL.
+    assert(linebreak.class_of(0x0378 as u32) == data.lb_al());
+}
+
+test "an ideograph is ID and a hangul syllable is H2 or H3" {
+    assert(linebreak.class_of(0x4E2D as u32) == data.lb_id());
+    assert(linebreak.class_of(0xAC00 as u32) == data.lb_h2());
+}
+
+// --- The rules ---------------------------------------------------------------
+
+test "LB18: a break follows a space" {
+    assert(break_count("abc def") == 1);
+    assert(break_at("abc def", 0) == 4);
+}
+
+test "LB7: no break before a space, LB2: none at the start" {
+    // The only opportunity in "a b" is before the 'b', never before the space
+    // and never at offset 0.
+    assert(break_count("a b") == 1);
+    assert(break_at("a b", 0) == 2);
+}
+
+test "LB28: no break between letters" {
+        assert(unbreakable("word"));
+}
+
+test "LB21: a break follows a hyphen but never precedes one" {
+    // "brown-fox" breaks after the hyphen, at offset 6, and nowhere else.
+    assert(break_count("brown-fox") == 1);
+    assert(break_at("brown-fox", 0) == 6);
+}
+
+test "LB25: no break inside a number" {
+        assert(unbreakable("3.5"));
+    assert(unbreakable("1,000"));
+}
+
+test "LB23: no break between digits and letters" {
+        assert(unbreakable("100km"));
+    assert(unbreakable("km100"));
+}
+
+test "LB30 and LB14: brackets hold on to what they enclose" {
+    // No break before '(' after a letter, none after '(', and none before ')'.
+        assert(unbreakable("a(b)"));
+}
+
+test "LB13: no break before closing punctuation" {
+        assert(unbreakable("word!"));
+    assert(unbreakable("word;"));
+}
+
+test "LB24: no break between a currency prefix and its number" {
+        assert(unbreakable("$100"));
+}
+
+test "LB19: no break either side of a quotation mark" {
+        assert(unbreakable("a\"b"));
+}
+
+test "LB11: a word joiner forbids a break either side" {
+    // U+2060 WORD JOINER between two ideographs, which would otherwise break.
+        assert(unbreakable("\xe4\xb8\xad\xe2\x81\xa0\xe4\xb8\xad"));
+}
+
+test "LB8: a break follows a zero width space" {
+    // U+200B between two letters, which LB28 would otherwise hold together.
+    // The second letter is a z because a b would extend the hex escape.
+    assert(break_count("a\xe2\x80\x8bz") == 1);
+    assert(break_at("a\xe2\x80\x8bz", 0) == 4);
+}
+
+test "LB12: no break after non-breaking glue" {
+    // U+00A0 NO-BREAK SPACE.
+        assert(unbreakable("a\xc2\xa0z"));
+}
+
+test "LB31: ideographs break between every pair" {
+    // Three CJK characters give two opportunities, at bytes 3 and 6.
+    assert(break_count("\xe4\xb8\xad\xe6\x96\x87\xe7\xb6\xb2") == 2);
+    assert(break_at("\xe4\xb8\xad\xe6\x96\x87\xe7\xb6\xb2", 0) == 3);
+    assert(break_at("\xe4\xb8\xad\xe6\x96\x87\xe7\xb6\xb2", 1) == 6);
+}
+
+test "LB16: an ideograph is held to the closing bracket and the mark after it" {
+    // U+3002 IDEOGRAPHIC FULL STOP is CL; the ideograph before it must not be
+    // separated from it.
+        assert(unbreakable("\xe4\xb8\xad\xe3\x80\x82"));
+}
+
+test "LB26: a hangul syllable does not come apart" {
+    // JL followed by JV: one syllable, no opportunity between them.
+        assert(unbreakable("\xe1\x84\x80\xe1\x85\xa1"));
+}
+
+test "LB9: a combining mark attaches to what precedes it" {
+    // U+0301 COMBINING ACUTE ACCENT after 'e', then a space and a word: the
+    // only opportunity is after the space.
+    assert(break_count("e\xcc\x81 x") == 1);
+    assert(break_at("e\xcc\x81 x", 0) == 4);
+}
+
+test "LB4 and LB6: a newline is a mandatory break, and nothing breaks before it" {
+    let view: []const u8 = view_of("a\nb");
+    let state: BreakState = linebreak.new_state();
+    // 'a'
+    assert(linebreak.next(&state, linebreak.class_of('a' as u32), 'a' as u32)
+    == linebreak.break_prohibited());
+    // '\n' — LB6 forbids a break before it
+    assert(linebreak.next(&state, linebreak.class_of(10 as u32), 10 as u32)
+    == linebreak.break_prohibited());
+    // 'b' — LB5 makes the break after the newline mandatory
+    assert(linebreak.next(&state, linebreak.class_of('b' as u32), 'b' as u32)
+    == linebreak.break_mandatory());
+}
+
+test "LB5: CR LF is one break, not two" {
+    let state: BreakState = linebreak.new_state();
+    linebreak.next(&state, linebreak.class_of('a' as u32), 'a' as u32);
+    assert(linebreak.next(&state, linebreak.class_of(13 as u32), 13 as u32)
+    == linebreak.break_prohibited());
+    // CR × LF: no break between them.
+    assert(linebreak.next(&state, linebreak.class_of(10 as u32), 10 as u32)
+    == linebreak.break_prohibited());
+    assert(linebreak.next(&state, linebreak.class_of('b' as u32), 'b' as u32)
+    == linebreak.break_mandatory());
+}
+
+test "next_opportunity finds the first break past an offset" {
+    let found: BreakOpportunity =
+    linebreak.next_opportunity(view_of("one two three"), 0);
+    assert(found.found);
+    assert(found.offset == 4);
+    let later: BreakOpportunity =
+    linebreak.next_opportunity(view_of("one two three"), 4);
+    assert(later.found);
+    assert(later.offset == 8);
+}
+
+test "next_opportunity reports none in an unbreakable run" {
+    let found: BreakOpportunity =
+    linebreak.next_opportunity(view_of("unbreakable"), 0);
+    assert(!found.found);
+    assert(found.offset == 11);
+}

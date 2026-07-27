@@ -1,0 +1,14 @@
+Vendored from https://www.unicode.org/Public/UCD/latest/ucd/
+files:  LineBreak.txt               (Line_Break, UAX #14)
+        EastAsianWidth.txt          (East_Asian_Width, UAX #11)
+        extracted/DerivedGeneralCategory.txt
+version: Unicode 17.0.0
+date:   fetched 2026-07-27
+
+Regenerated into engine/src/text/linebreak_data.mx by tools/gen_linebreak.py;
+nothing reads these files at run time. DerivedGeneralCategory is needed only
+for LB1, which resolves the SA class to CM for combining marks and AL for
+everything else.
+
+Refresh by re-downloading all three at a newer Unicode version and re-running
+the generator in the same change.

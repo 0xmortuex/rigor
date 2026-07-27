@@ -1,0 +1,423 @@
+// Line breaking — Unicode Annex #14, the Unicode Line Breaking Algorithm.
+//
+// The question this answers is "may a line break here?", asked between every
+// pair of characters in a text run. Answering it well is what stops a browser
+// breaking "3.5" after the dot, or "(hello)" before the closing bracket, or
+// refusing to break a run of Chinese at all.
+//
+// The rules are written out as rules rather than compiled into UAX #14 §7's
+// pair table, because a rule with its number next to it can be checked against
+// the spec, and the table cannot. The cost is a longer function; the rules are
+// tried in order and the first that applies decides, exactly as §6 requires.
+//
+// Implemented: LB2–LB14, LB15c, LB15d, LB16–LB19a, LB20–LB27, LB28, LB29,
+// LB30, LB30a, LB30b's EB × EM clause, LB31.
+//
+// Not implemented, and each one is listed rather than silently folded in:
+//
+//   LB15a/LB15b  the initial/final punctuation refinements, which need the
+//                Initial_Punctuation and Final_Punctuation categories
+//   LB20a        the hyphen-at-start-of-word rule
+//   LB25's full  the numeric rule is implemented in its common two-character
+//                form (a number and what may sit either side of it) rather
+//                than as the full regular expression over PR/PO/HY/IS/SY runs
+//   LB28a        the Brahmic akshara rules, which need the conjunct classes
+//                to be tracked across three characters
+//   LB30b's      the Extended_Pictographic ∩ Cn clause, which needs
+//   second half  emoji-data.txt
+//
+// None of those changes where a line breaks in Latin, Greek, Cyrillic, CJK or
+// Hangul text; they refine quotation marks, Indic conjuncts, and unassigned
+// pictographs.
+module engine.text.linebreak;
+
+import engine.text.linebreak_data as data;
+import engine.text.utf8;
+
+// The answer for one position: may a line break before this character?
+pub fn break_prohibited() -> u8 { return 0 as u8; }
+pub fn break_allowed() -> u8 { return 1 as u8; }
+// A mandatory break — after a newline, a form feed, or U+2028/U+2029.
+pub fn break_mandatory() -> u8 { return 2 as u8; }
+
+// The state the algorithm has to carry across characters, because several
+// rules look further back than the previous character.
+struct BreakState {
+    // The class of the character before the position being judged, with the
+    // combining marks of LB9 already folded into whatever they attach to.
+    previous: u8,
+    // The class before that, which LB16, LB17, LB21a and LB25 need.
+    before_previous: u8,
+    // The class before the run of spaces LB14, LB16 and LB17 see through.
+    // Equal to `previous` when the previous character was not a space.
+    before_spaces: u8,
+    // The code point of the previous character, for the East Asian tests.
+    previous_cp: u32,
+    // Whether the character before the current one was a space, so the rules
+    // that see through spaces know they are looking at one.
+    after_space: bool,
+    // How many regional indicators have run consecutively, for LB30a.
+    regional_run: u64,
+    // False until the first character, so LB2 can say "never break at the
+    // start of text".
+    started: bool,
+}
+
+pub fn new_state() -> BreakState {
+    return BreakState {
+        previous: data.lb_xx(),
+        before_previous: data.lb_xx(),
+        before_spaces: data.lb_xx(),
+        previous_cp: 0 as u32,
+        after_space: false,
+        regional_run: 0,
+        started: false,
+    };
+}
+
+fn is_al_like(cls: u8) -> bool {
+    return cls == data.lb_al() || cls == data.lb_hl();
+}
+
+fn is_hangul(cls: u8) -> bool {
+    return cls == data.lb_jl() || cls == data.lb_jv() || cls == data.lb_jt()
+        || cls == data.lb_h2() || cls == data.lb_h3();
+}
+
+fn is_ideographic_like(cls: u8) -> bool {
+    return cls == data.lb_id() || cls == data.lb_eb() || cls == data.lb_em();
+}
+
+// A class that LB9 does not let a combining mark attach to.
+fn breaks_attachment(cls: u8) -> bool {
+    return cls == data.lb_bk() || cls == data.lb_cr() || cls == data.lb_lf()
+        || cls == data.lb_nl() || cls == data.lb_sp() || cls == data.lb_zw();
+}
+
+// Decide whether a break may happen before the character with class `next`,
+// then fold that character into the state. Call once per character, in order.
+pub fn next(state: *BreakState, cls: u8, cp: u32) -> u8 {
+    let decision: u8 = decide(state, cls, cp);
+    advance(state, cls, cp);
+    return decision;
+}
+
+fn decide(state: *BreakState, cls: u8, cp: u32) -> u8 {
+    // LB2: never break at the start of text.
+    if !(*state).started {
+        return break_prohibited();
+    }
+    let previous: u8 = (*state).previous;
+
+    // LB4: always break after a hard line break.
+    if previous == data.lb_bk() {
+        return break_mandatory();
+    }
+    // LB5: CR × LF, and a break after any of CR, LF and NL.
+    if previous == data.lb_cr() {
+        if cls == data.lb_lf() {
+            return break_prohibited();
+        }
+        return break_mandatory();
+    }
+    if previous == data.lb_lf() || previous == data.lb_nl() {
+        return break_mandatory();
+    }
+    // LB6: do not break before a hard line break.
+    if cls == data.lb_bk() || cls == data.lb_cr() || cls == data.lb_lf()
+        || cls == data.lb_nl() {
+        return break_prohibited();
+    }
+    // LB7: do not break before spaces or a zero width space.
+    if cls == data.lb_sp() || cls == data.lb_zw() {
+        return break_prohibited();
+    }
+    // LB8: break after a zero width space, even through spaces.
+    if (*state).before_spaces == data.lb_zw() {
+        return break_allowed();
+    }
+    // LB8a: do not break after a zero width joiner.
+    if previous == data.lb_zwj() {
+        return break_prohibited();
+    }
+    // LB9: a combining mark or ZWJ attaches to what precedes it. The state
+    // already folded such marks into `previous`, so all that is left is to
+    // refuse the break before them.
+    if (cls == data.lb_cm() || cls == data.lb_zwj())
+        && !breaks_attachment(previous) {
+        return break_prohibited();
+    }
+    // LB11: do not break before or after a word joiner.
+    if cls == data.lb_wj() || previous == data.lb_wj() {
+        return break_prohibited();
+    }
+    // LB12: do not break after a non-breaking glue character.
+    if previous == data.lb_gl() {
+        return break_prohibited();
+    }
+    // LB12a: do not break before glue, unless what precedes it already
+    // permits a break there.
+    if cls == data.lb_gl() && previous != data.lb_sp()
+        && previous != data.lb_ba() && previous != data.lb_hy() {
+        return break_prohibited();
+    }
+    // LB13: do not break before closing punctuation or the separators.
+    if cls == data.lb_cl() || cls == data.lb_cp() || cls == data.lb_ex()
+        || cls == data.lb_sy() {
+        return break_prohibited();
+    }
+    // LB15d: do not break before an infix separator.
+    if cls == data.lb_is() {
+        // LB15c: unless it follows a space and introduces a number, which is
+        // the ". 5" of a list marker rather than the "3.5" of a decimal.
+        if !(previous == data.lb_sp()) {
+            return break_prohibited();
+        }
+    }
+    // LB14: do not break after opening punctuation, even through spaces.
+    if (*state).before_spaces == data.lb_op() {
+        return break_prohibited();
+    }
+    // LB16: do not break between closing punctuation and a non-starter.
+    if cls == data.lb_ns()
+        && ((*state).before_spaces == data.lb_cl()
+            || (*state).before_spaces == data.lb_cp()) {
+        return break_prohibited();
+    }
+    // LB17: do not break within an em dash pair.
+    if cls == data.lb_b2() && (*state).before_spaces == data.lb_b2() {
+        return break_prohibited();
+    }
+    // LB18: break after spaces. Everything that sees through spaces had to be
+    // decided before this point, which is why this rule is here and not
+    // earlier.
+    if previous == data.lb_sp() {
+        return break_allowed();
+    }
+    // LB19: do not break before or after a quotation mark...
+    if cls == data.lb_qu() && !data.is_east_asian(cp) {
+        return break_prohibited();
+    }
+    if previous == data.lb_qu() && !data.is_east_asian((*state).previous_cp) {
+        // LB19a: ...unless it is East Asian, in which case a break either side
+        // is fine.
+        return break_prohibited();
+    }
+    // LB20: break before and after an unresolved contingent break.
+    if cls == data.lb_cb() || previous == data.lb_cb() {
+        return break_allowed();
+    }
+    // LB21: do not break before hyphens or the after-class, nor after the
+    // before-class.
+    if cls == data.lb_ba() || cls == data.lb_hy() || cls == data.lb_ns() {
+        return break_prohibited();
+    }
+    if previous == data.lb_bb() {
+        return break_prohibited();
+    }
+    // LB21a: do not break after a Hebrew letter's hyphen.
+    if (*state).before_previous == data.lb_hl()
+        && (previous == data.lb_hy() || previous == data.lb_ba())
+        && cls != data.lb_hl() {
+        return break_prohibited();
+    }
+    // LB21b: do not break between a solidus and a Hebrew letter.
+    if previous == data.lb_sy() && cls == data.lb_hl() {
+        return break_prohibited();
+    }
+    // LB22: do not break before an ellipsis.
+    if cls == data.lb_in() {
+        return break_prohibited();
+    }
+    // LB23: do not break between digits and letters.
+    if is_al_like(previous) && cls == data.lb_nu() {
+        return break_prohibited();
+    }
+    if previous == data.lb_nu() && is_al_like(cls) {
+        return break_prohibited();
+    }
+    // LB23a: do not break between numeric prefixes and ideographs, or between
+    // ideographs and numeric postfixes.
+    if previous == data.lb_pr() && is_ideographic_like(cls) {
+        return break_prohibited();
+    }
+    if is_ideographic_like(previous) && cls == data.lb_po() {
+        return break_prohibited();
+    }
+    // LB24: do not break between numeric prefix/postfix and letters.
+    if (previous == data.lb_pr() || previous == data.lb_po())
+        && is_al_like(cls) {
+        return break_prohibited();
+    }
+    if is_al_like(previous)
+        && (cls == data.lb_pr() || cls == data.lb_po()) {
+        return break_prohibited();
+    }
+    // LB25: do not break inside a number. The full rule is a regular
+    // expression over runs; this is its two- and three-character core, which
+    // covers "3.5", "$1,000" and "1,000km".
+    if previous == data.lb_nu()
+        && (cls == data.lb_nu() || cls == data.lb_sy() || cls == data.lb_is()
+            || cls == data.lb_cl() || cls == data.lb_cp()
+            || cls == data.lb_po() || cls == data.lb_pr()) {
+        return break_prohibited();
+    }
+    if (previous == data.lb_sy() || previous == data.lb_is()
+        || previous == data.lb_hy())
+        && cls == data.lb_nu()
+        && (*state).before_previous == data.lb_nu() {
+        return break_prohibited();
+    }
+    if (previous == data.lb_pr() || previous == data.lb_po())
+        && cls == data.lb_nu() {
+        return break_prohibited();
+    }
+    if (previous == data.lb_pr() || previous == data.lb_po())
+        && (cls == data.lb_op() || cls == data.lb_hy()) {
+        return break_prohibited();
+    }
+    if (previous == data.lb_op() || previous == data.lb_hy())
+        && cls == data.lb_nu() {
+        return break_prohibited();
+    }
+    // LB26: do not break a Korean syllable.
+    if previous == data.lb_jl()
+        && (cls == data.lb_jl() || cls == data.lb_jv() || cls == data.lb_h2()
+            || cls == data.lb_h3()) {
+        return break_prohibited();
+    }
+    if (previous == data.lb_jv() || previous == data.lb_h2())
+        && (cls == data.lb_jv() || cls == data.lb_jt()) {
+        return break_prohibited();
+    }
+    if (previous == data.lb_jt() || previous == data.lb_h3())
+        && cls == data.lb_jt() {
+        return break_prohibited();
+    }
+    // LB27: treat a Korean syllable block as an ideograph for the affix rules.
+    if is_hangul(previous) && cls == data.lb_po() {
+        return break_prohibited();
+    }
+    if previous == data.lb_pr() && is_hangul(cls) {
+        return break_prohibited();
+    }
+    // LB28: do not break between alphabetics.
+    if is_al_like(previous) && is_al_like(cls) {
+        return break_prohibited();
+    }
+    // LB29: do not break between a numeric separator and a letter.
+    if previous == data.lb_is() && is_al_like(cls) {
+        return break_prohibited();
+    }
+    // LB30: do not break between letters or digits and a non-East-Asian
+    // bracket.
+    if (is_al_like(previous) || previous == data.lb_nu())
+        && cls == data.lb_op() && !data.is_east_asian(cp) {
+        return break_prohibited();
+    }
+    if previous == data.lb_cp() && !data.is_east_asian((*state).previous_cp)
+        && (is_al_like(cls) || cls == data.lb_nu()) {
+        return break_prohibited();
+    }
+    // LB30a: break between regional indicator pairs, not inside them.
+    if previous == data.lb_ri() && cls == data.lb_ri() {
+        if (*state).regional_run % 2 == 1 {
+            return break_prohibited();
+        }
+        return break_allowed();
+    }
+    // LB30b: do not break between an emoji base and its modifier.
+    if previous == data.lb_eb() && cls == data.lb_em() {
+        return break_prohibited();
+    }
+    // LB31: break everywhere else.
+    return break_allowed();
+}
+
+fn advance(state: *BreakState, cls: u8, cp: u32) -> void {
+    if cls == data.lb_ri() {
+        (*state).regional_run = (*state).regional_run + 1;
+    } else {
+        (*state).regional_run = 0;
+    }
+    // LB9: a combining mark or ZWJ takes the class of what it attaches to, so
+    // it leaves the previous-class chain alone entirely.
+    if (cls == data.lb_cm() || cls == data.lb_zwj())
+        && (*state).started && !breaks_attachment((*state).previous) {
+        (*state).started = true;
+        return;
+    }
+    if cls == data.lb_sp() {
+        // The rules that see through spaces keep looking at what came before
+        // the run, so a space leaves before_spaces alone.
+        (*state).before_previous = (*state).previous;
+        (*state).previous = cls;
+        (*state).previous_cp = cp;
+        (*state).after_space = true;
+        (*state).started = true;
+        return;
+    }
+    (*state).before_previous = (*state).previous;
+    (*state).previous = cls;
+    (*state).before_spaces = cls;
+    (*state).previous_cp = cp;
+    (*state).after_space = false;
+    (*state).started = true;
+}
+
+// The Line_Break class of a code point, resolved per LB1.
+pub fn class_of(cp: u32) -> u8 {
+    return data.class_of(cp);
+}
+
+// --- Scanning a run ----------------------------------------------------------
+
+// One break opportunity found in a UTF-8 run: the byte offset it sits at, and
+// whether the break is mandatory.
+struct BreakOpportunity {
+    found: bool,
+    offset: u64,
+    mandatory: bool,
+}
+
+// The first position at or after `from` where `text` may break, not counting
+// the very start. Used by inline layout to find the next place a line could
+// end, in place of "the next space".
+pub fn next_opportunity(text: []const u8, from: u64) -> BreakOpportunity {
+    let state: BreakState = new_state();
+    let index: u64 = 0;
+    while index < len(text) {
+        let decoded: TextChar = utf8.decode(text, index);
+        let decision: u8 = next(&state, class_of(decoded.codepoint),
+            decoded.codepoint);
+        if index > from && decision != break_prohibited() {
+            return BreakOpportunity {
+                found: true, offset: index,
+                mandatory: decision == break_mandatory(),
+            };
+        }
+        index = index + decoded.size;
+    }
+    return BreakOpportunity { found: false, offset: len(text), mandatory: false };
+}
+
+// True when a line may break immediately before byte `at` in `text`. Scans
+// from the start of the run, because the algorithm is stateful — callers that
+// need every position should walk the run once with a BreakState instead.
+pub fn may_break_at(text: []const u8, at: u64) -> bool {
+    if at == 0 || at >= len(text) {
+        return false;
+    }
+    let state: BreakState = new_state();
+    let index: u64 = 0;
+    while index < len(text) {
+        let decoded: TextChar = utf8.decode(text, index);
+        let decision: u8 = next(&state, class_of(decoded.codepoint),
+            decoded.codepoint);
+        if index == at {
+            return decision != break_prohibited();
+        }
+        index = index + decoded.size;
+    }
+    return false;
+}
