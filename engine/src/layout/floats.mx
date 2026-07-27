@@ -1,0 +1,219 @@
+// Float placement — CSS 2.1 §9.5.
+//
+// A float is taken out of normal flow, shifted as far left or right as it can
+// go, and then everything else flows *around* it: line boxes shorten where they
+// overlap it, and a block with `clear` drops below it.
+//
+// All of that needs one thing — a record of where the floats are — so this
+// module is that record. Each entry is the float's margin box, which is the
+// rectangle content must avoid (§9.5 talks about the margin box throughout,
+// not the border box).
+//
+// One context per block formatting context. rigor establishes exactly one, at
+// the root, because the properties that would establish another (`overflow`
+// other than visible, `display: inline-block`, a float inside a float) are
+// either unimplemented or reuse the outer context. That is noted here rather
+// than hidden: a nested BFC would mean a second context whose floats do not
+// escape it.
+module engine.layout.floats;
+
+import std.vec;
+import engine.style.computed;
+
+struct FloatBox {
+    // The margin box, in document coordinates.
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    // computed.float_left() or float_right().
+    side: u8,
+}
+
+resource struct FloatContext {
+    entries: Vec<FloatBox>,
+}
+
+pub fn new_context() -> FloatContext {
+    return FloatContext { entries: vec.new<FloatBox>() };
+}
+
+pub fn destroy(context: *FloatContext) -> void {
+    vec.destroy(&(*context).entries);
+}
+
+pub fn count(context: *FloatContext) -> u64 {
+    return (*context).entries.length;
+}
+
+fn entry(context: *FloatContext, index: u64) -> FloatBox {
+    match vec.get(&(*context).entries, index) {
+        Option<FloatBox>.Some(value) => { return value; },
+        Option<FloatBox>.None => {
+            return FloatBox {
+                left: 0.0, top: 0.0, right: 0.0, bottom: 0.0,
+                side: computed.float_none(),
+            };
+        },
+    }
+}
+
+pub fn add(
+    context: *FloatContext,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    side: u8
+) -> void {
+    vec.push(&(*context).entries, FloatBox {
+        left: left, top: top, right: right, bottom: bottom, side: side,
+    });
+}
+
+// Does this float overlap the band between `top` and `bottom`? A float whose
+// bottom is exactly at `top` does not: §9.5 bands are half-open, which is what
+// lets a line sit immediately below a float it does not overlap.
+fn overlaps(value: FloatBox, top: f64, bottom: f64) -> bool {
+    if value.bottom <= top {
+        return false;
+    }
+    if value.top >= bottom {
+        return false;
+    }
+    return true;
+}
+
+// The horizontal space still available in the band between `top` and `bottom`,
+// given a containing block from `edge_left` to `edge_right`.
+struct FloatBand {
+    left: f64,
+    right: f64,
+}
+
+pub fn band(
+    context: *FloatContext,
+    top: f64,
+    bottom: f64,
+    edge_left: f64,
+    edge_right: f64
+) -> FloatBand {
+    let result: FloatBand = FloatBand { left: edge_left, right: edge_right };
+    for index: u64 in 0..(*context).entries.length {
+        let value: FloatBox = entry(context, index);
+        if !overlaps(value, top, bottom) {
+            continue;
+        }
+        if value.side == computed.float_left() {
+            if value.right > result.left {
+                result.left = value.right;
+            }
+        } else {
+            if value.left < result.right {
+                result.right = value.left;
+            }
+        }
+    }
+    if result.right < result.left {
+        result.right = result.left;
+    }
+    return result;
+}
+
+// The next y at or below `from` where the band gets wider — that is, where some
+// float that is currently in the way ends. Returns `from` when nothing is in
+// the way, so a caller can loop safely.
+pub fn next_band(context: *FloatContext, from: f64) -> f64 {
+    let best: f64 = from;
+    let found: bool = false;
+    for index: u64 in 0..(*context).entries.length {
+        let value: FloatBox = entry(context, index);
+        if value.bottom <= from {
+            continue;
+        }
+        if !found || value.bottom < best {
+            best = value.bottom;
+            found = true;
+        }
+    }
+    if !found {
+        return from;
+    }
+    return best;
+}
+
+// §9.5.2 `clear`: the y a box must move to so that the floats it clears are
+// entirely above it.
+pub fn clearance(context: *FloatContext, from: f64, clear_side: u8) -> f64 {
+    if clear_side == computed.clear_none() {
+        return from;
+    }
+    let result: f64 = from;
+    for index: u64 in 0..(*context).entries.length {
+        let value: FloatBox = entry(context, index);
+        let clears: bool = clear_side == computed.clear_both()
+            || (clear_side == computed.clear_left()
+                && value.side == computed.float_left())
+            || (clear_side == computed.clear_right()
+                && value.side == computed.float_right());
+        if clears && value.bottom > result {
+            result = value.bottom;
+        }
+    }
+    return result;
+}
+
+// The lowest edge of any float, so a block formatting context can be made tall
+// enough to contain the ones inside it.
+pub fn lowest(context: *FloatContext) -> f64 {
+    let result: f64 = 0.0;
+    for index: u64 in 0..(*context).entries.length {
+        let value: FloatBox = entry(context, index);
+        if value.bottom > result {
+            result = value.bottom;
+        }
+    }
+    return result;
+}
+
+// Where a float of the given outer width goes if it is placed no higher than
+// `from`: the first y at which a band is wide enough for it, and the x within
+// that band (§9.5.1 rules 5, 6 and 7).
+struct FloatPlacement {
+    x: f64,
+    y: f64,
+}
+
+pub fn place(
+    context: *FloatContext,
+    from: f64,
+    width: f64,
+    side: u8,
+    edge_left: f64,
+    edge_right: f64
+) -> FloatPlacement {
+    let y: f64 = from;
+    // Each iteration drops to the next band; there are finitely many floats,
+    // so this terminates even when nothing ever fits.
+    for step: u64 in 0..(count(context) + 1) {
+        let available: FloatBand = band(context, y, y + 1.0, edge_left, edge_right);
+        if available.right - available.left >= width {
+            if side == computed.float_left() {
+                return FloatPlacement { x: available.left, y: y };
+            }
+            return FloatPlacement { x: available.right - width, y: y };
+        }
+        let next: f64 = next_band(context, y);
+        if next <= y {
+            break;
+        }
+        y = next;
+    }
+    // Nothing fits anywhere: the float goes at the containing block's edge and
+    // overflows, which is what §9.5.1 rule 7 amounts to when a float is wider
+    // than its containing block.
+    if side == computed.float_left() {
+        return FloatPlacement { x: edge_left, y: y };
+    }
+    return FloatPlacement { x: edge_right - width, y: y };
+}

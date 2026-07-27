@@ -7,20 +7,26 @@
 //
 // Implemented: block-level boxes in normal flow, the width constraint of
 // §10.3.3 (including `auto` margins centring a box), auto and fixed heights,
-// adjacent-sibling margin collapsing, and inline formatting with line boxes,
-// white-space processing, text-align, and line breaking at the opportunities
-// UAX #14 finds (engine.text.linebreak) rather than only at spaces.
+// margin collapsing in all three of its forms (between siblings, between a
+// parent and its first or last child, and through a box with nothing in it),
+// floats with `clear` and line boxes that shorten around them (§9.5), and
+// inline formatting with line boxes, white-space processing, horizontal
+// borders and padding on inline boxes, text-align, and line breaking at the
+// opportunities UAX #14 finds (engine.text.linebreak) rather than at spaces.
 //
-// Not implemented, and noted where each would go: floats, positioning other
-// than static, margin collapsing through parents or across empty boxes,
-// vertical-align other than baseline, inline borders and padding, and table
-// layout (table boxes lay out as ordinary blocks, which is enough to see them
-// but not to align columns).
+// Not implemented, and noted where each would go: positioning other than
+// static, vertical margins and vertical borders on inline boxes (which do not
+// affect line height, per §10.8, but should still paint), vertical-align other
+// than baseline, nested block formatting contexts, and table layout (table
+// boxes lay out as ordinary blocks, which is enough to see them but not to
+// align columns).
 module engine.layout.flow;
 
 import std.vec;
 import box;
 import metrics;
+import floats;
+import intrinsic;
 import engine.dom.node;
 import engine.style.computed;
 import engine.text.fonts;
@@ -192,6 +198,167 @@ fn larger(a: f64, b: f64) -> f64 {
     return b;
 }
 
+fn is_floated(styles: *StyleTree, tree: *LayoutTree, index: u64) -> bool {
+    let box_value: LayoutBox = box.get(tree, index);
+    if box_value.kind != box.box_block() {
+        return false;
+    }
+    return style_of(styles, box_value.style_node).float_side
+        != computed.float_none();
+}
+
+// --- Margin collapsing (§8.3.1) ----------------------------------------------
+//
+// Three cases, and they compose: two siblings' adjoining margins collapse to
+// the larger; a parent's top margin collapses with its first child's when
+// nothing (border, padding, inline content) separates them, and likewise at the
+// bottom; and a box with nothing in it at all collapses its own two margins
+// together, so an empty div between two paragraphs adds no gap of its own.
+//
+// The collapsed value is needed *before* a box is laid out, because it decides
+// where the box goes — so these walk the box tree by style rather than reading
+// geometry that does not exist yet.
+
+fn zero_length(length: StyleLength, containing: f64) -> bool {
+    return resolve(length, containing) == 0.0;
+}
+
+// The first block-level child that participates in collapsing: an in-flow
+// block. Inline content between a parent and its first block child stops the
+// collapse, which is why anonymous boxes count as content rather than being
+// walked through.
+fn first_collapsible_child(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    index: u64
+) -> u64 {
+    let child: u64 = box.get(tree, index).first_child;
+    while child != box.none() {
+        let child_box: LayoutBox = box.get(tree, child);
+        if child_box.kind != box.box_block() {
+            return box.none();
+        }
+        if !is_floated(styles, tree, child) {
+            return child;
+        }
+        child = child_box.next_sibling;
+    }
+    return box.none();
+}
+
+fn last_collapsible_child(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    index: u64
+) -> u64 {
+    let found: u64 = box.none();
+    let child: u64 = box.get(tree, index).first_child;
+    while child != box.none() {
+        let child_box: LayoutBox = box.get(tree, child);
+        if child_box.kind != box.box_block() {
+            return box.none();
+        }
+        if !is_floated(styles, tree, child) {
+            found = child;
+        }
+        child = child_box.next_sibling;
+    }
+    return found;
+}
+
+// Does this box's own top margin adjoin its first child's?
+fn top_adjoins_children(style: ComputedStyle, containing: f64) -> bool {
+    return style.border_top_width == 0.0
+        && zero_length(style.padding_top, containing);
+}
+
+// And its bottom margin its last child's? A fixed height separates them, since
+// the height is what the margin sits below.
+fn bottom_adjoins_children(style: ComputedStyle, containing: f64) -> bool {
+    return style.border_bottom_width == 0.0
+        && zero_length(style.padding_bottom, containing)
+        && is_auto(style.height);
+}
+
+// A box whose top and bottom margins collapse *through* it: nothing inside,
+// no border or padding, and no height to speak of.
+fn collapses_through(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    index: u64,
+    style: ComputedStyle,
+    containing: f64
+) -> bool {
+    if box.get(tree, index).first_child != box.none() {
+        return false;
+    }
+    if !is_auto(style.height) && resolve(style.height, containing) != 0.0 {
+        return false;
+    }
+    return top_adjoins_children(style, containing)
+        && style.border_bottom_width == 0.0
+        && zero_length(style.padding_bottom, containing);
+}
+
+fn collapsed_top_margin(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    index: u64,
+    containing: f64
+) -> f64 {
+    let box_value: LayoutBox = box.get(tree, index);
+    if box_value.kind != box.box_block() {
+        return 0.0;
+    }
+    let style: ComputedStyle = style_of(styles, box_value.style_node);
+    if style.float_side != computed.float_none() {
+        // A float's margins never collapse with anything (§8.3.1).
+        return 0.0;
+    }
+    let own: f64 = resolve(style.margin_top, containing);
+    if collapses_through(tree, styles, index, style, containing) {
+        return larger(own, resolve(style.margin_bottom, containing));
+    }
+    if !top_adjoins_children(style, containing) {
+        return own;
+    }
+    let child: u64 = first_collapsible_child(tree, styles, index);
+    if child == box.none() {
+        return own;
+    }
+    return larger(own,
+        collapsed_top_margin(tree, styles, child, containing));
+}
+
+fn collapsed_bottom_margin(
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    index: u64,
+    containing: f64
+) -> f64 {
+    let box_value: LayoutBox = box.get(tree, index);
+    if box_value.kind != box.box_block() {
+        return 0.0;
+    }
+    let style: ComputedStyle = style_of(styles, box_value.style_node);
+    if style.float_side != computed.float_none() {
+        return 0.0;
+    }
+    let own: f64 = resolve(style.margin_bottom, containing);
+    if collapses_through(tree, styles, index, style, containing) {
+        return larger(own, resolve(style.margin_top, containing));
+    }
+    if !bottom_adjoins_children(style, containing) {
+        return own;
+    }
+    let child: u64 = last_collapsible_child(tree, styles, index);
+    if child == box.none() {
+        return own;
+    }
+    return larger(own,
+        collapsed_bottom_margin(tree, styles, child, containing));
+}
+
 // --- Block layout ------------------------------------------------------------
 
 // Lay out `box_index` as a block-level box. `x` is the left content edge of
@@ -202,10 +369,14 @@ fn layout_block(
     tree: *LayoutTree,
     styles: *StyleTree,
     set: *TextFontSet,
+    context: *FloatContext,
     box_index: u64,
     x: f64,
     y: f64,
-    containing_width: f64
+    containing_width: f64,
+    // A float's width is decided by its caller from the intrinsic sizes;
+    // negative means "work it out from §10.3.3 as usual".
+    forced_width: f64
 ) -> void {
     let current: LayoutBox = box.get(tree, box_index);
     let style: ComputedStyle = style_of(styles, current.style_node);
@@ -231,6 +402,12 @@ fn layout_block(
     let width: f64 = 0.0;
     if anonymous {
         width = containing_width;
+    } else if forced_width >= 0.0 {
+        // §10.3.5: a float's own margins do not absorb slack, so they stay as
+        // declared and `auto` becomes zero.
+        width = forced_width;
+        current.margin_left = resolve(style.margin_left, containing_width);
+        current.margin_right = resolve(style.margin_right, containing_width);
     } else {
         // §10.3.3: margin-left + border + padding + width + padding + border +
         // margin-right must equal the containing block's width.
@@ -274,11 +451,20 @@ fn layout_block(
 
     let content_height: f64 = 0.0;
     if first_child_is_inline(tree, box_index) {
-        content_height = layout_inline_content(
-            doc, tree, styles, set, box_index, content_x, content_y, width);
+        content_height = layout_inline_content(doc, tree, styles, set, context,
+            box_index, content_x, content_y, width);
     } else {
-        content_height = layout_block_children(
-            doc, tree, styles, set, box_index, content_x, content_y, width);
+        // Whether this box's own margins adjoin its children's decides whether
+        // the first child's margin was already applied above this box.
+        let collapse_top: bool = !anonymous
+            && top_adjoins_children(style, containing_width)
+            && style.float_side == computed.float_none();
+        let collapse_bottom: bool = !anonymous
+            && bottom_adjoins_children(style, containing_width)
+            && style.float_side == computed.float_none();
+        content_height = layout_block_children(doc, tree, styles, set, context,
+            box_index, content_x, content_y, width, collapse_top,
+            collapse_bottom);
     }
 
     current = box.get(tree, box_index);
@@ -290,6 +476,67 @@ fn layout_block(
     box.set(tree, box_index, current);
 }
 
+// Lay out a float and record it in the context. §9.5.1: it is placed as high as
+// the current position allows and as far to its side as it can go without
+// overlapping a float already there, dropping to the next band when it will not
+// fit.
+fn layout_float(
+    doc: *DomDocument,
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    set: *TextFontSet,
+    context: *FloatContext,
+    child: u64,
+    content_x: f64,
+    top: f64,
+    containing_width: f64
+) -> void {
+    let style: ComputedStyle = style_of(styles, box.get(tree, child).style_node);
+    let side: u8 = style.float_side;
+
+    let margin_left: f64 = resolve(style.margin_left, containing_width);
+    let margin_right: f64 = resolve(style.margin_right, containing_width);
+    let edges: f64 = style.border_left_width + style.border_right_width
+        + resolve(style.padding_left, containing_width)
+        + resolve(style.padding_right, containing_width);
+
+    let width: f64 = 0.0;
+    if is_auto(style.width) {
+        // §10.3.5 shrink-to-fit, measured over the box's own content.
+        let available: f64 =
+            containing_width - margin_left - margin_right - edges;
+        let sizes: IntrinsicWidths =
+            intrinsic.widths(doc, tree, styles, set, child, containing_width);
+        // The intrinsic widths include this box's own edges, which the
+        // available width already accounts for.
+        let content: IntrinsicWidths = IntrinsicWidths {
+            min: sizes.min - edges - margin_left - margin_right,
+            max: sizes.max - edges - margin_left - margin_right,
+        };
+        width = intrinsic.shrink_to_fit(available, content);
+    } else {
+        width = resolve(style.width, containing_width);
+    }
+    if width < 0.0 {
+        width = 0.0;
+    }
+
+    let outer: f64 = width + edges + margin_left + margin_right;
+    let start: f64 = floats.clearance(context, top, style.clear_side);
+    let spot: FloatPlacement = floats.place(context, start, outer, side,
+        content_x, content_x + containing_width);
+
+    layout_block(doc, tree, styles, set, context, child, spot.x,
+        spot.y + resolve(style.margin_top, containing_width), containing_width,
+        width);
+
+    let placed: LayoutBox = box.get(tree, child);
+    let margin_top: f64 = placed.margin_top;
+    let margin_bottom: f64 = placed.margin_bottom;
+    floats.add(context, spot.x, spot.y, spot.x + outer,
+        placed.y + box.border_box_height(placed) + margin_bottom, side);
+}
+
 fn first_child_is_inline(tree: *LayoutTree, box_index: u64) -> bool {
     let first: u64 = box.get(tree, box_index).first_child;
     if first == box.none() {
@@ -299,58 +546,70 @@ fn first_child_is_inline(tree: *LayoutTree, box_index: u64) -> bool {
     return kind == box.box_inline() || kind == box.box_text();
 }
 
-// The top margin a child will use, needed before it is laid out so sibling
-// margins can be collapsed.
-fn child_top_margin(
-    tree: *LayoutTree,
-    styles: *StyleTree,
-    child: u64,
-    containing_width: f64
-) -> f64 {
-    let child_box: LayoutBox = box.get(tree, child);
-    if child_box.kind == box.box_anonymous() {
-        return 0.0;
-    }
-    return resolve(style_of(styles, child_box.style_node).margin_top,
-        containing_width);
-}
-
 // Stack block children vertically, collapsing adjacent sibling margins.
 fn layout_block_children(
     doc: *DomDocument,
     tree: *LayoutTree,
     styles: *StyleTree,
     set: *TextFontSet,
+    context: *FloatContext,
     parent: u64,
     content_x: f64,
     content_y: f64,
-    content_width: f64
+    content_width: f64,
+    collapse_top: bool,
+    collapse_bottom: bool
 ) -> f64 {
     let cursor: f64 = content_y;
     let previous_bottom: f64 = 0.0;
+    let trailing_margin: f64 = 0.0;
     let first: bool = true;
     let child: u64 = box.get(tree, parent).first_child;
     while child != box.none() {
+        let next: u64 = box.get(tree, child).next_sibling;
+        if is_floated(styles, tree, child) {
+            // Out of flow: it does not move the cursor, and the next in-flow
+            // box's margins are unaffected by it.
+            layout_float(doc, tree, styles, set, context, child, content_x,
+                cursor, content_width);
+            child = next;
+            continue;
+        }
         let top_margin: f64 =
-            child_top_margin(tree, styles, child, content_width);
-        // §8.3.1: adjacent siblings' vertical margins collapse to the larger
-        // of the two rather than summing.
+            collapsed_top_margin(tree, styles, child, content_width);
+        // §8.3.1: adjoining margins collapse to the larger of the two rather
+        // than summing. The first child's margin has already been applied
+        // above this box when the two adjoin, so the gap here is nothing.
         let gap: f64 = top_margin;
-        if !first {
+        if first {
+            if collapse_top {
+                gap = 0.0;
+            }
+        } else {
             gap = larger(previous_bottom, top_margin);
         }
         let child_y: f64 = cursor + gap;
-        layout_block(doc, tree, styles, set, child, content_x, child_y, content_width);
+        // §9.5.2: clearance moves the box below the floats it clears.
+        let child_style: ComputedStyle =
+            style_of(styles, box.get(tree, child).style_node);
+        child_y = floats.clearance(context, child_y, child_style.clear_side);
+        layout_block(doc, tree, styles, set, context, child, content_x, child_y,
+            content_width, -1.0);
         let placed: LayoutBox = box.get(tree, child);
         cursor = placed.y + box.border_box_height(placed);
-        previous_bottom = placed.margin_bottom;
+        previous_bottom =
+            collapsed_bottom_margin(tree, styles, child, content_width);
+        trailing_margin = previous_bottom;
         first = false;
-        child = placed.next_sibling;
+        child = next;
     }
-    // The bottom margin of the last child is left outside the parent's height:
-    // collapsing through the parent is not implemented, and adding it here
-    // would double the gap compared with a browser.
-    return cursor - content_y;
+    // The last child's bottom margin escapes this box when the two adjoin —
+    // the parent's own collapsed margin carries it — and is part of the
+    // content height when they do not.
+    if collapse_bottom {
+        return cursor - content_y;
+    }
+    return cursor - content_y + trailing_margin;
 }
 
 // --- Inline layout -----------------------------------------------------------
@@ -370,6 +629,45 @@ struct InlineState {
     // before it, not to the element after, so it is appended here rather than
     // opening the next fragment.
     last_fragment: u64,
+    // The box a newly created fragment is inserted after, which is the text
+    // box itself for the first fragment and the previous fragment after that.
+    previous_fragment: u64,
+    // The containing block's own content edges, which a line box starts from
+    // before floats narrow it.
+    edge_left: f64,
+    edge_right: f64,
+    context: *FloatContext,
+}
+
+// §9.5: a line box beside a float is only as wide as the space the float
+// leaves. Called when a line starts, since the floats a line meets depend on
+// where that line sits.
+fn apply_float_band(state: *InlineState) -> void {
+    let context: *FloatContext = (*state).context;
+    // Probe a one-pixel band at the line's top: the line's own height is not
+    // known until content is placed on it, and this is where every engine
+    // makes the same approximation.
+    let available: FloatBand = floats.band(context, (*state).line_top,
+        (*state).line_top + 1.0, (*state).edge_left, (*state).edge_right);
+    // A band with nothing left in it means the floats meet; drop past the
+    // nearest one and try again.
+    for step: u64 in 0..(floats.count(context) + 1) {
+        if available.right - available.left > 0.0 {
+            break;
+        }
+        let next: f64 = floats.next_band(context, (*state).line_top);
+        if next <= (*state).line_top {
+            break;
+        }
+        (*state).line_top = next;
+        available = floats.band(context, (*state).line_top,
+            (*state).line_top + 1.0, (*state).edge_left, (*state).edge_right);
+    }
+    (*state).origin_x = available.left;
+    (*state).available = available.right - available.left;
+    if (*state).line_empty {
+        (*state).x = available.left;
+    }
 }
 
 fn layout_inline_content(
@@ -377,6 +675,7 @@ fn layout_inline_content(
     tree: *LayoutTree,
     styles: *StyleTree,
     set: *TextFontSet,
+    context: *FloatContext,
     container: u64,
     content_x: f64,
     content_y: f64,
@@ -392,13 +691,38 @@ fn layout_inline_content(
         origin_x: content_x,
         available: content_width,
         last_fragment: box.none(),
+        previous_fragment: box.none(),
+        edge_left: content_x,
+        edge_right: content_x + content_width,
+        context: context,
     };
+    apply_float_band(&state);
     layout_inline_children(doc, tree, styles, set, container, &state);
     if !state.line_empty {
         align_line(tree, styles, set, &state);
         return state.line_top + state.line_height - content_y;
     }
     return state.line_top - content_y;
+}
+
+// Where the first text fragment inside `index` was placed, or `fallback` when
+// there is none.
+fn first_fragment_x(tree: *LayoutTree, index: u64, fallback: f64) -> f64 {
+    let child: u64 = box.get(tree, index).first_child;
+    while child != box.none() {
+        let child_box: LayoutBox = box.get(tree, child);
+        if child_box.kind == box.box_text() && child_box.text_len > 0 {
+            return child_box.x;
+        }
+        if child_box.kind == box.box_inline() {
+            let inner: f64 = first_fragment_x(tree, child, fallback);
+            if inner != fallback {
+                return inner;
+            }
+        }
+        child = child_box.next_sibling;
+    }
+    return fallback;
 }
 
 fn layout_inline_children(
@@ -416,20 +740,55 @@ fn layout_inline_children(
         if child_box.kind == box.box_text() {
             place_text(doc, tree, styles, set, child, state);
         } else if child_box.kind == box.box_inline() {
-            // An inline box's geometry is the extent of its fragments. Inline
-            // borders and padding are not implemented; recording the extent is
-            // enough for paint to draw a background behind it.
-            let start_x: f64 = (*state).x;
+            // §10.8: horizontal margins, borders and padding on an inline box
+            // do take up room on the line, even though the vertical ones do
+            // not affect line height. The box's own geometry is the extent of
+            // its fragments plus those edges.
+            let style: ComputedStyle = style_of(styles, child_box.style_node);
+            let containing: f64 = (*state).edge_right - (*state).edge_left;
+            let margin_left: f64 = resolve(style.margin_left, containing);
+            let margin_right: f64 = resolve(style.margin_right, containing);
+            let padding_left: f64 = resolve(style.padding_left, containing);
+            let padding_right: f64 = resolve(style.padding_right, containing);
+
+            (*state).x = (*state).x
+                + margin_left + style.border_left_width + padding_left;
+            let content_start: f64 = (*state).x;
             let start_y: f64 = (*state).line_top;
             layout_inline_children(doc, tree, styles, set, child, state);
+            let content_end: f64 = (*state).x;
+            (*state).x = (*state).x
+                + padding_right + style.border_right_width + margin_right;
+
             let updated: LayoutBox = box.get(tree, child);
-            updated.x = start_x;
+            updated.margin_left = margin_left;
+            updated.margin_right = margin_right;
+            updated.border_left = style.border_left_width;
+            updated.border_right = style.border_right_width;
+            updated.padding_left = padding_left;
+            updated.padding_right = padding_right;
+            updated.padding_top = resolve(style.padding_top, containing);
+            updated.padding_bottom = resolve(style.padding_bottom, containing);
+            updated.border_top = style.border_top_width;
+            updated.border_bottom = style.border_bottom_width;
+            // The box begins where its content actually landed. That is
+            // usually `content_start`, but a collapsible space just before the
+            // box belongs to the text run outside it — so the content starts
+            // one space further right, and the box must not reach back over a
+            // space it does not contain.
+            let placed_start: f64 = first_fragment_x(tree, child, content_start);
+            updated.x = placed_start - style.border_left_width - padding_left;
             updated.y = start_y;
-            updated.width = (*state).x - start_x;
+            updated.width = content_end - placed_start;
             if updated.width < 0.0 {
                 updated.width = 0.0;
             }
-            updated.height = (*state).line_top + (*state).line_height - start_y;
+            updated.height = (*state).line_top + (*state).line_height - start_y
+                - updated.border_top - updated.padding_top
+                - updated.border_bottom - updated.padding_bottom;
+            if updated.height < 0.0 {
+                updated.height = 0.0;
+            }
             box.set(tree, child, updated);
         }
         child = next;
@@ -461,6 +820,7 @@ fn place_text(
     let fragment_width: f64 = 0.0;
     let first_fragment: bool = true;
     let index: u64 = 0;
+    (*state).previous_fragment = text_box;
     // Reused across every word in this text node rather than allocated per
     // word, since a paragraph has a lot of words and none of them need the
     // buffer to outlive them.
@@ -655,8 +1015,13 @@ fn flush_fragment(
     if !reuse {
         target = box.create(tree, box.box_text(), template.node,
             template.style_node);
-        box.append_child(tree, template.parent, target);
+        // Next to the fragment before it, so the fragments of one text node
+        // stay together and in order. Appending at the end of the parent
+        // instead would put them after boxes the inline walk has not reached
+        // yet, and it would lay them out a second time.
+        box.insert_after(tree, (*state).previous_fragment, target);
     }
+    (*state).previous_fragment = target;
     let fragment: LayoutBox = box.get(tree, target);
     fragment.text_off = fragment_start;
     fragment.text_len = length;
@@ -679,11 +1044,13 @@ fn break_line(
 ) -> void {
     align_line(tree, styles, set, state);
     (*state).line_top = (*state).line_top + (*state).line_height;
-    (*state).x = (*state).origin_x;
     (*state).line_height = 0.0;
     (*state).line_empty = true;
     (*state).pending_space = false;
     (*state).last_fragment = box.none();
+    // The next line may meet a different set of floats.
+    apply_float_band(state);
+    (*state).x = (*state).origin_x;
 }
 
 // Apply text-align to the fragments sitting on the current line.
@@ -738,7 +1105,30 @@ pub fn layout(
     if (*tree).root == box.none() {
         return;
     }
-    layout_block(doc, tree, styles, set, (*tree).root, 0.0, 0.0, viewport_width);
+    // The root establishes the document's one block formatting context, so its
+    // floats live here and are cleaned up with it.
+    let context: FloatContext = floats.new_context();
+    // The root's own margin collapses with its first child's, and the result
+    // sits above the root — which is where the eight pixels at the top of an
+    // unstyled page come from.
+    let top: f64 =
+        collapsed_top_margin(tree, styles, (*tree).root, viewport_width);
+    layout_block(doc, tree, styles, set, &context, (*tree).root, 0.0, top,
+        viewport_width, -1.0);
+    // §10.6.3: a float does not make its containing block taller, but the
+    // document still has to be tall enough to show it.
+    let lowest: f64 = floats.lowest(&context);
+    let root: LayoutBox = box.get(tree, (*tree).root);
+    let bottom: f64 = root.y + box.border_box_height(root);
+    if lowest > bottom {
+        root.height = root.height + (lowest - bottom);
+    }
+    // The margin that escaped the bottom of the root is still part of the
+    // document's height, so record it where document_height will find it.
+    root.margin_bottom =
+        collapsed_bottom_margin(tree, styles, (*tree).root, viewport_width);
+    box.set(tree, (*tree).root, root);
+    floats.destroy(&context);
 }
 
 // The total height the document occupies, for sizing a canvas.

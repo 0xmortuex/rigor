@@ -109,13 +109,25 @@ fn write_box(
         push_str(out, " ");
         push_f64(out, current.margin_left);
     }
-    if current.border_top != 0.0 || current.border_left != 0.0 {
+    if current.border_top != 0.0 || current.border_right != 0.0
+        || current.border_bottom != 0.0 || current.border_left != 0.0 {
         push_str(out, " border ");
         push_f64(out, current.border_top);
+        push_str(out, " ");
+        push_f64(out, current.border_right);
+        push_str(out, " ");
+        push_f64(out, current.border_bottom);
+        push_str(out, " ");
+        push_f64(out, current.border_left);
     }
-    if current.padding_top != 0.0 || current.padding_left != 0.0 {
+    if current.padding_top != 0.0 || current.padding_right != 0.0
+        || current.padding_bottom != 0.0 || current.padding_left != 0.0 {
         push_str(out, " padding ");
         push_f64(out, current.padding_top);
+        push_str(out, " ");
+        push_f64(out, current.padding_right);
+        push_str(out, " ");
+        push_f64(out, current.padding_bottom);
         push_str(out, " ");
         push_f64(out, current.padding_left);
     }

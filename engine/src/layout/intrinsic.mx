@@ -1,0 +1,202 @@
+// Intrinsic widths — CSS 2.1 §10.3.5 "shrink-to-fit", and the "preferred" and
+// "preferred minimum" widths it is defined in terms of.
+//
+// A float with no declared width is as wide as its content wants to be, up to
+// the space available. Working that out needs two numbers per box:
+//
+//   max-content  the width the content would take with no wrapping at all
+//   min-content  the width of the widest piece that cannot be broken
+//
+// CSS 2.1 calls these the preferred width and the preferred minimum width, and
+// defines shrink-to-fit as min(max(min-content, available), max-content).
+//
+// Both are measured over the box tree rather than the DOM, so the anonymous
+// boxes and the display rules are already resolved. Text is measured with the
+// same metrics inline layout uses and broken at the same UAX #14 opportunities,
+// so a float sized here and laid out there agree.
+module engine.layout.intrinsic;
+
+import std.vec;
+import box;
+import metrics;
+import engine.dom.node;
+import engine.style.computed;
+import engine.text.fonts;
+import engine.text.utf8;
+import engine.text.linebreak;
+
+struct IntrinsicWidths {
+    min: f64,
+    max: f64,
+}
+
+fn wider(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+fn style_of(styles: *StyleTree, dom_node: u64) -> ComputedStyle {
+    return computed.get(styles, dom_node);
+}
+
+fn is_space_byte(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 12 as u8
+        || c == 13 as u8;
+}
+
+// The horizontal edges a box adds around its content.
+fn edges_of(styles: *StyleTree, box_value: LayoutBox, containing: f64) -> f64 {
+    if box_value.kind == box.box_anonymous() || box_value.kind == box.box_text() {
+        return 0.0;
+    }
+    let style: ComputedStyle = style_of(styles, box_value.style_node);
+    return resolve(style.margin_left, containing)
+        + resolve(style.margin_right, containing)
+        + style.border_left_width + style.border_right_width
+        + resolve(style.padding_left, containing)
+        + resolve(style.padding_right, containing);
+}
+
+fn resolve(length: StyleLength, containing: f64) -> f64 {
+    if length.kind == computed.length_percent() {
+        return containing * length.value / 100.0;
+    }
+    if length.kind == computed.length_auto() {
+        return 0.0;
+    }
+    return length.value;
+}
+
+// The widths of one text box: the whole run for max-content, and the widest
+// unbreakable piece for min-content.
+fn text_widths(
+    doc: *DomDocument,
+    styles: *StyleTree,
+    set: *TextFontSet,
+    box_value: LayoutBox
+) -> IntrinsicWidths {
+    let style: ComputedStyle = style_of(styles, box_value.style_node);
+    let source: DomNode = node.get(doc, box_value.node);
+    let text: []const u8 = node.bytes(doc, source.data_off, source.data_len);
+    let result: IntrinsicWidths = IntrinsicWidths { min: 0.0, max: 0.0 };
+    if len(text) == 0 {
+        return result;
+    }
+
+    // max-content: the whole run on one line, with collapsed white space.
+    let run: f64 = 0.0;
+    let index: u64 = 0;
+    let pending_space: bool = false;
+    let started: bool = false;
+    let space_width: f64 = metrics.codepoint_width(set, style, ' ' as u32);
+
+    // min-content: the widest piece between two break opportunities.
+    let state: BreakState = linebreak.new_state();
+    let piece: f64 = 0.0;
+
+    while index < len(text) {
+        if is_space_byte(text[index]) {
+            while index < len(text) && is_space_byte(text[index]) {
+                index = index + 1;
+            }
+            if started {
+                pending_space = true;
+            }
+            // A space is always a break opportunity, so the piece ends here.
+            result.min = wider(result.min, piece);
+            piece = 0.0;
+            continue;
+        }
+        let decoded: TextChar = utf8.decode(text, index);
+        let advance: f64 = metrics.codepoint_width(set, style, decoded.codepoint);
+        if pending_space {
+            run = run + space_width;
+            pending_space = false;
+        }
+        run = run + advance;
+        started = true;
+        // A break opportunity before this character ends the previous piece.
+        let decision: u8 = linebreak.next(&state,
+            linebreak.class_of(decoded.codepoint), decoded.codepoint);
+        if decision != linebreak.break_prohibited() {
+            result.min = wider(result.min, piece);
+            piece = 0.0;
+        }
+        piece = piece + advance;
+        index = index + decoded.size;
+    }
+    result.min = wider(result.min, piece);
+    result.max = run;
+    return result;
+}
+
+// The intrinsic widths of a box and everything inside it.
+pub fn widths(
+    doc: *DomDocument,
+    tree: *LayoutTree,
+    styles: *StyleTree,
+    set: *TextFontSet,
+    box_index: u64,
+    containing: f64
+) -> IntrinsicWidths {
+    let box_value: LayoutBox = box.get(tree, box_index);
+    if box_value.kind == box.box_text() {
+        return text_widths(doc, styles, set, box_value);
+    }
+
+    let edges: f64 = edges_of(styles, box_value, containing);
+    // A declared width settles both numbers, whatever the content wants.
+    if box_value.kind != box.box_anonymous() {
+        let style: ComputedStyle = style_of(styles, box_value.style_node);
+        if style.width.kind != computed.length_auto() {
+            let declared: f64 = resolve(style.width, containing);
+            return IntrinsicWidths {
+                min: declared + edges, max: declared + edges,
+            };
+        }
+    }
+
+    let result: IntrinsicWidths = IntrinsicWidths { min: 0.0, max: 0.0 };
+    // Inline children sit side by side, so their max-content widths add and
+    // their min-content widths take the largest. Block children stack, so both
+    // take the largest.
+    let inline_run: f64 = 0.0;
+    let child: u64 = box_value.first_child;
+    while child != box.none() {
+        let child_box: LayoutBox = box.get(tree, child);
+        let child_widths: IntrinsicWidths =
+            widths(doc, tree, styles, set, child, containing);
+        result.min = wider(result.min, child_widths.min);
+        if child_box.kind == box.box_block()
+            || child_box.kind == box.box_anonymous() {
+            result.max = wider(result.max, inline_run);
+            inline_run = 0.0;
+            result.max = wider(result.max, child_widths.max);
+        } else {
+            inline_run = inline_run + child_widths.max;
+        }
+        child = child_box.next_sibling;
+    }
+    result.max = wider(result.max, inline_run);
+
+    result.min = result.min + edges;
+    result.max = result.max + edges;
+    return result;
+}
+
+// §10.3.5: the width a float or inline-block takes when its own width is auto.
+pub fn shrink_to_fit(available: f64, intrinsic: IntrinsicWidths) -> f64 {
+    let result: f64 = intrinsic.max;
+    if result > available {
+        result = available;
+    }
+    if result < intrinsic.min {
+        result = intrinsic.min;
+    }
+    if result < 0.0 {
+        return 0.0;
+    }
+    return result;
+}

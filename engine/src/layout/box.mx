@@ -177,6 +177,30 @@ pub fn append_child(tree: *LayoutTree, parent: u64, child: u64) -> void {
     set(tree, parent, parent_box);
 }
 
+// Insert `child` immediately after `sibling` in their shared parent.
+//
+// Line breaking uses this: a text node that wraps produces several fragments,
+// and each one has to land next to the box it came from rather than at the end
+// of the parent's children. Appending them at the end would put them out of
+// document order — which paints them in the wrong order, and, worse, makes
+// them siblings that the inline layout walk has not visited yet, so it would
+// lay them out a second time.
+pub fn insert_after(tree: *LayoutTree, sibling: u64, child: u64) -> void {
+    let sibling_box: LayoutBox = get(tree, sibling);
+    let parent: u64 = sibling_box.parent;
+    let child_box: LayoutBox = get(tree, child);
+    child_box.parent = parent;
+    child_box.next_sibling = sibling_box.next_sibling;
+    sibling_box.next_sibling = child;
+    set(tree, child, child_box);
+    set(tree, sibling, sibling_box);
+    let parent_box: LayoutBox = get(tree, parent);
+    if parent_box.last_child == sibling {
+        parent_box.last_child = child;
+        set(tree, parent, parent_box);
+    }
+}
+
 // The full outer width of a box: content plus padding, borders and margins.
 pub fn outer_width(value: LayoutBox) -> f64 {
     return value.margin_left + value.border_left + value.padding_left

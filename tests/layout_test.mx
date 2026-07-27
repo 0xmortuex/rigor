@@ -168,6 +168,18 @@ fn box_for(l: *Laid, tag: *u8) -> LayoutBox {
     return box.empty_box(box.box_block());
 }
 
+
+// The first text fragment in the tree, for checking where a line starts.
+fn first_text(l: *Laid) -> LayoutBox {
+    for index: u64 in 0..box.box_count(&(*l).boxes) {
+        let candidate: LayoutBox = box.get(&(*l).boxes, index);
+        if candidate.kind == box.box_text() && candidate.text_len > 0 {
+            return candidate;
+        }
+    }
+    return box.empty_box(box.box_text());
+}
+
 test "a block fills its containing block's width" {
     let l: Laid = build("<div>x</div>", "body { margin: 0 }", 800.0);
     let div: LayoutBox = box_for(&l, "div");
@@ -355,5 +367,167 @@ test "nested blocks inherit the narrowed containing block" {
     // 800 - 20 - 20 = 760 for the paragraph.
     assert(near(box_for(&l, "p").width, 760.0));
     assert(near(box_for(&l, "p").x, 20.0));
+    destroy(&l);
+}
+
+// --- Margin collapsing (CSS 2.1 §8.3.1) --------------------------------------
+
+test "a parent's top margin collapses with its first child's" {
+    // The larger of the two wins, and the result sits above the parent — so
+    // both boxes end up at the same y.
+    let l: Laid = build("<div><p>x</p></div>",
+    "body { margin: 0 } div { margin-top: 20px } p { margin: 30px 0 }", 800.0);
+    let div: LayoutBox = box_for(&l, "div");
+    let p: LayoutBox = box_for(&l, "p");
+    assert(near(div.y, 30.0));
+    assert(near(p.y, 30.0));
+    destroy(&l);
+}
+
+test "a border stops the parent and child margins collapsing" {
+    let l: Laid = build("<div><p>x</p></div>",
+    "body { margin: 0 } div { margin-top: 20px; border-top: 1px solid red } p { margin: 30px 0 }",
+    800.0);
+    let div: LayoutBox = box_for(&l, "div");
+    let p: LayoutBox = box_for(&l, "p");
+    assert(near(div.y, 20.0));
+    // The child's own margin now applies inside, below the border.
+    assert(near(p.y, 51.0));
+    destroy(&l);
+}
+
+test "padding stops the parent and child margins collapsing" {
+    let l: Laid = build("<div><p>x</p></div>",
+    "body { margin: 0 } div { margin-top: 20px; padding-top: 5px } p { margin: 30px 0 }",
+    800.0);
+    let p: LayoutBox = box_for(&l, "p");
+    assert(near(p.y, 55.0));
+    destroy(&l);
+}
+
+test "an empty box collapses its own margins through itself" {
+    // The gap between the two paragraphs is the largest single margin
+    // involved, not the sum of four of them.
+    let l: Laid = build("<p id=a>one</p><div></div><p id=b>two</p>",
+    "body { margin: 0 } p { margin: 10px 0 } div { margin: 40px 0 }", 800.0);
+    let first: LayoutBox = box_for(&l, "p");
+    assert(near(first.y, 10.0));
+    // one's bottom is at 10 + line height; the next paragraph sits 40 below.
+    let empty: LayoutBox = box_for(&l, "div");
+    assert(near(empty.height, 0.0));
+    assert(near(empty.y, first.y + first.height + 40.0));
+    destroy(&l);
+}
+
+test "sibling margins still collapse to the larger" {
+    let l: Laid = build("<p id=a>one</p><p id=b>two</p>",
+    "body { margin: 0 } #a { margin-bottom: 40px } #b { margin-top: 10px }",
+    800.0);
+    let first: LayoutBox = box_for(&l, "p");
+    // The second paragraph is the next block sibling of the first.
+    let second: LayoutBox = box.get(&l.boxes, first.next_sibling);
+    assert(near(second.y, first.y + first.height + 40.0));
+    destroy(&l);
+}
+
+// --- Floats (CSS 2.1 §9.5) ---------------------------------------------------
+
+test "a left float sits at the left edge and leaves the flow" {
+    let l: Laid = build("<div id=f></div><p>x</p>",
+    "body { margin: 0 } p { margin: 0 } #f { float: left; width: 100px; height: 50px }",
+    800.0);
+    let f: LayoutBox = box_for(&l, "div");
+    let p: LayoutBox = box_for(&l, "p");
+    assert(near(f.x, 0.0));
+    assert(near(f.y, 0.0));
+    // The paragraph is still full width and still at the top: a float does not
+    // push block boxes down, only line boxes sideways.
+    assert(near(p.y, 0.0));
+    assert(near(p.width, 800.0));
+    destroy(&l);
+}
+
+test "a right float sits at the right edge" {
+    let l: Laid = build("<div id=f></div><p>x</p>",
+    "body { margin: 0 } #f { float: right; width: 100px; height: 50px }",
+    800.0);
+    let f: LayoutBox = box_for(&l, "div");
+    assert(near(f.x, 700.0));
+    destroy(&l);
+}
+
+test "a line box shortens beside a float" {
+    let l: Laid = build("<div id=f></div><p>hello</p>",
+    "body { margin: 0 } p { margin: 0 } #f { float: left; width: 100px; height: 50px }",
+    800.0);
+    let text: LayoutBox = first_text(&l);
+    assert(near(text.x, 100.0));
+    destroy(&l);
+}
+
+test "clear moves a block below the float" {
+    let l: Laid = build("<div id=f></div><p>x</p>",
+    "body { margin: 0 } p { margin: 0; clear: left } #f { float: left; width: 100px; height: 50px }",
+    800.0);
+    let p: LayoutBox = box_for(&l, "p");
+    assert(near(p.y, 50.0));
+    destroy(&l);
+}
+
+test "clear: right ignores a left float" {
+    let l: Laid = build("<div id=f></div><p>x</p>",
+    "body { margin: 0 } p { margin: 0; clear: right } #f { float: left; width: 100px; height: 50px }",
+    800.0);
+    let p: LayoutBox = box_for(&l, "p");
+    assert(near(p.y, 0.0));
+    destroy(&l);
+}
+
+test "two left floats stack sideways, then wrap" {
+    let l: Laid = build("<div id=a></div><div id=b></div>",
+    "body { margin: 0 } div { float: left; width: 300px; height: 40px }",
+    700.0);
+    let first: LayoutBox = box_for(&l, "div");
+    let second: LayoutBox = box.get(&l.boxes, first.next_sibling);
+    assert(near(first.x, 0.0));
+    assert(near(second.x, 300.0));
+    assert(near(second.y, 0.0));
+    destroy(&l);
+}
+
+test "a float wider than the remaining band drops below" {
+    let l: Laid = build("<div id=a></div><div id=b></div>",
+    "body { margin: 0 } div { float: left; width: 400px; height: 40px }",
+    700.0);
+    let first: LayoutBox = box_for(&l, "div");
+    let second: LayoutBox = box.get(&l.boxes, first.next_sibling);
+    assert(near(second.x, 0.0));
+    assert(near(second.y, 40.0));
+    destroy(&l);
+}
+
+test "an auto-width float shrinks to fit its content" {
+    // Shrink-to-fit lands between the min-content and max-content widths, so
+    // a short word gives a float far narrower than the containing block.
+    let l: Laid = build("<div id=f>hi</div>",
+    "body { margin: 0 } #f { float: left }", 800.0);
+    let f: LayoutBox = box_for(&l, "div");
+    assert(f.width > 0.0);
+    assert(f.width < 200.0);
+    destroy(&l);
+}
+
+// --- Inline boxes ------------------------------------------------------------
+
+test "horizontal padding and borders on an inline box take up room" {
+    let l: Laid = build("<p>a<b>x</b>c</p>",
+    "body { margin: 0 } p { margin: 0 } b { padding: 0 10px; border-left: 4px solid red; border-right: 4px solid red }",
+    800.0);
+    let b: LayoutBox = box_for(&l, "b");
+    assert(near(b.padding_left, 10.0));
+    assert(near(b.border_left, 4.0));
+    // The content sits inside the border and padding.
+    let inner: LayoutBox = box.get(&l.boxes, b.first_child);
+    assert(near(inner.x, b.x + 14.0));
     destroy(&l);
 }
