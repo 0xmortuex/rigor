@@ -18,6 +18,7 @@ passing conformance tests, not vibes.
 ```
 Get-Content examples/demo.html | rigor-view     # a window
 Get-Content examples/demo.html | rigor          # tokens, tree, styles, layout
+$env:RIGOR_URL = "https://example.com"; rigor   # fetch a page and render it
 ```
 
 ```
@@ -48,6 +49,25 @@ are the suites' `#script-on` cases, and rigor has no scripting engine, so the
 behaviour they test does not exist here. Fragment cases (`#document-fragment`)
 are run, with the fragment parsing algorithm and the case's context element.
 
+### Reftests
+
+`python tools/run_wpt.py` against a vendored subset of the
+[web-platform-tests](https://github.com/web-platform-tests/wpt) reftests — a
+test page and the page it names with `<link rel=match>`, which must render
+identically: **16/43 (37%)**.
+
+| suite | passing |
+| --- | ---: |
+| css/CSS2/floats | 7/16 |
+| css/CSS2/normal-flow | 5/19 |
+| css/CSS2/text | 4/8 |
+
+The failures are the features rigor does not have — nested block formatting
+contexts, `overflow`, table sizing, block-in-inline splitting. The runner also
+counts what was not vendored, by reason, so the denominator is not quietly
+flattering: 58 tests need JavaScript, 52 have a reference outside their own
+directory, and 11 need the Ahem font.
+
 ### Tokenizer
 
 Against the [html5lib-tests](https://github.com/html5lib/html5lib-tests)
@@ -71,9 +91,12 @@ Nothing is skipped: every state the suites exercise is implemented.
 
 ## What works today
 
-- **Byte stream decoding** (§13.2.3.3) and **input preprocessing** (§13.2.3.5):
-  BOM removal, newline normalization, and the surrogate / noncharacter /
-  control input-stream parse errors.
+- **The input byte stream** (§13.2.3): the encoding sniffing algorithm, with
+  the `<meta>` prescan, and every decoder in the WHATWG Encoding Standard —
+  UTF-8, UTF-16, all 28 legacy single-byte encodings, GBK, gb18030, Big5,
+  EUC-JP, Shift_JIS, EUC-KR, ISO-2022-JP and x-user-defined. Then input
+  preprocessing (§13.2.3.5): newline normalization and the surrogate /
+  noncharacter / control input-stream parse errors.
 - **HTML tokenizer** (§13.2.5), every state: data / RCDATA / RAWTEXT /
   PLAINTEXT, the script-data family including double escaping, tags and
   attributes (duplicate dropping, ASCII lowercasing), comments including the
@@ -106,27 +129,46 @@ Nothing is skipped: every state the suites exercise is implemented.
 - **Selector matching** against the DOM, right to left with backtracking, plus
   the structural pseudo-classes.
 - **The cascade** (CSS Cascade §6): origin and importance, specificity,
-  document order, inheritance, and a real user-agent stylesheet written as
-  CSS and parsed by the same parser — which is what makes `<div>` a block and
-  `<b>` bold.
+  document order, inheritance, `style=` attributes at their own place in the
+  sort order, the CSS-wide keywords (`inherit`, `initial`, `unset`, `revert`),
+  custom properties with `var()` and fallback, and a real user-agent stylesheet
+  written as CSS and parsed by the same parser — which is what makes `<div>` a
+  block and `<b>` bold.
+- **`@media` evaluation** (mediaqueries-4): media types, `and`/`or`/`not` with
+  nesting, the discrete features, and the range features in all three
+  spellings, including `400px <= width <= 900px`.
 - **Computed values**: lengths resolved to pixels (em, rem, pt, cm, …),
   percentages kept for layout, colors from hex/rgb()/named, and the margin,
   padding and border shorthands.
 - **Layout** (CSS 2.1 §9–§10): the box tree with anonymous block boxes, the
   block width constraint including `auto` margins centring a box, auto and
-  fixed heights, adjacent-sibling margin collapsing, and inline formatting
-  with line boxes, white-space collapsing, line breaking and `text-align`.
-- **Real text**: TrueType parsing — `cmap` for character-to-glyph mapping,
-  `hmtx` for advances, `glyf` for outlines including composite glyphs — with
-  an anti-aliased scanline rasterizer using the nonzero winding rule. Bold,
-  italic and monospace resolve to the system's actual faces, and non-ASCII
-  renders.
+  fixed heights, margin collapsing in all three forms (siblings, parent/child,
+  and through an empty box), floats with `clear` and line boxes that shorten
+  around them, and inline formatting with line boxes, white-space collapsing,
+  horizontal borders and padding on inline boxes, and `text-align`.
+- **Line breaking** per UAX #14 rather than at spaces, so a run of Chinese
+  wraps and `3.5`, `(parenthesised)` and `100km` do not.
+- **Real text**: TrueType and OpenType parsing — `cmap` for
+  character-to-glyph mapping, `hmtx` for advances, `glyf` for outlines
+  including composite glyphs, and `CFF ` Type 2 charstrings for the OpenType
+  flavour — with an anti-aliased scanline rasterizer using the nonzero winding
+  rule, and kerning from `kern` or GPOS. Bold, italic and monospace resolve to
+  the system's actual faces, and non-ASCII renders.
+- **Images**: a PNG decoder written from scratch, DEFLATE included — every
+  colour type at every bit depth, all five filters, tRNS transparency and
+  Adam7 interlacing — with `<img>` laid out as a replaced element.
+- **Networking**: a URL parser and http/https fetching with redirects and
+  chunked responses, so `RIGOR_URL` loads a page from the web along with its
+  linked stylesheets and images.
 - **Paint**: a software rasterizer with source-over alpha blending, drawing
   backgrounds, borders and text into a BGRA canvas, plus a BMP writer so a
   render can be diffed without a window.
 - **A window**: `rigor-view` opens a Win32 window and blits the canvas, with
-  arrow-key and mouse-wheel scrolling. Win32 is confined to one file —
-  `viewer/src/win32.mx` — so a port replaces that and nothing else.
+  arrow-key and mouse-wheel scrolling, re-rendering on resize (the whole
+  cascade, since the viewport width decides which `@media` queries match), and
+  hit testing — the cursor changes over a link and fragment links navigate.
+  Win32 is confined to one file — `viewer/src/win32.mx` — so a port replaces
+  that and nothing else.
 - **`rigor` CLI**: pipe HTML in, get the token stream, the parsed tree, the
   parsed stylesheet, the computed style of every element, the laid-out box
   tree with its geometry, and `rigor.bmp`.

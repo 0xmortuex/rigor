@@ -8,3 +8,6 @@ conformance/build/
 
 viewer/build/
 rigor.bmp
+
+# scratch renders from tools/run_wpt.py
+tools/vendor/wpt/.render/

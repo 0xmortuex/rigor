@@ -44,8 +44,11 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       inheritance, and a UA stylesheet written as real CSS
 - [x] Property value parsing: lengths (absolute and font-relative), colors
       (hex, rgb(), named), keywords, and the box shorthands
-- [ ] `inherit` / `initial` / `unset` keywords and custom properties
-- [ ] `@media` query evaluation (rules inside one currently always apply)
+- [x] The CSS-wide keywords (`inherit`, `initial`, `unset`, `revert`), custom
+      properties and `var()` with fallback, and the `style=` attribute at its
+      own place in the cascade
+- [x] `@media` query evaluation: media types, `and`/`or`/`not` with nesting,
+      the discrete features, and the range features in all three spellings
 - [x] Layout: the box tree with anonymous boxes, block formatting (widths,
       auto margins, heights, sibling margin collapsing) and inline formatting
       (line boxes, white-space collapsing, line breaking, text-align)
@@ -53,8 +56,12 @@ HTML + CSS in, pixels in a window out. No JavaScript.
       glyphs), an anti-aliased scanline rasterizer using the nonzero winding
       rule, and font selection across three generic families in regular, bold
       and italic
-- [ ] Floats, static positioning beyond normal flow, parent/child margin
-      collapsing, inline borders and padding
+- [x] Floats with `clear` and line boxes that shorten around them, margin
+      collapsing in all three forms (siblings, parent/child, and through an
+      empty box), horizontal borders and padding on inline boxes, and
+      `visibility`
+- [ ] Positioning other than static, vertical-align other than baseline,
+      nested block formatting contexts, and real table layout
 - [x] Paint: software rasterizer with alpha blending, backgrounds, borders,
       outline text, and a BMP writer
 - [x] Window: Win32 via `extern fn` FFI, with scrolling
@@ -63,21 +70,28 @@ HTML + CSS in, pixels in a window out. No JavaScript.
 
 ## Milestone 2 — a usable document viewer
 
-- [ ] **Text shaping.** Glyphs are placed at their nominal advances, so there
-      is no kerning (`kern`/`GPOS`), no ligatures, and no support for scripts
-      needing reordering or contextual forms. This is the largest remaining
-      typography gap now that outlines are real.
+- [x] Kerning, from both the `kern` table and GPOS pair positioning in both
+      its formats
+- [ ] **The rest of shaping.** Ligatures, and the scripts that need reordering
+      or contextual forms, are still missing — as is fallback to another family
+      for a glyph the selected face does not have, which is why CJK text renders
+      blank under a Latin font.
 - [x] A glyph cache, keyed on (face, glyph, size) — about 3x faster on a
       text-heavy page
-- [ ] CFF/Type-2 outlines, so OpenType fonts without a `glyf` table render
-      rather than falling back
-- [ ] Re-layout on window resize (the viewer keeps its initial width)
-- [ ] Charset sniffing + non-UTF-8 decoding (§13.2.3)
-- [ ] Line breaking per a UAX #14 subset (currently breaks at spaces only)
-- [ ] Images: PNG decoder first (from scratch, like everything else)
-- [ ] `std.net`/`std.https`-backed fetching: URLs, http(s), redirects, cache
-- [ ] Scrolling, hit testing, links
-- [ ] web-platform-tests harness for parsing + CSS subsets
+- [x] CFF/Type-2 outlines, so OpenType fonts without a `glyf` table render
+- [x] Re-layout on window resize — the whole cascade, since the viewport width
+      decides which `@media` queries match
+- [x] Charset sniffing (§13.2.3) and every decoder in the Encoding Standard
+- [x] Line breaking per UAX #14, with the unimplemented rules named
+- [x] Images: a PNG decoder, and the DEFLATE decompressor under it, both from
+      scratch; `<img>` as a replaced element
+- [x] URL parsing, and fetching over http and https with redirects, chunked
+      responses, linked stylesheets and remote images
+- [ ] A response cache, so a page's subresources are not refetched
+- [x] Scrolling, hit testing, and links (fragment links navigate; the cursor
+      changes over any link)
+- [x] web-platform-tests reftest harness — **16/43 (37%)**, with what is not
+      vendored counted by reason
 
 ## Milestone 3 and beyond
 

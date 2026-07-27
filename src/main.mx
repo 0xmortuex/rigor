@@ -6,6 +6,10 @@
 //     Get-Content page.html | rigor        (PowerShell)
 //     rigor < page.html                    (cmd / sh)
 //
+// The rendered page goes to rigor.bmp, or to RIGOR_OUT when that names a
+// path — which is what the reftest runner uses to render two pages and compare
+// them.
+//
 // A URL can be loaded instead, by setting RIGOR_URL:
 //
 //     $env:RIGOR_URL = "https://example.com"; rigor
@@ -491,7 +495,7 @@ fn main() -> int {
     vec.clear(&out);
     vec.destroy(&layout_text);
 
-    // Render to rigor.bmp, sized to the document.
+    // Render, sized to the document, to rigor.bmp or wherever RIGOR_OUT says.
     let page_height: u64 = (flow.document_height(&boxes) + 0.5) as u64;
     if page_height < 1 {
         page_height = 1;
@@ -499,17 +503,22 @@ fn main() -> int {
     let target: Canvas = canvas.new_canvas(800, page_height);
     paint.paint(&target, &boxes, &tree_styles, &font_set, &images);
     let image: Vec<u8> = bmp.encode(&target);
-    let output: File = fs.open("rigor.bmp", "wb");
+    let out_path: *u8 = "rigor.bmp";
+    if env.exists("RIGOR_OUT") {
+        out_path = env.get("RIGOR_OUT");
+    }
+    let output: File = fs.open(out_path, "wb");
     if fs.is_open(&output) {
         fs.write(&output, vec.as_const_slice(&image));
         fs.close(&output);
         out_str(&out, "-- painted --");
         out_line(&out);
-        out_str(&out, "rigor.bmp  800x");
+        out_str(&out, out_path);
+        out_str(&out, "  800x");
         out_u64(&out, page_height);
         out_line(&out);
     } else {
-        out_str(&out, "-- paint failed: could not open rigor.bmp --");
+        out_str(&out, "-- paint failed: could not open the output file --");
         out_line(&out);
     }
     vec.destroy(&image);

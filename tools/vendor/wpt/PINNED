@@ -1,0 +1,15 @@
+Vendored from https://github.com/web-platform-tests/wpt
+paths:  css/CSS2/floats, css/CSS2/normal-flow, css/CSS2/text
+branch: master
+date:   fetched 2026-07-27
+
+Only reftests are vendored: a test page and the page it names with
+`<link rel=match>`, which must render identically. That is the part of WPT an
+engine with no JavaScript can run.
+
+manifest.json lists what was taken and counts what was not, by reason. The
+largest exclusions are tests needing JavaScript and tests whose reference lives
+outside the directory (following those would drag in the support trees).
+
+Refresh with tools/fetch_wpt.py, which rewrites both the files and the
+manifest, in the same change.
