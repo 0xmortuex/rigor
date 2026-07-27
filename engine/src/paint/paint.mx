@@ -153,9 +153,15 @@ fn paint_text(
     let scale: f64 = metrics.scale_for(face, style.font_size);
     let pen: f64 = current.x;
     let index: u64 = 0;
+    // The same kerning layout measured with, applied in the same order.
+    let kern: bool = sfnt.has_kerning(face);
+    let previous: u64 = 0;
     while index < len(text) {
         let decoded: TextChar = utf8.decode(text, index);
         let glyph: u64 = sfnt.glyph_for(face, decoded.codepoint as u64);
+        if kern && previous != 0 {
+            pen = pen + sfnt.kerning(face, previous, glyph) * scale;
+        }
         // Glyph 0 is .notdef; drawing it would litter the page with boxes for
         // every unmapped character, so it is skipped and only the advance
         // applies.
@@ -165,6 +171,7 @@ fn paint_text(
             blit_glyph(target, glyphs, entry, pen, baseline, style.color);
         }
         pen = pen + sfnt.advance_for_glyph(face, glyph) * scale;
+        previous = glyph;
         index = index + decoded.size;
     }
 }

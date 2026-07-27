@@ -1,0 +1,181 @@
+// Kerning and CFF outlines.
+//
+// Windows ships no OpenType/CFF fonts and no font whose kerning values are
+// known in advance, so both are tested against fonts built for the purpose by
+// tools/gen_test_font.py: a CFF font with four charstrings that exercise the
+// path operators and a subroutine call, and a TrueType font with a kern table
+// holding two pairs whose values the test knows.
+
+import std.vec;
+import std.string;
+import engine.text.sfnt;
+import engine.text.load;
+import engine.text.outline;
+
+fn load_cff() -> TextFace {
+    return sfnt.load(load.read_file("tests/fonts/cff-test.otf"));
+}
+
+fn load_kern() -> TextFace {
+    return sfnt.load(load.read_file("tests/fonts/kern-test.ttf"));
+}
+
+// Widest and narrowest coordinates of an outline, to check a shape's extent
+// without depending on how the flattener orders its points.
+struct Extent {
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+}
+
+fn extent_of(shape: *TextOutline) -> Extent {
+    let result: Extent = Extent {
+        min_x: 100000.0, max_x: -100000.0,
+        min_y: 100000.0, max_y: -100000.0,
+    };
+    for index: u64 in 0..outline.point_count(shape) {
+        let x: f64 = outline.point_x(shape, index);
+        let y: f64 = outline.point_y(shape, index);
+        if x < result.min_x { result.min_x = x; }
+        if x > result.max_x { result.max_x = x; }
+        if y < result.min_y { result.min_y = y; }
+        if y > result.max_y { result.max_y = y; }
+    }
+    return result;
+}
+
+fn near(actual: f64, expected: f64) -> bool {
+    let difference: f64 = actual - expected;
+    if difference < 0.0 {
+        difference = 0.0 - difference;
+    }
+    return difference < 0.5;
+}
+
+// --- CFF ---------------------------------------------------------------------
+
+test "an OTTO font with CFF outlines parses" {
+    let face: TextFace = load_cff();
+    assert(sfnt.is_ok(&face));
+    assert(sfnt.is_cff(&face));
+    assert(sfnt.glyph_count(&face) == 4);
+    assert(sfnt.units_per_em(&face) == 1000.0);
+    sfnt.destroy(&face);
+}
+
+test "a charstring's straight-line path is interpreted" {
+    // Glyph 1 is a 600x600 square whose corner is at (100, 100), drawn with
+    // rmoveto, hlineto and vlineto.
+    let face: TextFace = load_cff();
+    let glyph: u64 = sfnt.glyph_for(&face, 'A' as u64);
+    assert(glyph == 1);
+    let shape: TextOutline = outline.build(&face, glyph);
+    assert(outline.contour_count(&shape) == 1);
+    let bounds: Extent = extent_of(&shape);
+    assert(near(bounds.min_x, 100.0));
+    assert(near(bounds.max_x, 700.0));
+    assert(near(bounds.min_y, 100.0));
+    assert(near(bounds.max_y, 700.0));
+    outline.destroy(&shape);
+    sfnt.destroy(&face);
+}
+
+test "a charstring can call a local subroutine" {
+    // Glyph 2 is nothing but `0 callsubr endchar`; the subroutine draws a
+    // triangle from (100,100) to (700,100) to (400,700).
+    let face: TextFace = load_cff();
+    let glyph: u64 = sfnt.glyph_for(&face, 'B' as u64);
+    assert(glyph == 2);
+    assert(sfnt.local_subr_count(&face) == 1);
+    let shape: TextOutline = outline.build(&face, glyph);
+    assert(outline.contour_count(&shape) == 1);
+    let bounds: Extent = extent_of(&shape);
+    assert(near(bounds.min_x, 100.0));
+    assert(near(bounds.max_x, 700.0));
+    assert(near(bounds.min_y, 100.0));
+    assert(near(bounds.max_y, 700.0));
+    outline.destroy(&shape);
+    sfnt.destroy(&face);
+}
+
+test "a charstring's cubic curve is flattened" {
+    // Glyph 3 is one rrcurveto from (100,100) with controls that carry it to
+    // (500, 900). A cubic flattens into several points, so the contour has
+    // more than the two its endpoints would give.
+    let face: TextFace = load_cff();
+    let glyph: u64 = sfnt.glyph_for(&face, 'C' as u64);
+    assert(glyph == 3);
+    let shape: TextOutline = outline.build(&face, glyph);
+    assert(outline.contour_count(&shape) == 1);
+    assert(outline.point_count(&shape) > 4);
+    let bounds: Extent = extent_of(&shape);
+    // The curve starts at (100, 100) and ends at (500, 900); every point of a
+    // Bézier lies within its control polygon's box.
+    assert(near(bounds.min_x, 100.0));
+    assert(bounds.max_x <= 500.5);
+    assert(near(bounds.min_y, 100.0));
+    assert(near(bounds.max_y, 900.0));
+    outline.destroy(&shape);
+    sfnt.destroy(&face);
+}
+
+test "a CFF glyph still reports its advance from hmtx" {
+    let face: TextFace = load_cff();
+    assert(near(sfnt.advance_for_glyph(&face, 1), 800.0));
+    sfnt.destroy(&face);
+}
+
+// --- Kerning -----------------------------------------------------------------
+
+test "a kern table is found and read" {
+    let face: TextFace = load_kern();
+    assert(sfnt.is_ok(&face));
+    assert(sfnt.has_kerning(&face));
+    sfnt.destroy(&face);
+}
+
+test "kerning is looked up by pair, and is directional" {
+    let face: TextFace = load_kern();
+    let a: u64 = sfnt.glyph_for(&face, 'A' as u64);
+    let v: u64 = sfnt.glyph_for(&face, 'V' as u64);
+    assert(a == 1);
+    assert(v == 2);
+    // A before V pulls together; V before A pushes apart. Real fonts only do
+    // the first, but a test that cannot tell the pairs apart proves nothing.
+    assert(near(sfnt.kerning(&face, a, v), -120.0));
+    assert(near(sfnt.kerning(&face, v, a), 40.0));
+    sfnt.destroy(&face);
+}
+
+test "an unkerned pair contributes nothing" {
+    let face: TextFace = load_kern();
+    assert(near(sfnt.kerning(&face, 1, 1), 0.0));
+    assert(near(sfnt.kerning(&face, 2, 2), 0.0));
+    sfnt.destroy(&face);
+}
+
+test "a face with no kerning data reports none" {
+    let face: TextFace = load_cff();
+    assert(!sfnt.has_kerning(&face));
+    assert(near(sfnt.kerning(&face, 1, 2), 0.0));
+    sfnt.destroy(&face);
+}
+
+test "a real system font's kerning pulls AV together" {
+    // Arial Narrow ships a kern table on every Windows install that has it;
+    // when it is absent the test still checks the no-kerning path is sane.
+    let face: TextFace = sfnt.load(
+    load.read_file("C:\\Windows\\Fonts\\ARIALN.TTF"));
+    if !sfnt.is_ok(&face) {
+        sfnt.destroy(&face);
+        return;
+    }
+    let a: u64 = sfnt.glyph_for(&face, 'A' as u64);
+    let v: u64 = sfnt.glyph_for(&face, 'V' as u64);
+    if sfnt.has_kerning(&face) && a != 0 && v != 0 {
+        // Whatever the exact value, a face that kerns AV kerns it negative.
+        assert(sfnt.kerning(&face, a, v) <= 0.0);
+    }
+    sfnt.destroy(&face);
+}

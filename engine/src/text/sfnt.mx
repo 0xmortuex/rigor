@@ -9,10 +9,13 @@
 // buffer: a font file is untrusted input, and a truncated or hostile one must
 // produce a face that reports no glyphs rather than reading out of bounds.
 //
-// Supported: `glyf`-based outlines (the TrueType flavour, which is what the
-// Windows core fonts are). CFF/Type-2 outlines — the OpenType flavour used by
-// many downloadable fonts — are not parsed; a face that has `CFF ` instead of
-// `glyf` reports itself as not usable so the caller can fall back.
+// Outlines come from `glyf` (the TrueType flavour, which is what the Windows
+// core fonts are) or from `CFF ` (the OpenType flavour, whose glyphs are Type 2
+// charstrings). This module locates whichever is present; interpreting either
+// is engine.text.outline's job.
+//
+// Kerning comes from `kern` or from GPOS pair positioning, whichever the font
+// ships — GPOS wins when it has both, which is what shaping engines do.
 module engine.text.sfnt;
 
 import std.vec;
@@ -40,6 +43,35 @@ resource struct TextFace {
     // The chosen cmap subtable, and its format (4 or 12; 0 when none usable).
     cmap_off: u64,
     cmap_format: u64,
+
+    // The `kern` table's format 0 subtable: its pair array and pair count.
+    kern_pairs_off: u64,
+    kern_pair_count: u64,
+    // GPOS's pair positioning: the lookup table offset, the coverage table,
+    // and the class definitions a format 2 subtable needs. Only one pair
+    // adjustment lookup is used, which is what a text-shaping engine with no
+    // script or language support can honour.
+    gpos_pair_off: u64,
+    gpos_pair_format: u64,
+
+    // The `CFF ` table, for a font whose outlines are Type 2 charstrings
+    // rather than `glyf` contours.
+    cff_off: u64,
+    cff_len: u64,
+    // Where the charstrings INDEX starts, and its item count.
+    cff_charstrings_off: u64,
+    cff_charstring_count: u64,
+    // The local and global subroutine INDEXes, which a charstring calls into.
+    cff_gsubrs_off: u64,
+    cff_gsubr_count: u64,
+    cff_lsubrs_off: u64,
+    cff_lsubr_count: u64,
+    // The nominal and default widths a charstring's leading width is relative
+    // to, from the Private DICT.
+    cff_nominal_width: f64,
+    cff_default_width: f64,
+    // True when outlines come from CFF rather than glyf.
+    is_cff: bool,
 }
 
 // --- Bounds-checked big-endian readers ---------------------------------------
@@ -154,14 +186,23 @@ pub fn load(data: Vec<u8>) -> TextFace {
         head_off: 0, hmtx_off: 0, hmtx_len: 0,
         loca_off: 0, loca_len: 0, glyf_off: 0, glyf_len: 0,
         cmap_off: 0, cmap_format: 0,
+        kern_pairs_off: 0, kern_pair_count: 0,
+        gpos_pair_off: 0, gpos_pair_format: 0,
+        cff_off: 0, cff_len: 0,
+        cff_charstrings_off: 0, cff_charstring_count: 0,
+        cff_gsubrs_off: 0, cff_gsubr_count: 0,
+        cff_lsubrs_off: 0, cff_lsubr_count: 0,
+        cff_nominal_width: 0.0, cff_default_width: 0.0,
+        is_cff: false,
     };
     if face.data.length < 12 {
         return move face;
     }
     let version: u64 = u32_at(&face, 0);
-    // 0x00010000 is TrueType outlines; 'true' is the old Apple variant. The
-    // 'OTTO' tag means CFF outlines, which this parser does not read.
-    if version != 0x00010000 && version != tag('t', 'r', 'u', 'e') {
+    // 0x00010000 is TrueType outlines and 'true' is the old Apple variant;
+    // 'OTTO' means the outlines are Type 2 charstrings in a `CFF ` table.
+    let otto: bool = version == tag('O', 'T', 'T', 'O');
+    if version != 0x00010000 && version != tag('t', 'r', 'u', 'e') && !otto {
         return move face;
     }
 
@@ -172,8 +213,14 @@ pub fn load(data: Vec<u8>) -> TextFace {
     let loca: TextTable = find_table(&face, tag('l', 'o', 'c', 'a'));
     let glyf: TextTable = find_table(&face, tag('g', 'l', 'y', 'f'));
     let cmap: TextTable = find_table(&face, tag('c', 'm', 'a', 'p'));
+    let cff: TextTable = find_table(&face, tag('C', 'F', 'F', ' '));
     if head.length == 0 || hhea.length == 0 || hmtx.length == 0
-        || maxp.length == 0 || loca.length == 0 || glyf.length == 0 {
+        || maxp.length == 0 {
+        return move face;
+    }
+    // Outlines come from one source or the other, never both.
+    let has_glyf: bool = loca.length > 0 && glyf.length > 0;
+    if !has_glyf && cff.length == 0 {
         return move face;
     }
 
@@ -197,10 +244,289 @@ pub fn load(data: Vec<u8>) -> TextFace {
     face.loca_len = loca.length;
     face.glyf_off = glyf.offset;
     face.glyf_len = glyf.length;
+    face.is_cff = !has_glyf;
+    face.cff_off = cff.offset;
+    face.cff_len = cff.length;
 
     select_cmap(&face, cmap);
+    select_kern(&face);
+    select_gpos(&face);
+    if face.is_cff {
+        read_cff(&face);
+    }
     face.ok = face.num_glyphs > 0 && face.num_h_metrics > 0;
+    if face.is_cff && face.cff_charstring_count == 0 {
+        face.ok = false;
+    }
     return move face;
+}
+
+// --- Kerning ------------------------------------------------------------------
+//
+// Two places record how much a pair of glyphs should be pulled together: the
+// old `kern` table, and OpenType's GPOS pair adjustment. Fonts ship one or the
+// other (sometimes both, in which case GPOS wins, because that is what shaping
+// engines do). Without either, "AV" and "To" sit visibly too far apart.
+
+// The `kern` table's format 0 subtable: a sorted array of (left, right, value)
+// triples, which a binary search resolves.
+fn select_kern(face: *TextFace) -> void {
+    let kern: TextTable = find_table(face, tag('k', 'e', 'r', 'n'));
+    if kern.length < 4 {
+        return;
+    }
+    let tables: u64 = u16_at(face, kern.offset + 2);
+    let cursor: u64 = kern.offset + 4;
+    for index: u64 in 0..tables {
+        if cursor + 6 > kern.offset + kern.length {
+            return;
+        }
+        let length: u64 = u16_at(face, cursor + 2);
+        let coverage: u64 = u16_at(face, cursor + 4);
+        // Coverage bit 0 is "horizontal", bit 1 is "minimum" (which is not a
+        // kerning value), and the format is the high byte.
+        let format: u64 = coverage >> 8;
+        let horizontal: bool = (coverage & 1) == 1;
+        let minimum: bool = (coverage & 2) == 2;
+        if format == 0 && horizontal && !minimum {
+            (*face).kern_pair_count = u16_at(face, cursor + 6);
+            (*face).kern_pairs_off = cursor + 14;
+            return;
+        }
+        if length == 0 {
+            return;
+        }
+        cursor = cursor + length;
+    }
+}
+
+// The value for one pair from the `kern` table, in font units.
+fn kern_table_value(face: *TextFace, left: u64, right: u64) -> f64 {
+    if (*face).kern_pair_count == 0 {
+        return 0.0;
+    }
+    let wanted: u64 = (left << 16) | right;
+    let low: u64 = 0;
+    let high: u64 = (*face).kern_pair_count;
+    while low < high {
+        let mid: u64 = low + (high - low) / 2;
+        let entry: u64 = (*face).kern_pairs_off + mid * 6;
+        let key: u64 = (u16_at(face, entry) << 16) | u16_at(face, entry + 2);
+        if key < wanted {
+            low = mid + 1;
+        } else if key > wanted {
+            high = mid;
+        } else {
+            return i16_at(face, entry + 4) as f64;
+        }
+    }
+    return 0.0;
+}
+
+// GPOS lookup type 2 "pair adjustment". Only the first such lookup in the
+// table is used: choosing between them properly needs script, language and
+// feature selection, which is a shaping engine rather than a font parser.
+fn select_gpos(face: *TextFace) -> void {
+    let gpos: TextTable = find_table(face, tag('G', 'P', 'O', 'S'));
+    if gpos.length < 10 {
+        return;
+    }
+    let lookup_list: u64 = gpos.offset + u16_at(face, gpos.offset + 8);
+    let count: u64 = u16_at(face, lookup_list);
+    for index: u64 in 0..count {
+        let lookup: u64 = lookup_list + u16_at(face, lookup_list + 2 + index * 2);
+        let kind: u64 = u16_at(face, lookup);
+        if kind != 2 {
+            continue;
+        }
+        let subtables: u64 = u16_at(face, lookup + 4);
+        for step: u64 in 0..subtables {
+            let sub: u64 = lookup + u16_at(face, lookup + 6 + step * 2);
+            let format: u64 = u16_at(face, sub);
+            if format == 1 || format == 2 {
+                (*face).gpos_pair_off = sub;
+                (*face).gpos_pair_format = format;
+                return;
+            }
+        }
+    }
+}
+
+// A coverage table maps a glyph to its index in the table's own ordering, or
+// reports that the glyph is not covered.
+fn coverage_index(face: *TextFace, coverage: u64, glyph: u64) -> i64 {
+    let format: u64 = u16_at(face, coverage);
+    if format == 1 {
+        let count: u64 = u16_at(face, coverage + 2);
+        let low: u64 = 0;
+        let high: u64 = count;
+        while low < high {
+            let mid: u64 = low + (high - low) / 2;
+            let value: u64 = u16_at(face, coverage + 4 + mid * 2);
+            if value < glyph {
+                low = mid + 1;
+            } else if value > glyph {
+                high = mid;
+            } else {
+                return mid as i64;
+            }
+        }
+        return -1;
+    }
+    if format != 2 {
+        return -1;
+    }
+    let ranges: u64 = u16_at(face, coverage + 2);
+    let low: u64 = 0;
+    let high: u64 = ranges;
+    while low < high {
+        let mid: u64 = low + (high - low) / 2;
+        let record: u64 = coverage + 4 + mid * 6;
+        let start: u64 = u16_at(face, record);
+        let end: u64 = u16_at(face, record + 2);
+        if glyph < start {
+            high = mid;
+        } else if glyph > end {
+            low = mid + 1;
+        } else {
+            return (u16_at(face, record + 4) + (glyph - start)) as i64;
+        }
+    }
+    return -1;
+}
+
+// A class definition table assigns each glyph a class number; anything not
+// listed is class 0.
+fn class_of_glyph(face: *TextFace, table: u64, glyph: u64) -> u64 {
+    let format: u64 = u16_at(face, table);
+    if format == 1 {
+        let start: u64 = u16_at(face, table + 2);
+        let count: u64 = u16_at(face, table + 4);
+        if glyph < start || glyph >= start + count {
+            return 0;
+        }
+        return u16_at(face, table + 6 + (glyph - start) * 2);
+    }
+    if format != 2 {
+        return 0;
+    }
+    let ranges: u64 = u16_at(face, table + 2);
+    let low: u64 = 0;
+    let high: u64 = ranges;
+    while low < high {
+        let mid: u64 = low + (high - low) / 2;
+        let record: u64 = table + 4 + mid * 6;
+        let start: u64 = u16_at(face, record);
+        let end: u64 = u16_at(face, record + 2);
+        if glyph < start {
+            high = mid;
+        } else if glyph > end {
+            low = mid + 1;
+        } else {
+            return u16_at(face, record + 4);
+        }
+    }
+    return 0;
+}
+
+// How many bytes a value record occupies, from its format's set bits. Only
+// XAdvance is read, but the others still take up room in the record.
+fn value_record_size(format: u64) -> u64 {
+    let size: u64 = 0;
+    for bit: u64 in 0..8 {
+        if (format & ((1 as u64) << bit)) != 0 {
+            size = size + 2;
+        }
+    }
+    return size;
+}
+
+// The XAdvance in a value record, which is the second field when present.
+fn value_x_advance(face: *TextFace, offset: u64, format: u64) -> f64 {
+    if (format & 4) == 0 {
+        return 0.0;
+    }
+    let skip: u64 = 0;
+    if (format & 1) != 0 { skip = skip + 2; }
+    if (format & 2) != 0 { skip = skip + 2; }
+    return i16_at(face, offset + skip) as f64;
+}
+
+fn gpos_pair_value(face: *TextFace, left: u64, right: u64) -> f64 {
+    let sub: u64 = (*face).gpos_pair_off;
+    if sub == 0 {
+        return 0.0;
+    }
+    let coverage: u64 = sub + u16_at(face, sub + 2);
+    let first: i64 = coverage_index(face, coverage, left);
+    if first < 0 {
+        return 0.0;
+    }
+    let format1: u64 = u16_at(face, sub + 4);
+    let format2: u64 = u16_at(face, sub + 6);
+    let size1: u64 = value_record_size(format1);
+    let size2: u64 = value_record_size(format2);
+
+    if (*face).gpos_pair_format == 1 {
+        // Format 1: a list of pair sets, one per covered first glyph, each a
+        // sorted array of second glyphs.
+        let set: u64 = sub + u16_at(face, sub + 10 + (first as u64) * 2);
+        let pairs: u64 = u16_at(face, set);
+        let stride: u64 = 2 + size1 + size2;
+        let low: u64 = 0;
+        let high: u64 = pairs;
+        while low < high {
+            let mid: u64 = low + (high - low) / 2;
+            let record: u64 = set + 2 + mid * stride;
+            let second: u64 = u16_at(face, record);
+            if second < right {
+                low = mid + 1;
+            } else if second > right {
+                high = mid;
+            } else {
+                return value_x_advance(face, record + 2, format1);
+            }
+        }
+        return 0.0;
+    }
+
+    // Format 2: a matrix indexed by the two glyphs' classes, which is how a
+    // font expresses "every uppercase before every rounded lowercase".
+    let class1_table: u64 = sub + u16_at(face, sub + 8);
+    let class2_table: u64 = sub + u16_at(face, sub + 10);
+    let class1_count: u64 = u16_at(face, sub + 12);
+    let class2_count: u64 = u16_at(face, sub + 14);
+    let class1: u64 = class_of_glyph(face, class1_table, left);
+    let class2: u64 = class_of_glyph(face, class2_table, right);
+    if class1 >= class1_count || class2 >= class2_count {
+        return 0.0;
+    }
+    let stride: u64 = size1 + size2;
+    let record: u64 = sub + 16
+        + (class1 * class2_count + class2) * stride;
+    return value_x_advance(face, record, format1);
+}
+
+// The kerning between two glyphs, in font units. GPOS wins over `kern` when a
+// font has both, which is what shaping engines do.
+pub fn kerning(face: *TextFace, left: u64, right: u64) -> f64 {
+    if !(*face).ok || left == 0 || right == 0 {
+        return 0.0;
+    }
+    if (*face).gpos_pair_off != 0 {
+        let value: f64 = gpos_pair_value(face, left, right);
+        if value != 0.0 {
+            return value;
+        }
+    }
+    return kern_table_value(face, left, right);
+}
+
+// Whether this face has any kerning data at all, so a caller can skip the
+// per-pair lookups entirely.
+pub fn has_kerning(face: *TextFace) -> bool {
+    return (*face).ok
+        && ((*face).gpos_pair_off != 0 || (*face).kern_pair_count > 0);
 }
 
 pub fn destroy(face: *TextFace) -> void {
@@ -232,6 +558,344 @@ pub fn descent(face: *TextFace) -> f64 {
 
 pub fn line_gap(face: *TextFace) -> f64 {
     return (*face).line_gap;
+}
+
+// --- CFF ----------------------------------------------------------------------
+//
+// An OpenType font with 'OTTO' in its header keeps outlines as Type 2
+// charstrings in a `CFF ` table rather than as `glyf` contours. The container
+// is a chain of INDEX structures (a count, an offset array, then the data) and
+// DICTs (operands followed by an operator). All this module does is find the
+// charstrings, the subroutines they call, and the two widths the Private DICT
+// declares; interpreting a charstring is engine.text.outline's job.
+
+// One INDEX: where its data begins, how many items it holds, and where the
+// structure ends.
+struct CffIndex {
+    count: u64,
+    // Offset of the offset array.
+    offsets: u64,
+    // Size in bytes of each entry in the offset array (1 to 4).
+    offset_size: u64,
+    // Where item data begins, minus one — CFF offsets are 1-based.
+    data: u64,
+    end: u64,
+}
+
+fn empty_index(at: u64) -> CffIndex {
+    return CffIndex {
+        count: 0, offsets: 0, offset_size: 1, data: at, end: at,
+    };
+}
+
+fn read_offset(face: *TextFace, at: u64, size: u64) -> u64 {
+    let value: u64 = 0;
+    for index: u64 in 0..size {
+        value = (value << 8) | byte_at(face, at + index);
+    }
+    return value;
+}
+
+fn read_index(face: *TextFace, at: u64) -> CffIndex {
+    let count: u64 = u16_at(face, at);
+    if count == 0 {
+        // An empty INDEX is just its two-byte count.
+        return empty_index(at + 2);
+    }
+    let offset_size: u64 = byte_at(face, at + 2);
+    if offset_size < 1 || offset_size > 4 {
+        return empty_index(at + 2);
+    }
+    let offsets: u64 = at + 3;
+    let data: u64 = offsets + (count + 1) * offset_size - 1;
+    let last: u64 = read_offset(face, offsets + count * offset_size, offset_size);
+    return CffIndex {
+        count: count, offsets: offsets, offset_size: offset_size,
+        data: data, end: data + last,
+    };
+}
+
+// The byte range of one INDEX item.
+pub fn cff_item_start(face: *TextFace, index: CffIndex, item: u64) -> u64 {
+    if item >= index.count {
+        return 0;
+    }
+    return index.data
+        + read_offset(face, index.offsets + item * index.offset_size,
+            index.offset_size);
+}
+
+pub fn cff_item_end(face: *TextFace, index: CffIndex, item: u64) -> u64 {
+    if item >= index.count {
+        return 0;
+    }
+    return index.data
+        + read_offset(face, index.offsets + (item + 1) * index.offset_size,
+            index.offset_size);
+}
+
+// One DICT entry found while scanning: the operator and its last two operands,
+// which is all any operator this parser cares about needs.
+struct CffDictEntry {
+    found: bool,
+    first: f64,
+    second: f64,
+}
+
+// Scan a DICT for `operator`, which is a one-byte code, or 1200 + n for the
+// two-byte escaped operators (12 n).
+fn dict_lookup(face: *TextFace, start: u64, end: u64, operator: u64)
+    -> CffDictEntry {
+    let operands: [f64; 48] = [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ];
+    let operand_count: u64 = 0;
+    let pos: u64 = start;
+    while pos < end {
+        let b0: u64 = byte_at(face, pos);
+        if b0 <= 21 {
+            let code: u64 = b0;
+            pos = pos + 1;
+            if b0 == 12 {
+                code = 1200 + byte_at(face, pos);
+                pos = pos + 1;
+            }
+            if code == operator {
+                let first: f64 = 0.0;
+                let second: f64 = 0.0;
+                if operand_count >= 1 {
+                    first = operands[0];
+                }
+                if operand_count >= 2 {
+                    second = operands[1];
+                }
+                // An operator with more operands than fit still reports its
+                // last two, which is what the offset-and-size pairs need.
+                if operand_count > 2 {
+                    first = operands[operand_count - 2];
+                    second = operands[operand_count - 1];
+                }
+                return CffDictEntry { found: true, first: first, second: second };
+            }
+            operand_count = 0;
+            continue;
+        }
+        // Operands. The encoding is CFF's own, not Type 2's.
+        let value: f64 = 0.0;
+        if b0 == 28 {
+            value = i16_at(face, pos + 1) as f64;
+            pos = pos + 3;
+        } else if b0 == 29 {
+            let raw: u64 = u32_at(face, pos + 1);
+            let signed: i64 = raw as i64;
+            if raw >= 0x80000000 {
+                signed = (raw as i64) - 4294967296;
+            }
+            value = signed as f64;
+            pos = pos + 5;
+        } else if b0 == 30 {
+            // A real number, as packed nibbles. Parsed to the extent the two
+            // widths need: digits, sign, decimal point and exponent.
+            let text_value: f64 = 0.0;
+            let fraction: f64 = 0.0;
+            let fraction_scale: f64 = 1.0;
+            let in_fraction: bool = false;
+            let negative: bool = false;
+            let exponent: i64 = 0;
+            let exponent_sign: i64 = 1;
+            let in_exponent: bool = false;
+            pos = pos + 1;
+            let done: bool = false;
+            while !done && pos < end {
+                let packed: u64 = byte_at(face, pos);
+                pos = pos + 1;
+                for half: u64 in 0..2 {
+                    let nibble: u64 = packed >> 4;
+                    if half == 1 {
+                        nibble = packed & 15;
+                    }
+                    if done {
+                        continue;
+                    }
+                    if nibble <= 9 {
+                        if in_exponent {
+                            exponent = exponent * 10 + (nibble as i64);
+                        } else if in_fraction {
+                            fraction_scale = fraction_scale / 10.0;
+                            fraction = fraction + (nibble as f64) * fraction_scale;
+                        } else {
+                            text_value = text_value * 10.0 + (nibble as f64);
+                        }
+                    } else if nibble == 10 {
+                        in_fraction = true;
+                    } else if nibble == 11 {
+                        in_exponent = true;
+                    } else if nibble == 12 {
+                        in_exponent = true;
+                        exponent_sign = -1;
+                    } else if nibble == 14 {
+                        negative = true;
+                    } else if nibble == 15 {
+                        done = true;
+                    }
+                }
+            }
+            value = text_value + fraction;
+            let power: i64 = exponent * exponent_sign;
+            while power > 0 {
+                value = value * 10.0;
+                power = power - 1;
+            }
+            while power < 0 {
+                value = value / 10.0;
+                power = power + 1;
+            }
+            if negative {
+                value = 0.0 - value;
+            }
+        } else if b0 >= 32 && b0 <= 246 {
+            value = (b0 as f64) - 139.0;
+            pos = pos + 1;
+        } else if b0 >= 247 && b0 <= 250 {
+            value = ((b0 - 247) * 256 + byte_at(face, pos + 1) + 108) as f64;
+            pos = pos + 2;
+        } else if b0 >= 251 && b0 <= 254 {
+            value = 0.0 - (((b0 - 251) * 256 + byte_at(face, pos + 1) + 108) as f64);
+            pos = pos + 2;
+        } else {
+            // A reserved byte: the DICT is malformed, so stop rather than
+            // wander off into the next table.
+            return CffDictEntry { found: false, first: 0.0, second: 0.0 };
+        }
+        if operand_count < 48 {
+            operands[operand_count] = value;
+            operand_count = operand_count + 1;
+        }
+    }
+    return CffDictEntry { found: false, first: 0.0, second: 0.0 };
+}
+
+fn read_cff(face: *TextFace) -> void {
+    let base: u64 = (*face).cff_off;
+    if (*face).cff_len < 4 {
+        return;
+    }
+    // The header's size byte says where the Name INDEX starts.
+    let header_size: u64 = byte_at(face, base + 2);
+    let names: CffIndex = read_index(face, base + header_size);
+    let top_dicts: CffIndex = read_index(face, names.end);
+    let strings: CffIndex = read_index(face, top_dicts.end);
+    // The subroutine INDEXes have to be reachable while a charstring runs, and
+    // a CffIndex cannot be a field here, so their start offsets are stored and
+    // the structure is re-read on demand — a handful of integer reads.
+    let gsubrs: CffIndex = read_index(face, strings.end);
+    (*face).cff_gsubrs_off = strings.end;
+    (*face).cff_gsubr_count = gsubrs.count;
+
+    if top_dicts.count == 0 {
+        return;
+    }
+    let top_start: u64 = cff_item_start(face, top_dicts, 0);
+    let top_end: u64 = cff_item_end(face, top_dicts, 0);
+
+    // Operator 17 is CharStrings, an offset from the table's start.
+    let charstrings: CffDictEntry = dict_lookup(face, top_start, top_end, 17);
+    if !charstrings.found {
+        return;
+    }
+    let index: CffIndex = read_index(face, base + (charstrings.first as u64));
+    (*face).cff_charstrings_off = base + (charstrings.first as u64);
+    (*face).cff_charstring_count = index.count;
+
+    // Operator 18 is Private: its size and offset, in that order.
+    let private: CffDictEntry = dict_lookup(face, top_start, top_end, 18);
+    if !private.found {
+        return;
+    }
+    let private_start: u64 = base + (private.second as u64);
+    let private_end: u64 = private_start + (private.first as u64);
+    let default_width: CffDictEntry =
+        dict_lookup(face, private_start, private_end, 20);
+    if default_width.found {
+        (*face).cff_default_width = default_width.first;
+    }
+    let nominal_width: CffDictEntry =
+        dict_lookup(face, private_start, private_end, 21);
+    if nominal_width.found {
+        (*face).cff_nominal_width = nominal_width.first;
+    }
+    // Operator 19 is Subrs, an offset from the Private DICT's start.
+    let subrs: CffDictEntry = dict_lookup(face, private_start, private_end, 19);
+    if subrs.found {
+        let local: CffIndex = read_index(face, private_start + (subrs.first as u64));
+        (*face).cff_lsubrs_off = private_start + (subrs.first as u64);
+        (*face).cff_lsubr_count = local.count;
+    }
+}
+
+pub fn is_cff(face: *TextFace) -> bool {
+    return (*face).is_cff;
+}
+
+// The byte range of a glyph's Type 2 charstring.
+pub fn charstring_start(face: *TextFace, glyph: u64) -> u64 {
+    if !(*face).is_cff || glyph >= (*face).cff_charstring_count {
+        return 0;
+    }
+    let index: CffIndex = read_index(face, (*face).cff_charstrings_off);
+    return cff_item_start(face, index, glyph);
+}
+
+pub fn charstring_end(face: *TextFace, glyph: u64) -> u64 {
+    if !(*face).is_cff || glyph >= (*face).cff_charstring_count {
+        return 0;
+    }
+    let index: CffIndex = read_index(face, (*face).cff_charstrings_off);
+    return cff_item_end(face, index, glyph);
+}
+
+// The subroutine INDEXes a charstring calls into. Bias is Type 2's: the
+// subroutine number is offset so that small numbers reach the middle of the
+// table (CFF spec, "Local/Global Subrs INDEXes").
+pub fn subr_bias(count: u64) -> i64 {
+    if count < 1240 {
+        return 107;
+    }
+    if count < 33900 {
+        return 1131;
+    }
+    return 32768;
+}
+
+pub fn local_subr_count(face: *TextFace) -> u64 {
+    return (*face).cff_lsubr_count;
+}
+
+pub fn global_subr_count(face: *TextFace) -> u64 {
+    return (*face).cff_gsubr_count;
+}
+
+pub fn local_subr_start(face: *TextFace, item: u64) -> u64 {
+    let index: CffIndex = read_index(face, (*face).cff_lsubrs_off);
+    return cff_item_start(face, index, item);
+}
+
+pub fn local_subr_end(face: *TextFace, item: u64) -> u64 {
+    let index: CffIndex = read_index(face, (*face).cff_lsubrs_off);
+    return cff_item_end(face, index, item);
+}
+
+pub fn global_subr_start(face: *TextFace, item: u64) -> u64 {
+    let index: CffIndex = read_index(face, (*face).cff_gsubrs_off);
+    return cff_item_start(face, index, item);
+}
+
+pub fn global_subr_end(face: *TextFace, item: u64) -> u64 {
+    let index: CffIndex = read_index(face, (*face).cff_gsubrs_off);
+    return cff_item_end(face, index, item);
 }
 
 // --- cmap lookup --------------------------------------------------------------

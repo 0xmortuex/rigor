@@ -1,8 +1,9 @@
 // Font metrics.
 //
-// Advances come from the font's own `hmtx` table, scaled from font units to
-// pixels by the em size — so a run measured here is exactly as wide as the
-// glyphs painted for it, and line breaking lands where a browser would put it.
+// Advances come from the font's own `hmtx` table, adjusted by the kerning the
+// font declares and scaled from font units to pixels by the em size — so a run
+// measured here is exactly as wide as the glyphs painted for it, and line
+// breaking lands where a browser would put it.
 //
 // When no font is installed the estimate table below is used instead. That
 // path exists so the engine still lays out (and tests still run) without a
@@ -91,10 +92,19 @@ pub fn text_width(
         return total;
     }
     let scale: f64 = scale_for(face, style.font_size);
+    // Kerning pulls a pair of glyphs together — the "AV" and "To" of any
+    // decent face. Measuring without it and painting with it would put the
+    // two out of step, so both walk the run the same way.
+    let kern: bool = sfnt.has_kerning(face);
+    let previous: u64 = 0;
     while index < len(view) {
         let decoded: TextChar = utf8.decode(view, index);
         let glyph: u64 = sfnt.glyph_for(face, decoded.codepoint as u64);
+        if kern && previous != 0 {
+            total = total + sfnt.kerning(face, previous, glyph) * scale;
+        }
         total = total + sfnt.advance_for_glyph(face, glyph) * scale;
+        previous = glyph;
         index = index + decoded.size;
     }
     return total;

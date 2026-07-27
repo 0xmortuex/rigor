@@ -388,9 +388,531 @@ fn flatten_contour(
     vec.push(&(*outline).contour_ends, (*outline).xs.length);
 }
 
+// --- Type 2 charstrings (CFF) -------------------------------------------------
+//
+// An OpenType font with CFF outlines stores each glyph as a little stack
+// program rather than as a point list. The operators draw cubic Béziers and
+// straight lines, and call into two levels of subroutine; the interpreter below
+// runs one and appends the result to a TextOutline directly, because a
+// charstring already describes the curve rather than a spline's control points.
+//
+// Implemented: every path construction operator, both subroutine calls, the
+// hint operators (skipped, but their operand counts tracked, because hintmask
+// reads a byte per eight hints and getting that wrong desynchronises the
+// stream), and the four flex operators. Not implemented: seac-style accent
+// composition through endchar's four-argument form, and the arithmetic and
+// storage operators, which no real font uses.
+
+// The interpreter's state. The stack is fixed at Type 2's own limit of 48.
+struct CharstringState {
+    stack: [f64; 48],
+    depth: u64,
+    x: f64,
+    y: f64,
+    // Hints seen so far, which decides how many mask bytes hintmask consumes.
+    hints: u64,
+    // The leading width operand is only present on the first stack-clearing
+    // operator, and only when the count is odd for that operator.
+    width_parsed: bool,
+    open: bool,
+    // Where the current contour started, so it can be closed.
+    start_x: f64,
+    start_y: f64,
+}
+
+fn new_charstring_state() -> CharstringState {
+    return CharstringState {
+        stack: [
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ],
+        depth: 0,
+        x: 0.0,
+        y: 0.0,
+        hints: 0,
+        width_parsed: false,
+        open: false,
+        start_x: 0.0,
+        start_y: 0.0,
+    };
+}
+
+fn absolute(value: f64) -> f64 {
+    if value < 0.0 {
+        return 0.0 - value;
+    }
+    return value;
+}
+
+fn push_operand(state: *CharstringState, value: f64) -> void {
+    if (*state).depth < 48 {
+        (*state).stack[(*state).depth] = value;
+        (*state).depth = (*state).depth + 1;
+    }
+}
+
+// Flatten one cubic Bézier into the outline, starting from the current point.
+fn emit_cubic(
+    outline: *TextOutline,
+    x0: f64, y0: f64,
+    c1x: f64, c1y: f64,
+    c2x: f64, c2y: f64,
+    x1: f64, y1: f64
+) -> void {
+    let steps: u64 = curve_steps();
+    for step: u64 in 1..(steps + 1) {
+        let t: f64 = (step as f64) / (steps as f64);
+        let inverse: f64 = 1.0 - t;
+        let a: f64 = inverse * inverse * inverse;
+        let b: f64 = 3.0 * inverse * inverse * t;
+        let c: f64 = 3.0 * inverse * t * t;
+        let d: f64 = t * t * t;
+        push_point(outline, a * x0 + b * c1x + c * c2x + d * x1,
+            a * y0 + b * c1y + c * c2y + d * y1);
+    }
+}
+
+fn close_contour(outline: *TextOutline, state: *CharstringState) -> void {
+    if !(*state).open {
+        return;
+    }
+    vec.push(&(*outline).contour_ends, (*outline).xs.length);
+    (*state).open = false;
+}
+
+fn move_to(outline: *TextOutline, state: *CharstringState, x: f64, y: f64) -> void {
+    close_contour(outline, state);
+    (*state).x = x;
+    (*state).y = y;
+    (*state).start_x = x;
+    (*state).start_y = y;
+    push_point(outline, x, y);
+    (*state).open = true;
+}
+
+fn line_to(outline: *TextOutline, state: *CharstringState, x: f64, y: f64) -> void {
+    (*state).x = x;
+    (*state).y = y;
+    push_point(outline, x, y);
+}
+
+fn curve_to(
+    outline: *TextOutline,
+    state: *CharstringState,
+    c1x: f64, c1y: f64,
+    c2x: f64, c2y: f64,
+    x: f64, y: f64
+) -> void {
+    emit_cubic(outline, (*state).x, (*state).y, c1x, c1y, c2x, c2y, x, y);
+    (*state).x = x;
+    (*state).y = y;
+}
+
+// Take the width operand off the front of the stack if this operator's operand
+// count says one is there. `even` is how many operands the operator itself
+// takes, or 0 when it takes any even number.
+fn take_width(state: *CharstringState, expected: u64) -> u64 {
+    if (*state).width_parsed {
+        return 0;
+    }
+    (*state).width_parsed = true;
+    let extra: bool = false;
+    if expected == 0 {
+        extra = (*state).depth % 2 == 1;
+    } else {
+        extra = (*state).depth > expected;
+    }
+    if extra {
+        return 1;
+    }
+    return 0;
+}
+
+fn operand(state: *CharstringState, index: u64) -> f64 {
+    if index >= (*state).depth {
+        return 0.0;
+    }
+    return (*state).stack[index];
+}
+
+// Run one charstring, appending to `outline`. `depth` bounds subroutine
+// recursion, which a malformed font could otherwise make unbounded.
+fn run_charstring(
+    face: *TextFace,
+    outline: *TextOutline,
+    state: *CharstringState,
+    start: u64,
+    end: u64,
+    depth: u64
+) -> bool {
+    if depth > 10 {
+        return true;
+    }
+    let pos: u64 = start;
+    while pos < end {
+        let b0: u64 = sfnt.byte_at(face, pos);
+        pos = pos + 1;
+
+        // Operands.
+        if b0 == 28 {
+            push_operand(state, sfnt.i16_at(face, pos) as f64);
+            pos = pos + 2;
+            continue;
+        }
+        if b0 >= 32 {
+            if b0 <= 246 {
+                push_operand(state, (b0 as f64) - 139.0);
+                continue;
+            }
+            if b0 <= 250 {
+                push_operand(state,
+                    ((b0 - 247) * 256 + sfnt.byte_at(face, pos) + 108) as f64);
+                pos = pos + 1;
+                continue;
+            }
+            if b0 <= 254 {
+                push_operand(state, 0.0
+                    - (((b0 - 251) * 256 + sfnt.byte_at(face, pos) + 108) as f64));
+                pos = pos + 1;
+                continue;
+            }
+            // 255: a 16.16 fixed-point number.
+            let whole: f64 = sfnt.i16_at(face, pos) as f64;
+            let fraction: f64 = (sfnt.u16_at(face, pos + 2) as f64) / 65536.0;
+            if whole < 0.0 {
+                push_operand(state, whole - fraction);
+            } else {
+                push_operand(state, whole + fraction);
+            }
+            pos = pos + 4;
+            continue;
+        }
+
+        // Operators.
+        if b0 == 1 || b0 == 3 || b0 == 18 || b0 == 23 {
+            // hstem, vstem, hstemhm, vstemhm: two operands per hint.
+            take_width(state, 0);
+            (*state).hints = (*state).hints + (*state).depth / 2;
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 19 || b0 == 20 {
+            // hintmask, cntrmask. Any operands still on the stack are an
+            // implicit vstem, and then one mask byte per eight hints follows.
+            take_width(state, 0);
+            (*state).hints = (*state).hints + (*state).depth / 2;
+            (*state).depth = 0;
+            pos = pos + ((*state).hints + 7) / 8;
+            continue;
+        }
+        if b0 == 21 {
+            // rmoveto
+            let first: u64 = take_width(state, 2);
+            move_to(outline, state,
+                (*state).x + operand(state, first),
+                (*state).y + operand(state, first + 1));
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 22 {
+            // hmoveto
+            let first: u64 = take_width(state, 1);
+            move_to(outline, state, (*state).x + operand(state, first), (*state).y);
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 4 {
+            // vmoveto
+            let first: u64 = take_width(state, 1);
+            move_to(outline, state, (*state).x, (*state).y + operand(state, first));
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 5 {
+            // rlineto: pairs, any number.
+            let index: u64 = 0;
+            while index + 1 < (*state).depth + 1 && index + 2 <= (*state).depth {
+                line_to(outline, state,
+                    (*state).x + operand(state, index),
+                    (*state).y + operand(state, index + 1));
+                index = index + 2;
+            }
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 6 || b0 == 7 {
+            // hlineto / vlineto: alternating axes, starting with h or v.
+            let horizontal: bool = b0 == 6;
+            for index: u64 in 0..(*state).depth {
+                if horizontal {
+                    line_to(outline, state,
+                        (*state).x + operand(state, index), (*state).y);
+                } else {
+                    line_to(outline, state,
+                        (*state).x, (*state).y + operand(state, index));
+                }
+                horizontal = !horizontal;
+            }
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 8 {
+            // rrcurveto: six operands per curve.
+            let index: u64 = 0;
+            while index + 6 <= (*state).depth {
+                relative_curve(outline, state,
+                    operand(state, index), operand(state, index + 1),
+                    operand(state, index + 2), operand(state, index + 3),
+                    operand(state, index + 4), operand(state, index + 5));
+                index = index + 6;
+            }
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 24 {
+            // rcurveline: curves, then one final line.
+            let index: u64 = 0;
+            while (*state).depth - index >= 8 {
+                relative_curve(outline, state,
+                    operand(state, index), operand(state, index + 1),
+                    operand(state, index + 2), operand(state, index + 3),
+                    operand(state, index + 4), operand(state, index + 5));
+                index = index + 6;
+            }
+            if index + 2 <= (*state).depth {
+                line_to(outline, state,
+                    (*state).x + operand(state, index),
+                    (*state).y + operand(state, index + 1));
+            }
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 25 {
+            // rlinecurve: lines, then one final curve.
+            let index: u64 = 0;
+            while (*state).depth - index >= 8 {
+                line_to(outline, state,
+                    (*state).x + operand(state, index),
+                    (*state).y + operand(state, index + 1));
+                index = index + 2;
+            }
+            if index + 6 <= (*state).depth {
+                relative_curve(outline, state,
+                    operand(state, index), operand(state, index + 1),
+                    operand(state, index + 2), operand(state, index + 3),
+                    operand(state, index + 4), operand(state, index + 5));
+            }
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 26 || b0 == 27 {
+            // vvcurveto / hhcurveto: an optional odd first operand shifts the
+            // first curve on the other axis.
+            let index: u64 = 0;
+            let lead: f64 = 0.0;
+            if (*state).depth % 4 == 1 {
+                lead = operand(state, 0);
+                index = 1;
+            }
+            while index + 4 <= (*state).depth {
+                if b0 == 26 {
+                    relative_curve(outline, state,
+                        lead, operand(state, index),
+                        operand(state, index + 1), operand(state, index + 2),
+                        0.0, operand(state, index + 3));
+                } else {
+                    relative_curve(outline, state,
+                        operand(state, index), lead,
+                        operand(state, index + 1), operand(state, index + 2),
+                        operand(state, index + 3), 0.0);
+                }
+                lead = 0.0;
+                index = index + 4;
+            }
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 30 || b0 == 31 {
+            // vhcurveto / hvcurveto: curves whose tangents alternate between
+            // horizontal and vertical, with an optional last operand giving
+            // the otherwise-zero final component.
+            let horizontal: bool = b0 == 31;
+            let index: u64 = 0;
+            while index + 4 <= (*state).depth {
+                let last: bool = (*state).depth - index == 5;
+                let extra: f64 = 0.0;
+                if last {
+                    extra = operand(state, index + 4);
+                }
+                if horizontal {
+                    relative_curve(outline, state,
+                        operand(state, index), 0.0,
+                        operand(state, index + 1), operand(state, index + 2),
+                        extra, operand(state, index + 3));
+                } else {
+                    relative_curve(outline, state,
+                        0.0, operand(state, index),
+                        operand(state, index + 1), operand(state, index + 2),
+                        operand(state, index + 3), extra);
+                }
+                horizontal = !horizontal;
+                index = index + 4;
+            }
+            (*state).depth = 0;
+            continue;
+        }
+        if b0 == 10 || b0 == 29 {
+            // callsubr / callgsubr.
+            if (*state).depth == 0 {
+                continue;
+            }
+            (*state).depth = (*state).depth - 1;
+            let number: f64 = (*state).stack[(*state).depth];
+            let local: bool = b0 == 10;
+            let count: u64 = sfnt.global_subr_count(face);
+            if local {
+                count = sfnt.local_subr_count(face);
+            }
+            let item: i64 = (number as i64) + sfnt.subr_bias(count);
+            if item < 0 || (item as u64) >= count {
+                continue;
+            }
+            let sub_start: u64 = 0;
+            let sub_end: u64 = 0;
+            if local {
+                sub_start = sfnt.local_subr_start(face, item as u64);
+                sub_end = sfnt.local_subr_end(face, item as u64);
+            } else {
+                sub_start = sfnt.global_subr_start(face, item as u64);
+                sub_end = sfnt.global_subr_end(face, item as u64);
+            }
+            if run_charstring(face, outline, state, sub_start, sub_end, depth + 1) {
+                return true;
+            }
+            continue;
+        }
+        if b0 == 11 {
+            // return
+            return false;
+        }
+        if b0 == 14 {
+            // endchar
+            take_width(state, 0);
+            close_contour(outline, state);
+            return true;
+        }
+        if b0 == 12 {
+            let b1: u64 = sfnt.byte_at(face, pos);
+            pos = pos + 1;
+            if b1 == 35 {
+                // flex: two curves, then a final flex depth operand.
+                relative_curve(outline, state,
+                    operand(state, 0), operand(state, 1),
+                    operand(state, 2), operand(state, 3),
+                    operand(state, 4), operand(state, 5));
+                relative_curve(outline, state,
+                    operand(state, 6), operand(state, 7),
+                    operand(state, 8), operand(state, 9),
+                    operand(state, 10), operand(state, 11));
+            } else if b1 == 34 {
+                // hflex: a flat flex, with the y coordinates implied.
+                let start_y: f64 = (*state).y;
+                relative_curve(outline, state,
+                    operand(state, 0), 0.0,
+                    operand(state, 1), operand(state, 2),
+                    operand(state, 3), 0.0);
+                relative_curve(outline, state,
+                    operand(state, 4), 0.0,
+                    operand(state, 5), start_y - (*state).y,
+                    operand(state, 6), 0.0);
+            } else if b1 == 36 {
+                // hflex1: the flex begins and ends at the same y, so the last
+                // vertical delta is whatever cancels the ones before it.
+                let dy1: f64 = operand(state, 1);
+                let dy2: f64 = operand(state, 3);
+                let dy5: f64 = operand(state, 7);
+                relative_curve(outline, state,
+                    operand(state, 0), dy1,
+                    operand(state, 2), dy2,
+                    operand(state, 4), 0.0);
+                relative_curve(outline, state,
+                    operand(state, 5), 0.0,
+                    operand(state, 6), dy5,
+                    operand(state, 8), 0.0 - (dy1 + dy2 + dy5));
+            } else if b1 == 37 {
+                // flex1: five deltas and one final coordinate. Whichever axis
+                // moved further is the one that coordinate belongs to; on the
+                // other, the flex returns to where it started.
+                let dx: f64 = 0.0;
+                let dy: f64 = 0.0;
+                for index: u64 in 0..5 {
+                    dx = dx + operand(state, index * 2);
+                    dy = dy + operand(state, index * 2 + 1);
+                }
+                let last: f64 = operand(state, 10);
+                let dx6: f64 = 0.0 - dx;
+                let dy6: f64 = 0.0 - dy;
+                if absolute(dx) > absolute(dy) {
+                    dx6 = last;
+                } else {
+                    dy6 = last;
+                }
+                relative_curve(outline, state,
+                    operand(state, 0), operand(state, 1),
+                    operand(state, 2), operand(state, 3),
+                    operand(state, 4), operand(state, 5));
+                relative_curve(outline, state,
+                    operand(state, 6), operand(state, 7),
+                    operand(state, 8), operand(state, 9),
+                    dx6, dy6);
+            }
+            (*state).depth = 0;
+            continue;
+        }
+        // Any other operator clears the stack, which keeps a font using the
+        // arithmetic operators from desynchronising everything after them.
+        (*state).depth = 0;
+    }
+    return false;
+}
+
+// A curve whose control points and end point are all relative to the point
+// before them, which is how Type 2 writes every curve.
+fn relative_curve(
+    outline: *TextOutline,
+    state: *CharstringState,
+    dx1: f64, dy1: f64,
+    dx2: f64, dy2: f64,
+    dx3: f64, dy3: f64
+) -> void {
+    let c1x: f64 = (*state).x + dx1;
+    let c1y: f64 = (*state).y + dy1;
+    let c2x: f64 = c1x + dx2;
+    let c2y: f64 = c1y + dy2;
+    curve_to(outline, state, c1x, c1y, c2x, c2y, c2x + dx3, c2y + dy3);
+}
+
+fn build_cff(face: *TextFace, glyph: u64) -> TextOutline {
+    let outline: TextOutline = new_outline();
+    let start: u64 = sfnt.charstring_start(face, glyph);
+    let end: u64 = sfnt.charstring_end(face, glyph);
+    if end > start {
+        let state: CharstringState = new_charstring_state();
+        run_charstring(face, &outline, &state, start, end, 0);
+        close_contour(&outline, &state);
+    }
+    return move outline;
+}
+
 // Build the flattened outline of `glyph`, in font units. The caller owns the
 // result and must destroy it.
 pub fn build(face: *TextFace, glyph: u64) -> TextOutline {
+    if sfnt.is_cff(face) {
+        let charstring: TextOutline = build_cff(face, glyph);
+        return move charstring;
+    }
     let outline: TextOutline = new_outline();
     let scratch: TextGlyphPoints = points.new_points();
     append_glyph(face, glyph, &scratch, 0.0, 0.0, 1.0, 1.0, 0);
