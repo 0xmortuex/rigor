@@ -32,6 +32,21 @@ pub fn new_canvas(width: u64, height: u64) -> Canvas {
     return move canvas;
 }
 
+// Resize in place, clearing to transparent black.
+//
+// A resize could destroy the canvas and create another, but a resource binding
+// cannot be overwritten once made — so a caller holding one in a struct field
+// has no way to swap it. Resetting the buffer it already owns is both what the
+// language allows and less garbage than the alternative.
+pub fn resize(canvas: *Canvas, width: u64, height: u64) -> void {
+    vec.clear(&(*canvas).pixels);
+    (*canvas).width = width;
+    (*canvas).height = height;
+    for index: u64 in 0..(width * height * 4) {
+        vec.push(&(*canvas).pixels, 0 as u8);
+    }
+}
+
 pub fn destroy(canvas: *Canvas) -> void {
     vec.destroy(&(*canvas).pixels);
     (*canvas).width = 0;

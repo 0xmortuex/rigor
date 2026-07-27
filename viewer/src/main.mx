@@ -6,6 +6,16 @@
 // The whole engine runs first, producing a BGRA canvas; the window then blits
 // that canvas and scrolls it. Nothing above win32.mx knows a window exists.
 //
+// Resizing re-runs the engine from the cascade down rather than only re-laying
+// out, because the viewport width decides which @media queries match and
+// therefore which rules apply at all.
+//
+// Links are hit-tested: the cursor becomes a hand over one, and clicking a
+// same-document fragment link scrolls to its target. Following a link to
+// another document would need the network stack, and this program cannot
+// import it — the TLS backend pulls in the Windows headers, which collide with
+// win32.mx's own declarations of the same API.
+//
 // Mort has no argv access yet, so stdin is the interface, matching the `rigor`
 // CLI.
 
@@ -29,22 +39,33 @@ import engine.style.attrstyle;
 import engine.style.ua;
 import engine.layout.box;
 import engine.layout.flow;
+import engine.layout.hit;
 import engine.paint.canvas;
 import engine.paint.paint;
 import engine.text.fonts;
 import engine.text.load;
 import engine.image.store;
 import engine.image.load as image_load;
+import render;
 
 extern fn getchar() -> c_int;
 
-// The rendered page, reachable from the window procedure. Win32 calls that
-// procedure from inside DispatchMessage rather than passing state along, so
-// the pixels have to be file-scope.
+// Everything the window procedure needs. Win32 calls that procedure from
+// inside DispatchMessage rather than passing state along, so it all has to be
+// reachable from file scope. These point at locals in main(), which outlives
+// the message loop.
 let PAGE_PIXELS: *u8 = null;
 let PAGE_WIDTH: i32 = 0;
 let PAGE_HEIGHT: i32 = 0;
 let SCROLL_Y: i32 = 0;
+let RENDER_STATE: *RenderState = null;
+let RENDER_INPUTS: *RenderInputs = null;
+let DOCUMENT: *DomDocument = null;
+// The link under the cursor, or node.none().
+let HOVER_LINK: u64 = 0;
+// Handles are pointers, so these initialise to null like the others.
+let HAND_CURSOR: Handle = null;
+let ARROW_CURSOR: Handle = null;
 
 fn read_stdin() -> Vec<u8> {
     let buf: Vec<u8> = vec.with_capacity<u8>(65536);
@@ -91,6 +112,61 @@ fn gather_style_text(doc: *DomDocument, out: *Vec<u8>, index: u64) -> void {
     }
 }
 
+// Re-render at the window's current size and republish the pixels.
+fn relayout(window: Handle) -> void {
+    if RENDER_STATE == null || RENDER_INPUTS == null {
+        return;
+    }
+    let client: Win32Rect = win32.client_rect(window);
+    let view_width: f64 = (client.right - client.left) as f64;
+    let view_height: f64 = (client.bottom - client.top) as f64;
+    if view_width < 1.0 {
+        view_width = 800.0;
+    }
+    if view_height < 1.0 {
+        view_height = 600.0;
+    }
+    render.render(RENDER_STATE, (*RENDER_INPUTS), view_width, view_height);
+    PAGE_PIXELS = render.pixels(RENDER_STATE);
+    PAGE_WIDTH = render.width(RENDER_STATE) as i32;
+    PAGE_HEIGHT = render.height(RENDER_STATE) as i32;
+    clamp_scroll(client.bottom - client.top);
+}
+
+// The link under a client-area point, or node.none().
+fn link_under(x: i32, y: i32) -> u64 {
+    if RENDER_STATE == null || DOCUMENT == null {
+        return 0;
+    }
+    let found: HitResult = hit.at(render.boxes_of(RENDER_STATE),
+    x as f64, (y + SCROLL_Y) as f64);
+    if !found.found {
+        return 0;
+    }
+    return hit.link_at(DOCUMENT, found.node);
+}
+
+// A fragment link scrolls to its target; anything else is reported but not
+// followed, since navigation would need the network.
+fn activate_link(window: Handle, element: u64) -> void {
+    if DOCUMENT == null || element == 0 {
+        return;
+    }
+    let href: []const u8 = hit.href_of(DOCUMENT, element);
+    if len(href) < 2 || href[0] != '#' {
+        return;
+    }
+    let target: u64 = hit.element_by_id(DOCUMENT,
+    slice((&href[1]) as *const u8, len(href) - 1));
+    if target == 0 {
+        return;
+    }
+    SCROLL_Y = hit.top_of(render.boxes_of(RENDER_STATE), target) as i32;
+    let client: Win32Rect = win32.client_rect(window);
+    clamp_scroll(client.bottom - client.top);
+    win32.invalidate(window);
+}
+
 fn clamp_scroll(view_height: i32) -> void {
     let limit: i32 = PAGE_HEIGHT - view_height;
     if limit < 0 {
@@ -107,6 +183,43 @@ fn clamp_scroll(view_height: i32) -> void {
 fn window_proc(window: Handle, message: u32, wparam: u64, lparam: i64) -> i64 {
     if message == win32.wm_destroy() {
         win32.quit();
+        return 0;
+    }
+    if message == win32.wm_size() {
+        relayout(window);
+        win32.invalidate(window);
+        return 0;
+    }
+    if message == win32.wm_mousemove() {
+        // The mouse position is packed into lparam as two signed 16-bit
+        // values, x in the low half.
+        let x: i32 = (lparam & (0xFFFF as i64)) as i32;
+        let y: i32 = ((lparam >> 16) & (0xFFFF as i64)) as i32;
+        if x > 32767 { x = x - 65536; }
+        if y > 32767 { y = y - 65536; }
+        HOVER_LINK = link_under(x, y);
+        if HOVER_LINK != 0 {
+            win32.set_cursor(HAND_CURSOR);
+        } else {
+            win32.set_cursor(ARROW_CURSOR);
+        }
+        return 0;
+    }
+    if message == win32.wm_setcursor() {
+        // Win32 resets the cursor to the class's on every move unless this
+        // message is claimed.
+        if HOVER_LINK != 0 {
+            win32.set_cursor(HAND_CURSOR);
+            return 1;
+        }
+        return win32.default_proc(window, message, wparam, lparam);
+    }
+    if message == win32.wm_lbuttonup() {
+        let x: i32 = (lparam & (0xFFFF as i64)) as i32;
+        let y: i32 = ((lparam >> 16) & (0xFFFF as i64)) as i32;
+        if x > 32767 { x = x - 65536; }
+        if y > 32767 { y = y - 65536; }
+        activate_link(window, link_under(x, y));
         return 0;
     }
     if message == win32.wm_keydown() {
@@ -214,6 +327,8 @@ fn main() -> int {
     let ua_sheet: CssStylesheet = stylesheet.new_stylesheet();
     css_parser.parse_stylesheet(&ua_sheet, &ua_sink);
 
+    // Before any window exists, so the client size reported below is real.
+    win32.set_dpi_aware();
     let instance: Handle = win32.module_handle();
     let class_name: *u8 = "RigorWindow";
     let window_class: Win32WindowClass = Win32WindowClass {
@@ -255,32 +370,37 @@ fn main() -> int {
     }
 
     let attrs: AttrStyles = attrstyle.parse_document(&doc);
-    let styles: StyleTree = computed.new_tree(node.node_count(&doc));
-    let env: CustomEnv = custom.new_env();
-    cascade.compute(&doc,
-    cascade.new_source(&ua_sheet, &ua_sink,
-    vec.as_const_slice(&ua_normalized), cascade.origin_ua()),
-    cascade.new_source(&sheet, &css_sink,
-    vec.as_const_slice(&css_normalized), cascade.origin_author()),
-    &attrs, &env, media.screen_context(viewport, view_height), &styles);
-
     let font_set: TextFontSet = fonts.new_set();
     load.load_windows_defaults(&font_set);
     let images: ImageStore = store.new_store();
     image_load.load_document(&doc, &images, "");
-    let boxes: LayoutTree = box.new_tree();
-    flow.layout(&doc, &styles, &boxes, &font_set, &images, viewport);
 
-    let page_height: u64 = (flow.document_height(&boxes) + 0.5) as u64;
-    if page_height < 1 {
-        page_height = 1;
-    }
-    let target: Canvas = canvas.new_canvas(viewport as u64, page_height);
-    paint.paint(&target, &boxes, &styles, &font_set, &images);
+    let inputs: RenderInputs = RenderInputs {
+        doc: &doc,
+        ua_sheet: &ua_sheet,
+        ua_sink: &ua_sink,
+        ua_source: vec.as_const_slice(&ua_normalized),
+        author_sheet: &sheet,
+        author_sink: &css_sink,
+        author_source: vec.as_const_slice(&css_normalized),
+        attrs: &attrs,
+        fonts: &font_set,
+        images: &images,
+    };
+    let state: RenderState = render.new_state();
 
-    PAGE_PIXELS = canvas.pixels(&target);
-    PAGE_WIDTH = viewport as i32;
-    PAGE_HEIGHT = page_height as i32;
+    // Publish everything the window procedure reaches. These point at locals
+    // in this function, which outlives the message loop below.
+    RENDER_STATE = &state;
+    RENDER_INPUTS = &inputs;
+    DOCUMENT = &doc;
+    ARROW_CURSOR = win32.arrow_cursor();
+    HAND_CURSOR = win32.hand_cursor();
+
+    render.render(&state, inputs, viewport, view_height);
+    PAGE_PIXELS = render.pixels(&state);
+    PAGE_WIDTH = render.width(&state) as i32;
+    PAGE_HEIGHT = render.height(&state) as i32;
 
     win32.show(window);
 
@@ -292,12 +412,12 @@ fn main() -> int {
         win32.dispatch(&message);
     }
 
-    canvas.destroy(&target);
-    box.destroy(&boxes);
+    RENDER_STATE = null;
+    RENDER_INPUTS = null;
+    DOCUMENT = null;
+    render.destroy(&state);
     store.destroy(&images);
     fonts.destroy(&font_set);
-    computed.destroy(&styles);
-    custom.destroy(&env);
     attrstyle.destroy(&attrs);
     stylesheet.destroy(&ua_sheet);
     css_tokens.destroy(&ua_sink);

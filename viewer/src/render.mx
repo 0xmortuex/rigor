@@ -1,0 +1,118 @@
+// The renderable state of one document, and how to rebuild it.
+//
+// The window procedure runs inside DispatchMessage rather than being handed
+// state, so everything a repaint or a resize needs has to be reachable from a
+// file-scope pointer. This module is what that pointer points at: the inputs
+// that survive a resize (the DOM, the stylesheets, the fonts, the images) and
+// the outputs that do not (the computed styles, the box tree, the canvas).
+//
+// Rebuilding is the whole engine from the cascade down, which is what a resize
+// requires: a narrower window changes not only where lines break but which
+// @media queries match, and therefore which rules apply at all.
+module rigor_view.render;
+
+import std.vec;
+import engine.dom.node;
+import engine.css.tokens as css_tokens;
+import engine.css.stylesheet;
+import engine.style.computed;
+import engine.style.cascade;
+import engine.style.custom;
+import engine.style.media;
+import engine.style.attrstyle;
+import engine.layout.box;
+import engine.layout.flow;
+import engine.paint.canvas;
+import engine.paint.paint;
+import engine.text.fonts;
+import engine.image.store;
+
+// Everything a render reads that does not change when the window does.
+struct RenderInputs {
+    doc: *DomDocument,
+    ua_sheet: *CssStylesheet,
+    ua_sink: *CssTokenSink,
+    ua_source: []const u8,
+    author_sheet: *CssStylesheet,
+    author_sink: *CssTokenSink,
+    author_source: []const u8,
+    attrs: *AttrStyles,
+    fonts: *TextFontSet,
+    images: *ImageStore,
+}
+
+resource struct RenderState {
+    styles: StyleTree,
+    env: CustomEnv,
+    boxes: LayoutTree,
+    target: Canvas,
+    width: u64,
+    height: u64,
+}
+
+pub fn new_state() -> RenderState {
+    return RenderState {
+        styles: computed.new_tree(0),
+        env: custom.new_env(),
+        boxes: box.new_tree(),
+        target: canvas.new_canvas(1, 1),
+        width: 0,
+        height: 0,
+    };
+}
+
+pub fn destroy(state: *RenderState) -> void {
+    canvas.destroy(&(*state).target);
+    box.destroy(&(*state).boxes);
+    custom.destroy(&(*state).env);
+    computed.destroy(&(*state).styles);
+}
+
+pub fn pixels(state: *RenderState) -> *u8 {
+    return canvas.pixels(&(*state).target);
+}
+
+pub fn width(state: *RenderState) -> u64 { return (*state).width; }
+pub fn height(state: *RenderState) -> u64 { return (*state).height; }
+
+pub fn boxes_of(state: *RenderState) -> *LayoutTree {
+    return &(*state).boxes;
+}
+
+// Cascade, lay out and paint at the given viewport size. The old style tree,
+// box tree and canvas are thrown away rather than updated: an incremental
+// relayout is a later milestone, and a resize is rare enough that redoing the
+// work is the honest implementation rather than a slow one.
+pub fn render(
+    state: *RenderState,
+    inputs: RenderInputs,
+    viewport_width: f64,
+    viewport_height: f64
+) -> void {
+    // Reset rather than replace: a resource binding cannot be overwritten, and
+    // these live in a struct the caller holds for the program's lifetime.
+    computed.reset(&(*state).styles, node.node_count(inputs.doc));
+    custom.reset(&(*state).env);
+    box.reset(&(*state).boxes);
+
+    cascade.compute(inputs.doc,
+    cascade.new_source(inputs.ua_sheet, inputs.ua_sink, inputs.ua_source,
+    cascade.origin_ua()),
+    cascade.new_source(inputs.author_sheet, inputs.author_sink,
+    inputs.author_source, cascade.origin_author()),
+    inputs.attrs, &(*state).env,
+    media.screen_context(viewport_width, viewport_height), &(*state).styles);
+
+    flow.layout(inputs.doc, &(*state).styles, &(*state).boxes, inputs.fonts,
+    inputs.images, viewport_width);
+
+    let page_height: u64 = (flow.document_height(&(*state).boxes) + 0.5) as u64;
+    if page_height < 1 {
+        page_height = 1;
+    }
+    (*state).width = viewport_width as u64;
+    (*state).height = page_height;
+    canvas.resize(&(*state).target, (*state).width, page_height);
+    paint.paint(&(*state).target, &(*state).boxes, &(*state).styles,
+    inputs.fonts, inputs.images);
+}

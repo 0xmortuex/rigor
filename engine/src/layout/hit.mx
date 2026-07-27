@@ -1,0 +1,134 @@
+// Hit testing: which box is under a point, and what it means.
+//
+// The box tree is painted in tree order, so a later box draws over an earlier
+// one — which means the *last* box whose border area contains the point is the
+// one the user sees there, and the one a click belongs to. Descending depth
+// first and keeping the last match gives exactly that, without needing a
+// separate paint order.
+//
+// This is the piece a browser builds cursors, selection and link activation on.
+// rigor uses it for the first of those three.
+module engine.layout.hit;
+
+import box;
+import engine.dom.node;
+import engine.html.tagnames;
+
+// The result of a hit test: the box under the point, and the DOM node it came
+// from. `found` is false when the point is outside every box.
+struct HitResult {
+    found: bool,
+    box_index: u64,
+    node: u64,
+}
+
+fn contains(value: LayoutBox, x: f64, y: f64) -> bool {
+    let width: f64 = box.border_box_width(value);
+    let height: f64 = box.border_box_height(value);
+    return x >= value.x && x < value.x + width
+        && y >= value.y && y < value.y + height;
+}
+
+fn descend(tree: *LayoutTree, index: u64, x: f64, y: f64, best: *HitResult)
+    -> void {
+    let current: LayoutBox = box.get(tree, index);
+    if contains(current, x, y) {
+        (*best) = HitResult {
+            found: true, box_index: index, node: current.node,
+        };
+    }
+    let child: u64 = current.first_child;
+    while child != box.none() {
+        descend(tree, child, x, y, best);
+        child = box.get(tree, child).next_sibling;
+    }
+}
+
+// The topmost box containing (x, y), in document coordinates. Named `at`
+// rather than `test`, which is a keyword.
+pub fn at(tree: *LayoutTree, x: f64, y: f64) -> HitResult {
+    let best: HitResult = HitResult { found: false, box_index: 0, node: 0 };
+    if (*tree).root == box.none() {
+        return best;
+    }
+    descend(tree, (*tree).root, x, y, &best);
+    return best;
+}
+
+// The nearest <a href> at or above `dom_node`, or none(). A link's clickable
+// area is its descendants', which is why this walks up rather than testing the
+// element the point landed in.
+pub fn link_at(doc: *DomDocument, dom_node: u64) -> u64 {
+    let current: u64 = dom_node;
+    while current != node.none() {
+        let element: DomNode = node.get(doc, current);
+        if element.kind == node.kind_element()
+            && element.tag == tagnames.tag_a() {
+            let href: DomAttrValue = node.find_attr(doc, current, href_name());
+            if href.found {
+                return current;
+            }
+        }
+        current = element.parent;
+    }
+    return node.none();
+}
+
+fn href_name() -> []const u8 {
+    let text: *u8 = "href";
+    return slice(text as *const u8, 4);
+}
+
+// The href of a link element, empty when it has none.
+pub fn href_of(doc: *DomDocument, element: u64) -> []const u8 {
+    let found: DomAttrValue = node.find_attr(doc, element, href_name());
+    if !found.found {
+        return slice(0 as *const u8, 0);
+    }
+    return node.bytes(doc, found.value_off, found.value_len);
+}
+
+// The element with this id, for resolving a same-document fragment link.
+pub fn element_by_id(doc: *DomDocument, wanted: []const u8) -> u64 {
+    if len(wanted) == 0 {
+        return node.none();
+    }
+    for index: u64 in 0..node.node_count(doc) {
+        let element: DomNode = node.get(doc, index);
+        if element.kind != node.kind_element() {
+            continue;
+        }
+        let found: DomAttrValue = node.find_attr(doc, index, id_name());
+        if !found.found || found.value_len != len(wanted) {
+            continue;
+        }
+        let value: []const u8 =
+            node.bytes(doc, found.value_off, found.value_len);
+        let same: bool = true;
+        for step: u64 in 0..len(value) {
+            if value[step] != wanted[step] {
+                same = false;
+            }
+        }
+        if same {
+            return index;
+        }
+    }
+    return node.none();
+}
+
+fn id_name() -> []const u8 {
+    let text: *u8 = "id";
+    return slice(text as *const u8, 2);
+}
+
+// Where an element's box sits vertically, for scrolling to it.
+pub fn top_of(tree: *LayoutTree, dom_node: u64) -> f64 {
+    for index: u64 in 0..box.box_count(tree) {
+        let current: LayoutBox = box.get(tree, index);
+        if current.node == dom_node && current.kind != box.box_text() {
+            return current.y;
+        }
+    }
+    return 0.0;
+}

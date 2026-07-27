@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rigor — links and resizing</title>
+<style>
+  body { margin: 32px; font-size: 16px; color: #222; background: #fbfbf9;
+         max-width: 100%; }
+  h1 { color: #202060; font-size: 2em; margin-bottom: 0.2em }
+  h2 { color: #404070; margin-top: 1.6em }
+  a { color: #0645ad }
+  p { margin: 0.8em 0 }
+  nav { background: #eef; padding: 12px 16px; border: 1px solid #ccd }
+  .wide { background: #fff6e0; border-left: 6px solid #cc9a2b;
+          padding: 12px 20px; margin: 24px 0 }
+  @media (max-width: 700px) {
+    .wide { background: #ffe8e8; border-left-color: #c33 }
+    h1::after { content: "" }
+  }
+</style>
+</head>
+<body>
+<h1 id="top">Links and resizing</h1>
+
+<nav>
+  Jump to:
+  <a href="#middle">the middle</a> &middot;
+  <a href="#bottom">the bottom</a> &middot;
+  <a href="https://example.com/">an external link</a>
+</nav>
+
+<p>Hovering a link turns the pointer into a hand, because the box tree is
+hit-tested against the cursor and the result walked up to the nearest anchor.
+Clicking one of the first two scrolls to its target.</p>
+
+<div class="wide">
+<p>Resize the window and this panel changes colour. That is not a repaint
+trick: the whole cascade re-runs, so the <code>@media (max-width: 700px)</code>
+rule starts or stops matching, and the layout is rebuilt from the styles it
+produces.</p>
+</div>
+
+<h2 id="middle">The middle</h2>
+<p>Text reflows to the new width at the same time, breaking at the
+opportunities UAX #14 finds rather than only at spaces, so a long word with
+hyphens can break after one of them and a run of Chinese can break at all:
+中文網頁測試中文網頁測試中文網頁測試中文網頁測試。</p>
+
+<p>An external link does nothing when clicked. Following it would need the
+network stack, and this program cannot import it: the TLS backend pulls in the
+Windows headers, which collide with the viewer's own declarations of the same
+API. The <code>rigor</code> CLI has no such conflict and does fetch.</p>
+
+<h2 id="bottom">The bottom</h2>
+<p><a href="#top">Back to the top</a></p>
+</body>
+</html>

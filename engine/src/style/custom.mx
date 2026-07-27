@@ -40,6 +40,12 @@ pub fn new_env() -> CustomEnv {
     };
 }
 
+// Forget every definition, in place.
+pub fn reset(env: *CustomEnv) -> void {
+    vec.clear(&(*env).entries);
+    vec.clear(&(*env).pool);
+}
+
 pub fn destroy(env: *CustomEnv) -> void {
     vec.destroy(&(*env).entries);
     vec.destroy(&(*env).pool);

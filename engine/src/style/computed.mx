@@ -250,6 +250,16 @@ pub fn new_tree(node_count: u64) -> StyleTree {
     return move tree;
 }
 
+// Empty the tree and size it for a fresh cascade, in place — a resource
+// binding cannot be overwritten, so a caller re-rendering into one it already
+// holds resets rather than replaces.
+pub fn reset(tree: *StyleTree, node_count: u64) -> void {
+    vec.clear(&(*tree).styles);
+    for index: u64 in 0..node_count {
+        vec.push(&(*tree).styles, initial_style());
+    }
+}
+
 pub fn destroy(tree: *StyleTree) -> void {
     vec.destroy(&(*tree).styles);
 }

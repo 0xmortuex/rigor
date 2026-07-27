@@ -94,6 +94,15 @@ pub fn new_tree() -> LayoutTree {
     return move tree;
 }
 
+// Empty the tree in place, ready to be built again — with the sentinel box
+// back at index 0, so none() keeps meaning what it means.
+pub fn reset(tree: *LayoutTree) -> void {
+    vec.clear(&(*tree).boxes);
+    vec.clear(&(*tree).text);
+    (*tree).root = 0;
+    vec.push(&(*tree).boxes, empty_box(box_block()));
+}
+
 pub fn destroy(tree: *LayoutTree) -> void {
     vec.destroy(&(*tree).boxes);
     vec.destroy(&(*tree).text);
